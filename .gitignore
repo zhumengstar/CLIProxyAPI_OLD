@@ -32,6 +32,7 @@ CLAUDE.md
 GEMINI.md
 
 # Tooling metadata
+.tools/
 .vscode/*
 .worktrees/
 .codex/*
@@ -51,6 +52,10 @@ _bmad-output/*
 .DS_Store
 ._*
 .gocache/
+
+# Local frontend verification artifacts
+frontend-*.png
+frontend-check-dom.html
 
 # Local deployment secrets
 deploy-secrets.local.txt
