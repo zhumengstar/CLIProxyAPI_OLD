@@ -1,6 +1,7 @@
 package management
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -59,8 +61,14 @@ var (
 	callbackForwardersMu  sync.Mutex
 	callbackForwarders    = make(map[int]*callbackForwarder)
 	errAuthFileMustBeJSON = errors.New("auth file must be .json")
+	errAuthArchiveNoJSON  = errors.New("archive contains no json auth files")
 	errAuthFileNotFound   = errors.New("auth file not found")
 )
+
+type authUploadFailure struct {
+	Name  string
+	Error string
+}
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
@@ -593,36 +601,23 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errMultipart)})
 		return
 	}
-	if len(fileHeaders) == 1 {
-		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
-			if errors.Is(errUpload, errAuthFileMustBeJSON) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-		return
-	}
-	if len(fileHeaders) > 1 {
+	if len(fileHeaders) > 0 {
 		uploaded := make([]string, 0, len(fileHeaders))
 		failed := make([]gin.H, 0)
 		for _, file := range fileHeaders {
-			name, errUpload := h.storeUploadedAuthFile(ctx, file)
+			names, failures, errUpload := h.storeUploadedAuthFiles(ctx, file)
 			if errUpload != nil {
-				failureName := ""
-				if file != nil {
-					failureName = filepath.Base(file.Filename)
-				}
-				msg := errUpload.Error()
-				if errors.Is(errUpload, errAuthFileMustBeJSON) {
-					msg = "file must be .json"
-				}
-				failed = append(failed, gin.H{"name": failureName, "error": msg})
+				failed = append(failed, gin.H{"name": uploadedFileDisplayName(file), "error": uploadErrorMessage(errUpload)})
 				continue
 			}
-			uploaded = append(uploaded, name)
+			uploaded = append(uploaded, names...)
+			for _, failure := range failures {
+				failed = append(failed, gin.H{"name": failure.Name, "error": failure.Error})
+			}
+		}
+		if len(fileHeaders) == 1 && len(uploaded) == 1 && len(failed) == 0 {
+			c.JSON(http.StatusOK, gin.H{"status": "ok"})
+			return
 		}
 		if len(failed) > 0 {
 			c.JSON(http.StatusMultiStatus, gin.H{
@@ -631,6 +626,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 				"files":    uploaded,
 				"failed":   failed,
 			})
+			return
+		}
+		if len(uploaded) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "no json auth files uploaded"})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "uploaded": len(uploaded), "files": uploaded})
@@ -767,28 +766,101 @@ func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHea
 	return headers, nil
 }
 
-func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader) (string, error) {
+func (h *Handler) storeUploadedAuthFiles(ctx context.Context, file *multipart.FileHeader) ([]string, []authUploadFailure, error) {
 	if file == nil {
-		return "", fmt.Errorf("no file uploaded")
+		return nil, nil, fmt.Errorf("no file uploaded")
 	}
 	name := filepath.Base(strings.TrimSpace(file.Filename))
-	if !strings.HasSuffix(strings.ToLower(name), ".json") {
-		return "", errAuthFileMustBeJSON
+	lowerName := strings.ToLower(name)
+	if !strings.HasSuffix(lowerName, ".json") && !strings.HasSuffix(lowerName, ".zip") {
+		return nil, nil, errAuthFileMustBeJSON
 	}
 	src, err := file.Open()
 	if err != nil {
-		return "", fmt.Errorf("failed to open uploaded file: %w", err)
+		return nil, nil, fmt.Errorf("failed to open uploaded file: %w", err)
 	}
 	defer src.Close()
 
 	data, err := io.ReadAll(src)
 	if err != nil {
-		return "", fmt.Errorf("failed to read uploaded file: %w", err)
+		return nil, nil, fmt.Errorf("failed to read uploaded file: %w", err)
+	}
+	if strings.HasSuffix(lowerName, ".zip") {
+		return h.storeUploadedAuthZip(ctx, data)
 	}
 	if err := h.writeAuthFile(ctx, name, data); err != nil {
-		return "", err
+		return nil, nil, err
 	}
-	return name, nil
+	return []string{name}, nil, nil
+}
+
+func (h *Handler) storeUploadedAuthZip(ctx context.Context, data []byte) ([]string, []authUploadFailure, error) {
+	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid zip archive: %w", err)
+	}
+
+	uploaded := make([]string, 0)
+	failures := make([]authUploadFailure, 0)
+	for _, entry := range reader.File {
+		if entry == nil || entry.FileInfo().IsDir() {
+			continue
+		}
+		name := authArchiveEntryFileName(entry.Name)
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		if isUnsafeAuthFileName(name) {
+			failures = append(failures, authUploadFailure{Name: entry.Name, Error: "invalid name"})
+			continue
+		}
+		rc, errOpen := entry.Open()
+		if errOpen != nil {
+			failures = append(failures, authUploadFailure{Name: name, Error: fmt.Sprintf("failed to open zip entry: %v", errOpen)})
+			continue
+		}
+		entryData, errRead := io.ReadAll(rc)
+		errClose := rc.Close()
+		if errRead != nil {
+			failures = append(failures, authUploadFailure{Name: name, Error: fmt.Sprintf("failed to read zip entry: %v", errRead)})
+			continue
+		}
+		if errClose != nil {
+			failures = append(failures, authUploadFailure{Name: name, Error: fmt.Sprintf("failed to close zip entry: %v", errClose)})
+			continue
+		}
+		if errWrite := h.writeAuthFile(ctx, name, entryData); errWrite != nil {
+			failures = append(failures, authUploadFailure{Name: name, Error: errWrite.Error()})
+			continue
+		}
+		uploaded = append(uploaded, name)
+	}
+	if len(uploaded) == 0 && len(failures) == 0 {
+		return nil, nil, errAuthArchiveNoJSON
+	}
+	return uploaded, failures, nil
+}
+
+func authArchiveEntryFileName(name string) string {
+	name = strings.TrimSpace(strings.ReplaceAll(name, "\\", "/"))
+	return path.Base(name)
+}
+
+func uploadedFileDisplayName(file *multipart.FileHeader) string {
+	if file == nil {
+		return ""
+	}
+	return filepath.Base(strings.TrimSpace(file.Filename))
+}
+
+func uploadErrorMessage(err error) string {
+	if errors.Is(err, errAuthFileMustBeJSON) {
+		return "file must be .json or .zip"
+	}
+	if errors.Is(err, errAuthArchiveNoJSON) {
+		return "archive contains no .json files"
+	}
+	return err.Error()
 }
 
 func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {

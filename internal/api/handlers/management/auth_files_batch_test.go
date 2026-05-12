@@ -1,6 +1,7 @@
 package management
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
 	"mime/multipart"
@@ -147,6 +148,147 @@ func TestUploadAuthFile_BatchMultipart_InvalidJSONDoesNotOverwriteExistingFile(t
 	}
 	if string(betaData) != files[1].content {
 		t.Fatalf("expected beta auth file content %q, got %q", files[1].content, string(betaData))
+	}
+}
+
+func TestUploadAuthFile_ZipMultipart(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	var archive bytes.Buffer
+	zipWriter := zip.NewWriter(&archive)
+	entries := []struct {
+		name    string
+		content string
+	}{
+		{name: "nested/alpha.json", content: `{"type":"codex","email":"alpha@example.com"}`},
+		{name: "beta.json", content: `{"type":"claude","email":"beta@example.com"}`},
+		{name: "notes.txt", content: "ignored"},
+	}
+	for _, entry := range entries {
+		part, err := zipWriter.Create(entry.name)
+		if err != nil {
+			t.Fatalf("failed to create zip entry %s: %v", entry.name, err)
+		}
+		if _, err = part.Write([]byte(entry.content)); err != nil {
+			t.Fatalf("failed to write zip entry %s: %v", entry.name, err)
+		}
+	}
+	if err := zipWriter.Close(); err != nil {
+		t.Fatalf("failed to close zip writer: %v", err)
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "auths.zip")
+	if err != nil {
+		t.Fatalf("failed to create multipart file: %v", err)
+	}
+	if _, err = part.Write(archive.Bytes()); err != nil {
+		t.Fatalf("failed to write multipart zip: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("failed to close multipart writer: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected upload status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	for _, file := range []struct {
+		name    string
+		content string
+	}{
+		{name: "alpha.json", content: entries[0].content},
+		{name: "beta.json", content: entries[1].content},
+	} {
+		data, err := os.ReadFile(filepath.Join(authDir, file.name))
+		if err != nil {
+			t.Fatalf("expected uploaded file %s to exist: %v", file.name, err)
+		}
+		if string(data) != file.content {
+			t.Fatalf("expected file %s content %q, got %q", file.name, file.content, string(data))
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(authDir, "notes.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected non-json zip entry to be ignored, stat err: %v", err)
+	}
+	if len(manager.List()) != 2 {
+		t.Fatalf("expected 2 auth entries, got %d", len(manager.List()))
+	}
+}
+
+func TestUploadAuthFile_ZipMultipartPartialFailure(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	var archive bytes.Buffer
+	zipWriter := zip.NewWriter(&archive)
+	for _, entry := range []struct {
+		name    string
+		content string
+	}{
+		{name: "good.json", content: `{"type":"codex","email":"good@example.com"}`},
+		{name: "bad.json", content: `{"type":"codex"`},
+	} {
+		part, err := zipWriter.Create(entry.name)
+		if err != nil {
+			t.Fatalf("failed to create zip entry %s: %v", entry.name, err)
+		}
+		if _, err = part.Write([]byte(entry.content)); err != nil {
+			t.Fatalf("failed to write zip entry %s: %v", entry.name, err)
+		}
+	}
+	if err := zipWriter.Close(); err != nil {
+		t.Fatalf("failed to close zip writer: %v", err)
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "auths.zip")
+	if err != nil {
+		t.Fatalf("failed to create multipart file: %v", err)
+	}
+	if _, err = part.Write(archive.Bytes()); err != nil {
+		t.Fatalf("failed to write multipart zip: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("failed to close multipart writer: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("expected upload status %d, got %d with body %s", http.StatusMultiStatus, rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(authDir, "good.json")); err != nil {
+		t.Fatalf("expected good auth file to be created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(authDir, "bad.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected invalid auth file not to be written, stat err: %v", err)
 	}
 }
 
