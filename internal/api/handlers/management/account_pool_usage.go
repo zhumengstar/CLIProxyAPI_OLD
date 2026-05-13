@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,10 +40,29 @@ type accountPoolUsageRecord struct {
 	TotalTokens  int64  `json:"total_tokens,omitempty"`
 }
 
+type accountPoolUsageSummary struct {
+	Key          string `json:"key"`
+	ServiceEmail string `json:"service_email,omitempty"`
+	AuthID       string `json:"auth_id,omitempty"`
+	AuthIndex    string `json:"auth_index,omitempty"`
+	AuthType     string `json:"auth_type,omitempty"`
+	Provider     string `json:"provider,omitempty"`
+	Model        string `json:"model,omitempty"`
+	Alias        string `json:"alias,omitempty"`
+	Requests     int64  `json:"requests"`
+	Successes    int64  `json:"successes"`
+	Failures     int64  `json:"failures"`
+	InputTokens  int64  `json:"input_tokens,omitempty"`
+	OutputTokens int64  `json:"output_tokens,omitempty"`
+	TotalTokens  int64  `json:"total_tokens,omitempty"`
+	LastUsedAt   string `json:"last_used_at,omitempty"`
+}
+
 type accountPoolUsageRecorder struct {
-	mu      sync.RWMutex
-	records []accountPoolUsageRecord
-	nextID  uint64
+	mu        sync.RWMutex
+	records   []accountPoolUsageRecord
+	summaries map[string]*accountPoolUsageSummary
+	nextID    uint64
 }
 
 var accountPoolUsage = &accountPoolUsageRecorder{}
@@ -89,11 +109,60 @@ func (r *accountPoolUsageRecorder) HandleUsage(ctx context.Context, record usage
 		OutputTokens: record.Detail.OutputTokens,
 		TotalTokens:  record.Detail.TotalTokens,
 	}
+	key := accountPoolUsageSummaryKey(item)
 	r.records = append(r.records, item)
 	if overflow := len(r.records) - maxAccountPoolUsageRecords; overflow > 0 {
 		copy(r.records, r.records[overflow:])
 		r.records = r.records[:len(r.records)-overflow]
 	}
+	if r.summaries == nil {
+		r.summaries = make(map[string]*accountPoolUsageSummary)
+	}
+	summary := r.summaries[key]
+	if summary == nil {
+		summary = &accountPoolUsageSummary{
+			Key:          key,
+			ServiceEmail: item.ServiceEmail,
+			AuthID:       item.AuthID,
+			AuthIndex:    item.AuthIndex,
+			AuthType:     item.AuthType,
+			Provider:     item.Provider,
+			Model:        item.Model,
+			Alias:        item.Alias,
+		}
+		r.summaries[key] = summary
+	}
+	summary.Requests++
+	if item.Success {
+		summary.Successes++
+	} else {
+		summary.Failures++
+	}
+	summary.InputTokens += item.InputTokens
+	summary.OutputTokens += item.OutputTokens
+	summary.TotalTokens += item.TotalTokens
+	if summary.ServiceEmail == "" {
+		summary.ServiceEmail = item.ServiceEmail
+	}
+	if summary.AuthID == "" {
+		summary.AuthID = item.AuthID
+	}
+	if summary.AuthIndex == "" {
+		summary.AuthIndex = item.AuthIndex
+	}
+	if summary.AuthType == "" {
+		summary.AuthType = item.AuthType
+	}
+	if summary.Provider == "" {
+		summary.Provider = item.Provider
+	}
+	if summary.Model == "" {
+		summary.Model = item.Model
+	}
+	if summary.Alias == "" {
+		summary.Alias = item.Alias
+	}
+	summary.LastUsedAt = item.RequestedAt
 	r.mu.Unlock()
 }
 
@@ -123,7 +192,52 @@ func (r *accountPoolUsageRecorder) Clear() {
 	}
 	r.mu.Lock()
 	r.records = nil
+	r.summaries = nil
 	r.mu.Unlock()
+}
+
+func (r *accountPoolUsageRecorder) Summaries() []accountPoolUsageSummary {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.summaries) == 0 {
+		return nil
+	}
+	out := make([]accountPoolUsageSummary, 0, len(r.summaries))
+	for _, item := range r.summaries {
+		if item == nil {
+			continue
+		}
+		out = append(out, *item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Requests != out[j].Requests {
+			return out[i].Requests > out[j].Requests
+		}
+		if out[i].TotalTokens != out[j].TotalTokens {
+			return out[i].TotalTokens > out[j].TotalTokens
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out
+}
+
+func accountPoolUsageSummaryKey(item accountPoolUsageRecord) string {
+	if value := strings.ToLower(strings.TrimSpace(item.ServiceEmail)); value != "" {
+		return "email:" + value
+	}
+	if value := strings.TrimSpace(item.AuthID); value != "" {
+		return "auth_id:" + value
+	}
+	if value := strings.TrimSpace(item.AuthIndex); value != "" {
+		return "auth_index:" + value
+	}
+	if value := strings.TrimSpace(item.SessionID); value != "" {
+		return "session:" + value
+	}
+	return "unknown"
 }
 
 func accountPoolRequestIdentity(ctx context.Context) (sessionID string, userID string, username string, requestPath string) {
@@ -166,7 +280,10 @@ func (h *Handler) GetAccountPoolUsageRecords(c *gin.Context) {
 		}
 		limit = parsed
 	}
-	c.JSON(http.StatusOK, gin.H{"records": accountPoolUsage.List(limit)})
+	c.JSON(http.StatusOK, gin.H{
+		"records":   accountPoolUsage.List(limit),
+		"summaries": accountPoolUsage.Summaries(),
+	})
 }
 
 func (h *Handler) ClearAccountPoolUsageRecords(c *gin.Context) {

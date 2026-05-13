@@ -85,6 +85,9 @@ func GinLogrusLogger() gin.HandlerFunc {
 		if creditsUsed(c) {
 			logLine += " [credits]"
 		}
+		if summary := buildRequestSummaryLogLine(c); summary != "" {
+			logLine += " | " + summary
+		}
 		if errorMessage != "" {
 			logLine = logLine + " | " + errorMessage
 		}
@@ -100,6 +103,40 @@ func GinLogrusLogger() gin.HandlerFunc {
 			entry.Info(logLine)
 		}
 	}
+}
+
+func buildRequestSummaryLogLine(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+
+	parts := make([]string, 0, 8)
+	appendPart := func(key string, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	appendPart("user", GetRequestSummaryValue(c, RequestSummaryUsernameKey))
+	appendPart("user_id", GetRequestSummaryValue(c, RequestSummaryUserIDKey))
+	appendPart("channel", GetRequestSummaryValue(c, RequestSummaryUpstreamKey))
+	appendPart("model", GetRequestSummaryValue(c, RequestSummaryModelKey))
+	appendPart("type", GetRequestSummaryValue(c, RequestSummaryRequestTypeKey))
+	appendPart("matched_email", GetRequestSummaryValue(c, RequestSummaryMatchedAccountKey))
+
+	if attempts := GetRequestSummaryValue(c, RequestSummaryAttemptsKey); attempts != "" && attempts != "1" {
+		appendPart("retry", attempts)
+	}
+	if firstByteMS := GetRequestSummaryValue(c, RequestSummaryFirstByteMSKey); firstByteMS != "" {
+		appendPart("first_byte_ms", firstByteMS)
+	}
+	if totalTokens := GetRequestSummaryValue(c, RequestSummaryTotalTokensKey); totalTokens != "" {
+		appendPart("tokens", totalTokens)
+	}
+
+	return strings.Join(parts, " ")
 }
 
 // isAIAPIPath checks if the given path is an AI API endpoint that should have request ID tracking.

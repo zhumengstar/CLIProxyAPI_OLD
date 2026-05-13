@@ -6,12 +6,15 @@ package middleware
 import (
 	"bytes"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/tidwall/gjson"
 )
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
@@ -284,6 +287,8 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		return nil
 	}
 
+	w.populateRequestSummary(c, w.extractRequestBody(c), w.extractAPIResponse(c), w.extractResponseBody(c), w.extractAPIResponseTimestamp(c))
+
 	if w.isStreaming && w.streamWriter != nil {
 		if w.chunkChannel != nil {
 			close(w.chunkChannel)
@@ -319,6 +324,133 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 	}
 
 	return w.logRequest(w.extractRequestBody(c), finalStatusCode, w.cloneHeaders(), w.extractResponseBody(c), w.extractWebsocketTimeline(c), w.extractAPIRequest(c), w.extractAPIResponse(c), w.extractAPIWebsocketTimeline(c), w.extractAPIResponseTimestamp(c), slicesAPIResponseError, forceLog)
+}
+
+func (w *ResponseWriterWrapper) populateRequestSummary(c *gin.Context, requestBody []byte, apiResponse []byte, responseBody []byte, apiResponseTimestamp time.Time) {
+	if c == nil || w.requestInfo == nil {
+		return
+	}
+
+	userID, username := parseRequestSummarySessionID(firstHeaderValue(w.requestInfo.Headers, "X-Session-ID"))
+	logging.SetRequestSummaryValue(c, logging.RequestSummaryUserIDKey, userID)
+	logging.SetRequestSummaryValue(c, logging.RequestSummaryUsernameKey, username)
+	logging.SetRequestSummaryValue(c, logging.RequestSummaryModelKey, firstNonEmptyJSONField(requestBody, "model", "model_name", "response.model"))
+	logging.SetRequestSummaryValue(c, logging.RequestSummaryRequestTypeKey, inferRequestSummaryType(w.requestInfo.URL))
+
+	if !apiResponseTimestamp.IsZero() && !w.requestInfo.Timestamp.IsZero() {
+		firstByteMS := apiResponseTimestamp.Sub(w.requestInfo.Timestamp).Milliseconds()
+		if firstByteMS >= 0 {
+			logging.SetRequestSummaryValue(c, logging.RequestSummaryFirstByteMSKey, strconv.FormatInt(firstByteMS, 10))
+		}
+	}
+
+	totalTokens := extractTotalTokens(apiResponse)
+	if totalTokens == 0 {
+		totalTokens = extractTotalTokens(responseBody)
+	}
+	if totalTokens > 0 {
+		logging.SetRequestSummaryValue(c, logging.RequestSummaryTotalTokensKey, strconv.FormatInt(totalTokens, 10))
+	}
+}
+
+func firstHeaderValue(headers map[string][]string, key string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	for currentKey, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(currentKey), key) {
+			continue
+		}
+		if len(values) == 0 {
+			return ""
+		}
+		return strings.TrimSpace(values[0])
+	}
+	return ""
+}
+
+func parseRequestSummarySessionID(sessionID string) (userID string, username string) {
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" {
+		return "", ""
+	}
+	const prefix = "newapi-user-"
+	lowered := strings.ToLower(trimmed)
+	if !strings.HasPrefix(lowered, prefix) {
+		return "", ""
+	}
+	raw := strings.TrimSpace(trimmed[len(prefix):])
+	if raw == "" {
+		return "", ""
+	}
+	parts := strings.SplitN(raw, "+", 2)
+	userID = strings.TrimSpace(parts[0])
+	if len(parts) > 1 {
+		username = strings.TrimSpace(parts[1])
+	}
+	return userID, username
+}
+
+func firstNonEmptyJSONField(data []byte, paths ...string) string {
+	if len(data) == 0 {
+		return ""
+	}
+	for _, path := range paths {
+		value := strings.TrimSpace(gjson.GetBytes(data, path).String())
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func inferRequestSummaryType(rawURL string) string {
+	if strings.TrimSpace(rawURL) == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	path := strings.Trim(parsed.Path, "/")
+	if path == "" {
+		return ""
+	}
+	segments := strings.Split(path, "/")
+	switch {
+	case len(segments) >= 2 && segments[0] == "v1":
+		return strings.Join(segments[1:], "/")
+	case len(segments) >= 3 && segments[0] == "api" && segments[1] == "provider":
+		return strings.Join(segments[2:], "/")
+	default:
+		return strings.Join(segments, "/")
+	}
+}
+
+func extractTotalTokens(data []byte) int64 {
+	if len(data) == 0 {
+		return 0
+	}
+	paths := []string{
+		"usage.total_tokens",
+		"usage.totalTokenCount",
+		"usageMetadata.totalTokenCount",
+		"usage_metadata.totalTokenCount",
+		"response.usage.total_tokens",
+		"response.usage.totalTokenCount",
+		"response.usageMetadata.totalTokenCount",
+		"response.usage_metadata.totalTokenCount",
+	}
+	for _, path := range paths {
+		value := gjson.GetBytes(data, path)
+		if value.Exists() {
+			total := value.Int()
+			if total > 0 {
+				return total
+			}
+		}
+	}
+	return 0
 }
 
 func (w *ResponseWriterWrapper) cloneHeaders() map[string][]string {

@@ -65,6 +65,9 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 
 	attempts := getAttempts(ginCtx)
 	index := len(attempts) + 1
+	logging.SetRequestSummaryValue(ginCtx, logging.RequestSummaryAttemptsKey, fmt.Sprintf("%d", index))
+	logging.SetRequestSummaryValue(ginCtx, logging.RequestSummaryUpstreamKey, info.Provider)
+	logging.SetRequestSummaryValue(ginCtx, logging.RequestSummaryMatchedAccountKey, info.AuthLabel)
 
 	builder := &strings.Builder{}
 	builder.WriteString(fmt.Sprintf("=== API REQUEST %d ===\n", index))
