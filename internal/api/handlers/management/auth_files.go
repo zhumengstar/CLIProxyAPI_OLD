@@ -70,6 +70,11 @@ type authUploadFailure struct {
 	Error string
 }
 
+type accountPoolArchiveFile struct {
+	Name string
+	Data []byte
+}
+
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
 		return time.Time{}, false
@@ -604,15 +609,22 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	if len(fileHeaders) > 0 {
 		uploaded := make([]string, 0, len(fileHeaders))
 		failed := make([]gin.H, 0)
+		archiveFiles := make([]accountPoolArchiveFile, 0, len(fileHeaders))
 		for _, file := range fileHeaders {
-			names, failures, errUpload := h.storeUploadedAuthFiles(ctx, file)
+			names, failures, updates, errUpload := h.storeUploadedAuthFiles(ctx, file, false)
 			if errUpload != nil {
 				failed = append(failed, gin.H{"name": uploadedFileDisplayName(file), "error": uploadErrorMessage(errUpload)})
 				continue
 			}
 			uploaded = append(uploaded, names...)
+			archiveFiles = append(archiveFiles, updates...)
 			for _, failure := range failures {
 				failed = append(failed, gin.H{"name": failure.Name, "error": failure.Error})
+			}
+		}
+		if len(archiveFiles) > 0 {
+			if errArchive := h.upsertAccountPoolArchiveFiles(archiveFiles); errArchive != nil {
+				log.WithError(errArchive).Warn("failed to update account pool archive for uploaded auth files")
 			}
 		}
 		if len(fileHeaders) == 1 && len(uploaded) == 1 && len(failed) == 0 {
@@ -766,42 +778,43 @@ func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHea
 	return headers, nil
 }
 
-func (h *Handler) storeUploadedAuthFiles(ctx context.Context, file *multipart.FileHeader) ([]string, []authUploadFailure, error) {
+func (h *Handler) storeUploadedAuthFiles(ctx context.Context, file *multipart.FileHeader, updateArchive bool) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
 	if file == nil {
-		return nil, nil, fmt.Errorf("no file uploaded")
+		return nil, nil, nil, fmt.Errorf("no file uploaded")
 	}
 	name := filepath.Base(strings.TrimSpace(file.Filename))
 	lowerName := strings.ToLower(name)
 	if !strings.HasSuffix(lowerName, ".json") && !strings.HasSuffix(lowerName, ".zip") {
-		return nil, nil, errAuthFileMustBeJSON
+		return nil, nil, nil, errAuthFileMustBeJSON
 	}
 	src, err := file.Open()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open uploaded file: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to open uploaded file: %w", err)
 	}
 	defer src.Close()
 
 	data, err := io.ReadAll(src)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read uploaded file: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to read uploaded file: %w", err)
 	}
 	if strings.HasSuffix(lowerName, ".zip") {
-		return h.storeUploadedAuthZip(ctx, data)
+		return h.storeUploadedAuthZip(ctx, data, updateArchive)
 	}
-	if err := h.writeAuthFile(ctx, name, data); err != nil {
-		return nil, nil, err
+	if err := h.writeAuthFileWithArchive(ctx, name, data, updateArchive); err != nil {
+		return nil, nil, nil, err
 	}
-	return []string{name}, nil, nil
+	return []string{name}, nil, []accountPoolArchiveFile{{Name: name, Data: data}}, nil
 }
 
-func (h *Handler) storeUploadedAuthZip(ctx context.Context, data []byte) ([]string, []authUploadFailure, error) {
+func (h *Handler) storeUploadedAuthZip(ctx context.Context, data []byte, updateArchive bool) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
 	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid zip archive: %w", err)
+		return nil, nil, nil, fmt.Errorf("invalid zip archive: %w", err)
 	}
 
 	uploaded := make([]string, 0)
 	failures := make([]authUploadFailure, 0)
+	archiveFiles := make([]accountPoolArchiveFile, 0)
 	for _, entry := range reader.File {
 		if entry == nil || entry.FileInfo().IsDir() {
 			continue
@@ -829,16 +842,17 @@ func (h *Handler) storeUploadedAuthZip(ctx context.Context, data []byte) ([]stri
 			failures = append(failures, authUploadFailure{Name: name, Error: fmt.Sprintf("failed to close zip entry: %v", errClose)})
 			continue
 		}
-		if errWrite := h.writeAuthFile(ctx, name, entryData); errWrite != nil {
+		if errWrite := h.writeAuthFileWithArchive(ctx, name, entryData, updateArchive); errWrite != nil {
 			failures = append(failures, authUploadFailure{Name: name, Error: errWrite.Error()})
 			continue
 		}
 		uploaded = append(uploaded, name)
+		archiveFiles = append(archiveFiles, accountPoolArchiveFile{Name: name, Data: entryData})
 	}
 	if len(uploaded) == 0 && len(failures) == 0 {
-		return nil, nil, errAuthArchiveNoJSON
+		return nil, nil, nil, errAuthArchiveNoJSON
 	}
-	return uploaded, failures, nil
+	return uploaded, failures, archiveFiles, nil
 }
 
 func authArchiveEntryFileName(name string) string {
@@ -864,6 +878,10 @@ func uploadErrorMessage(err error) string {
 }
 
 func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+	return h.writeAuthFileWithArchive(ctx, name, data, true)
+}
+
+func (h *Handler) writeAuthFileWithArchive(ctx context.Context, name string, data []byte, updateArchive bool) error {
 	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	if !filepath.IsAbs(dst) {
 		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
@@ -880,10 +898,36 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
 		return err
 	}
-	if err := h.upsertAccountPoolArchiveFile(filepath.Base(name), data); err != nil {
-		log.WithError(err).Warnf("failed to update account pool archive for %s", filepath.Base(name))
+	if updateArchive {
+		if err := h.upsertAccountPoolArchiveFile(filepath.Base(name), data); err != nil {
+			log.WithError(err).Warnf("failed to update account pool archive for %s", filepath.Base(name))
+		}
 	}
 	return nil
+}
+
+func (h *Handler) upsertAccountPoolArchiveFiles(files []accountPoolArchiveFile) error {
+	if h == nil || h.cfg == nil {
+		return fmt.Errorf("handler not initialized")
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		name := filepath.Base(strings.TrimSpace(file.Name))
+		if isUnsafeAuthFileName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		if len(bytes.TrimSpace(file.Data)) == 0 {
+			continue
+		}
+		entries[name] = file.Data
+	}
+	return h.writeAccountPoolArchive(dedupeAccountPoolEntries(entries))
 }
 
 func (h *Handler) accountPoolArchivePath() string {
@@ -891,23 +935,7 @@ func (h *Handler) accountPoolArchivePath() string {
 }
 
 func (h *Handler) upsertAccountPoolArchiveFile(name string, data []byte) error {
-	if h == nil || h.cfg == nil {
-		return fmt.Errorf("handler not initialized")
-	}
-	name = filepath.Base(strings.TrimSpace(name))
-	if isUnsafeAuthFileName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
-		return fmt.Errorf("invalid auth file name")
-	}
-	if len(bytes.TrimSpace(data)) == 0 {
-		return fmt.Errorf("empty auth file")
-	}
-
-	entries, err := h.readAccountPoolArchive()
-	if err != nil {
-		return err
-	}
-	entries[name] = data
-	return h.writeAccountPoolArchive(dedupeAccountPoolEntries(entries))
+	return h.upsertAccountPoolArchiveFiles([]accountPoolArchiveFile{{Name: name, Data: data}})
 }
 
 func (h *Handler) syncAccountPoolArchiveFromAuthDir() error {
