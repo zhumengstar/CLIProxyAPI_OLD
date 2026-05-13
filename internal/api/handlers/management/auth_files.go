@@ -812,10 +812,23 @@ func (h *Handler) storeUploadedAuthZip(ctx context.Context, data []byte, updateA
 		return nil, nil, nil, fmt.Errorf("invalid zip archive: %w", err)
 	}
 
-	uploaded := make([]string, 0)
+	type zipAuthJob struct {
+		index int
+		name  string
+		entry *zip.File
+	}
+	type zipAuthResult struct {
+		index       int
+		name        string
+		uploaded    bool
+		archiveFile accountPoolArchiveFile
+		failure     *authUploadFailure
+	}
+
+	jobs := make([]zipAuthJob, 0, len(reader.File))
 	failures := make([]authUploadFailure, 0)
-	archiveFiles := make([]accountPoolArchiveFile, 0)
-	for _, entry := range reader.File {
+	latestIndexByName := make(map[string]int)
+	for index, entry := range reader.File {
 		if entry == nil || entry.FileInfo().IsDir() {
 			continue
 		}
@@ -827,32 +840,106 @@ func (h *Handler) storeUploadedAuthZip(ctx context.Context, data []byte, updateA
 			failures = append(failures, authUploadFailure{Name: entry.Name, Error: "invalid name"})
 			continue
 		}
-		rc, errOpen := entry.Open()
-		if errOpen != nil {
-			failures = append(failures, authUploadFailure{Name: name, Error: fmt.Sprintf("failed to open zip entry: %v", errOpen)})
+		jobs = append(jobs, zipAuthJob{index: index, name: name, entry: entry})
+		latestIndexByName[name] = index
+	}
+	if len(jobs) == 0 && len(failures) == 0 {
+		return nil, nil, nil, errAuthArchiveNoJSON
+	}
+
+	jobCh := make(chan zipAuthJob)
+	resultCh := make(chan zipAuthResult, len(jobs))
+	workerCount := authZipLoadConcurrency(len(jobs))
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer wg.Done()
+			for job := range jobCh {
+				if latestIndexByName[job.name] != job.index {
+					continue
+				}
+				result := zipAuthResult{index: job.index, name: job.name}
+				rc, errOpen := job.entry.Open()
+				if errOpen != nil {
+					result.failure = &authUploadFailure{Name: job.name, Error: fmt.Sprintf("failed to open zip entry: %v", errOpen)}
+					resultCh <- result
+					continue
+				}
+				entryData, errRead := io.ReadAll(rc)
+				errClose := rc.Close()
+				if errRead != nil {
+					result.failure = &authUploadFailure{Name: job.name, Error: fmt.Sprintf("failed to read zip entry: %v", errRead)}
+					resultCh <- result
+					continue
+				}
+				if errClose != nil {
+					result.failure = &authUploadFailure{Name: job.name, Error: fmt.Sprintf("failed to close zip entry: %v", errClose)}
+					resultCh <- result
+					continue
+				}
+				if errWrite := h.writeAuthFileWithArchive(ctx, job.name, entryData, updateArchive); errWrite != nil {
+					result.failure = &authUploadFailure{Name: job.name, Error: errWrite.Error()}
+					resultCh <- result
+					continue
+				}
+				result.uploaded = true
+				result.archiveFile = accountPoolArchiveFile{Name: job.name, Data: entryData}
+				resultCh <- result
+			}
+		}()
+	}
+	go func() {
+		for _, job := range jobs {
+			jobCh <- job
+		}
+		close(jobCh)
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	results := make([]zipAuthResult, 0, len(jobs))
+	for result := range resultCh {
+		results = append(results, result)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].index < results[j].index
+	})
+
+	uploaded := make([]string, 0, len(results))
+	archiveFiles := make([]accountPoolArchiveFile, 0, len(results))
+	for _, result := range results {
+		if result.failure != nil {
+			failures = append(failures, *result.failure)
 			continue
 		}
-		entryData, errRead := io.ReadAll(rc)
-		errClose := rc.Close()
-		if errRead != nil {
-			failures = append(failures, authUploadFailure{Name: name, Error: fmt.Sprintf("failed to read zip entry: %v", errRead)})
+		if !result.uploaded {
 			continue
 		}
-		if errClose != nil {
-			failures = append(failures, authUploadFailure{Name: name, Error: fmt.Sprintf("failed to close zip entry: %v", errClose)})
-			continue
-		}
-		if errWrite := h.writeAuthFileWithArchive(ctx, name, entryData, updateArchive); errWrite != nil {
-			failures = append(failures, authUploadFailure{Name: name, Error: errWrite.Error()})
-			continue
-		}
-		uploaded = append(uploaded, name)
-		archiveFiles = append(archiveFiles, accountPoolArchiveFile{Name: name, Data: entryData})
+		uploaded = append(uploaded, result.name)
+		archiveFiles = append(archiveFiles, result.archiveFile)
 	}
 	if len(uploaded) == 0 && len(failures) == 0 {
 		return nil, nil, nil, errAuthArchiveNoJSON
 	}
 	return uploaded, failures, archiveFiles, nil
+}
+
+func authZipLoadConcurrency(count int) int {
+	if count <= 1 {
+		return 1
+	}
+	limit := runtime.GOMAXPROCS(0) * 2
+	if limit < 4 {
+		limit = 4
+	}
+	if limit > 16 {
+		limit = 16
+	}
+	if count < limit {
+		return count
+	}
+	return limit
 }
 
 func authArchiveEntryFileName(name string) string {
