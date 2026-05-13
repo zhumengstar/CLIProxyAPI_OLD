@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -83,6 +84,104 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 	if len(auths) != len(files) {
 		t.Fatalf("expected %d auth entries, got %d", len(files), len(auths))
 	}
+
+	archiveEntries := readTestZipEntries(t, filepath.Join(authDir, "account-pool.zip"))
+	for _, file := range files {
+		if got := string(archiveEntries[file.name]); got != file.content {
+			t.Fatalf("expected account pool archive entry %s content %q, got %q", file.name, file.content, got)
+		}
+	}
+}
+
+func TestDownloadAccountPoolArchive_PreservesDeletedFilesAndAddsCurrentFiles(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+
+	deletedName := "deleted.json"
+	deletedContent := []byte(`{"type":"codex","email":"deleted@example.com"}`)
+	if err := h.upsertAccountPoolArchiveFile(deletedName, deletedContent); err != nil {
+		t.Fatalf("failed to seed account pool archive: %v", err)
+	}
+
+	currentName := "current.json"
+	currentContent := []byte(`{"type":"claude","email":"current@example.com"}`)
+	if err := os.WriteFile(filepath.Join(authDir, currentName), currentContent, 0o600); err != nil {
+		t.Fatalf("failed to seed current auth file: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/account-pool/download", nil)
+
+	h.DownloadAccountPoolArchive(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if contentType := rec.Header().Get("Content-Type"); contentType != "application/zip" {
+		t.Fatalf("expected application/zip content type, got %q", contentType)
+	}
+
+	reader, err := zip.NewReader(bytes.NewReader(rec.Body.Bytes()), int64(rec.Body.Len()))
+	if err != nil {
+		t.Fatalf("failed to read response zip: %v", err)
+	}
+	entries := make(map[string][]byte, len(reader.File))
+	for _, entry := range reader.File {
+		rc, errOpen := entry.Open()
+		if errOpen != nil {
+			t.Fatalf("failed to open response zip entry %s: %v", entry.Name, errOpen)
+		}
+		data, errRead := io.ReadAll(rc)
+		errClose := rc.Close()
+		if errRead != nil {
+			t.Fatalf("failed to read response zip entry %s: %v", entry.Name, errRead)
+		}
+		if errClose != nil {
+			t.Fatalf("failed to close response zip entry %s: %v", entry.Name, errClose)
+		}
+		entries[entry.Name] = data
+	}
+
+	if got := string(entries[deletedName]); got != string(deletedContent) {
+		t.Fatalf("expected deleted archive entry to be preserved, got %q", got)
+	}
+	if got := string(entries[currentName]); got != string(currentContent) {
+		t.Fatalf("expected current auth file to be included, got %q", got)
+	}
+}
+
+func readTestZipEntries(t *testing.T, archivePath string) map[string][]byte {
+	t.Helper()
+
+	data, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatalf("failed to read zip archive: %v", err)
+	}
+	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("failed to open zip archive: %v", err)
+	}
+	entries := make(map[string][]byte, len(reader.File))
+	for _, entry := range reader.File {
+		rc, errOpen := entry.Open()
+		if errOpen != nil {
+			t.Fatalf("failed to open zip entry %s: %v", entry.Name, errOpen)
+		}
+		entryData, errRead := io.ReadAll(rc)
+		errClose := rc.Close()
+		if errRead != nil {
+			t.Fatalf("failed to read zip entry %s: %v", entry.Name, errRead)
+		}
+		if errClose != nil {
+			t.Fatalf("failed to close zip entry %s: %v", entry.Name, errClose)
+		}
+		entries[entry.Name] = entryData
+	}
+	return entries
 }
 
 func TestUploadAuthFile_BatchMultipart_InvalidJSONDoesNotOverwriteExistingFile(t *testing.T) {
