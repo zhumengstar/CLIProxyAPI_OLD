@@ -439,6 +439,12 @@ type SessionAffinitySelector struct {
 	cache    *SessionCache
 }
 
+type sessionAuthView struct {
+	authID   string
+	failures int
+	ok       bool
+}
+
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
 	Fallback Selector
@@ -489,29 +495,26 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return s.fallback.Pick(ctx, provider, model, opts, auths)
 	}
 
+	cacheKey := provider + "::" + primaryID + "::" + model
+
+	if cached := s.sessionAuthForKey(cacheKey); cached.ok && cached.failures < 2 {
+		for _, auth := range auths {
+			if auth == nil || auth.ID != cached.authID {
+				continue
+			}
+			if auth.Disabled || auth.Status == StatusDisabled {
+				break
+			}
+			_, _ = s.cache.GetAndRefresh(cacheKey)
+			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			return auth, nil
+		}
+	}
+
 	now := time.Now()
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
 		return nil, err
-	}
-
-	cacheKey := provider + "::" + primaryID + "::" + model
-
-	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		for _, auth := range available {
-			if auth.ID == cachedAuthID {
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
-			}
-		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
-		if err != nil {
-			return nil, err
-		}
-		s.cache.Set(cacheKey, auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-		return auth, nil
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
@@ -534,6 +537,17 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	s.cache.Set(cacheKey, auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) sessionAuthForKey(cacheKey string) sessionAuthView {
+	if s == nil || s.cache == nil || cacheKey == "" {
+		return sessionAuthView{}
+	}
+	authID, failures, ok := s.cache.GetState(cacheKey)
+	if !ok {
+		return sessionAuthView{}
+	}
+	return sessionAuthView{authID: authID, failures: failures, ok: true}
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {
@@ -567,6 +581,19 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	if s.cache != nil {
 		s.cache.InvalidateAuth(authID)
 	}
+}
+
+// RecordResult updates the session binding after a request outcome.
+func (s *SessionAffinitySelector) RecordResult(sessionID, authID string, success bool) {
+	if s == nil || s.cache == nil {
+		return
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	authID = strings.TrimSpace(authID)
+	if sessionID == "" || authID == "" {
+		return
+	}
+	s.cache.RecordResult(sessionID, authID, success)
 }
 
 // ExtractSessionID extracts session identifier from multiple sources.

@@ -700,6 +700,90 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 	}
 }
 
+func TestSessionAffinitySelector_RetriesSessionAuthTwiceThenPicksHighestPriority(t *testing.T) {
+	t.Parallel()
+
+	fallback := &RoundRobinSelector{}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: fallback,
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	now := time.Now()
+	auths := []*Auth{
+		{ID: "auth-a", Unavailable: true, NextRetryAfter: now.Add(time.Minute)},
+		{ID: "auth-b", Attributes: map[string]string{"priority": "20"}},
+		{ID: "auth-c", Attributes: map[string]string{"priority": "10"}},
+	}
+	headers := make(http.Header)
+	headers.Set("X-Session-ID", "user-1")
+	opts := cliproxyexecutor.Options{Headers: headers}
+	cacheKey := "claude::header:user-1::claude-3"
+
+	selector.cache.Set(cacheKey, "auth-a")
+
+	firstRetry, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() first retry error = %v", err)
+	}
+	if firstRetry.ID != "auth-a" {
+		t.Fatalf("Pick() first retry auth = %q, want auth-a", firstRetry.ID)
+	}
+
+	selector.RecordResult(cacheKey, "auth-a", false)
+
+	secondRetry, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() second retry error = %v", err)
+	}
+	if secondRetry.ID != "auth-a" {
+		t.Fatalf("Pick() second retry auth = %q, want auth-a", secondRetry.ID)
+	}
+
+	selector.RecordResult(cacheKey, "auth-a", false)
+
+	afterTwoFailures, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() after two failures error = %v", err)
+	}
+	if afterTwoFailures.ID != "auth-b" {
+		t.Fatalf("Pick() after two failures auth = %q, want highest-priority auth-b", afterTwoFailures.ID)
+	}
+}
+
+func TestSessionAffinitySelector_SuccessResetsFailureCount(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-a"},
+		{ID: "auth-b", Attributes: map[string]string{"priority": "20"}},
+	}
+	headers := make(http.Header)
+	headers.Set("X-Session-ID", "user-1")
+	opts := cliproxyexecutor.Options{Headers: headers}
+	cacheKey := "claude::header:user-1::claude-3"
+
+	selector.cache.Set(cacheKey, "auth-a")
+	selector.RecordResult(cacheKey, "auth-a", false)
+	selector.RecordResult(cacheKey, "auth-a", true)
+	selector.RecordResult(cacheKey, "auth-a", false)
+
+	got, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got.ID != "auth-a" {
+		t.Fatalf("Pick() after success reset auth = %q, want auth-a", got.ID)
+	}
+}
+
 func TestRoundRobinSelectorPick_MixedVirtualAndNonVirtualFallsBackToFlat(t *testing.T) {
 	t.Parallel()
 

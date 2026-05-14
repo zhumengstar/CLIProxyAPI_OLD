@@ -9,6 +9,7 @@ import (
 type sessionEntry struct {
 	authID    string
 	expiresAt time.Time
+	failures  int
 }
 
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
@@ -80,6 +81,29 @@ func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
 	return entry.authID, true
 }
 
+// GetState retrieves the auth ID and failure count bound to a session, if still valid.
+func (c *SessionCache) GetState(sessionID string) (string, int, bool) {
+	if sessionID == "" {
+		return "", 0, false
+	}
+	now := time.Now()
+	c.mu.Lock()
+	entry, ok := c.entries[sessionID]
+	if !ok {
+		c.mu.Unlock()
+		return "", 0, false
+	}
+	if now.After(entry.expiresAt) {
+		delete(c.entries, sessionID)
+		c.mu.Unlock()
+		return "", 0, false
+	}
+	entry.expiresAt = now.Add(c.ttl)
+	c.entries[sessionID] = entry
+	c.mu.Unlock()
+	return entry.authID, entry.failures, true
+}
+
 // Set binds a session to an auth ID with TTL refresh.
 func (c *SessionCache) Set(sessionID, authID string) {
 	if sessionID == "" || authID == "" {
@@ -89,7 +113,43 @@ func (c *SessionCache) Set(sessionID, authID string) {
 	c.entries[sessionID] = sessionEntry{
 		authID:    authID,
 		expiresAt: time.Now().Add(c.ttl),
+		failures:  0,
 	}
+	c.mu.Unlock()
+}
+
+// RecordResult updates the session binding after a request outcome.
+func (c *SessionCache) RecordResult(sessionID, authID string, success bool) {
+	if sessionID == "" || authID == "" {
+		return
+	}
+	now := time.Now()
+	c.mu.Lock()
+	entry, ok := c.entries[sessionID]
+	if !ok || entry.authID != authID {
+		c.mu.Unlock()
+		return
+	}
+	if now.After(entry.expiresAt) {
+		delete(c.entries, sessionID)
+		c.mu.Unlock()
+		return
+	}
+	if success {
+		entry.failures = 0
+		entry.expiresAt = now.Add(c.ttl)
+		c.entries[sessionID] = entry
+		c.mu.Unlock()
+		return
+	}
+	entry.failures++
+	if entry.failures >= 2 {
+		delete(c.entries, sessionID)
+		c.mu.Unlock()
+		return
+	}
+	entry.expiresAt = now.Add(c.ttl)
+	c.entries[sessionID] = entry
 	c.mu.Unlock()
 }
 
