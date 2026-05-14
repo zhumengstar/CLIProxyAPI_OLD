@@ -201,10 +201,13 @@ const buildAuthFileFingerprint = (file: AuthFileItem): string => {
   return parts.map((part) => String(part ?? '')).join('|');
 };
 
-export const syncAccountPoolFromAuthFiles = async (): Promise<AccountPoolRecord[]> => {
+export const syncAccountPoolFromAuthFiles = async (
+  concurrency = ACCOUNT_POOL_SYNC_CONCURRENCY
+): Promise<AccountPoolRecord[]> => {
   if (syncInFlight) return syncInFlight;
 
   syncInFlight = (async () => {
+    const syncConcurrency = Math.max(1, Math.floor(concurrency));
     const deletedHashes = readDeletedAccountPoolHashes();
     const storedRecords = uniqueAccountPoolRecords(readAccountPoolRecords()).filter(
       (record) => !deletedHashes.has(record.hash)
@@ -220,7 +223,7 @@ export const syncAccountPoolFromAuthFiles = async (): Promise<AccountPoolRecord[
 
     await runWithConcurrency(
       importedFiles,
-      ACCOUNT_POOL_SYNC_CONCURRENCY,
+      syncConcurrency,
       async (file) => {
         const sourceFingerprint = buildAuthFileFingerprint(file);
         const existing = recordsByName.get(file.name);

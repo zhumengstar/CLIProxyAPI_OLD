@@ -745,7 +745,7 @@ export function AccountPoolPage() {
     setError('');
     hydrateStoredPool();
     try {
-      const mergedRecords = await syncAccountPoolFromAuthFiles();
+      const mergedRecords = await syncAccountPoolFromAuthFiles(checkConcurrency);
       applyRecords(mergedRecords);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('notification.refresh_failed');
@@ -755,7 +755,7 @@ export function AccountPoolPage() {
         setLoading(false);
       }
     }
-  }, [applyRecords, hydrateStoredPool, t]);
+  }, [applyRecords, checkConcurrency, hydrateStoredPool, t]);
 
   useEffect(() => {
     hydrateStoredPool();
