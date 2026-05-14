@@ -51,6 +51,18 @@ const matchesStatusFilter = (record: AccountPoolUsageRecord, filter: string): bo
   return String(statusCode) === filter;
 };
 
+const getRecordUserFilterValue = (record: AccountPoolUsageRecord): string =>
+  String(record.newapi_user_id || record.username || record.session_id || '').trim();
+
+const getRecordUserFilterLabel = (record: AccountPoolUsageRecord): string => {
+  const username = String(record.username || '').trim();
+  const userId = String(record.newapi_user_id || '').trim();
+  if (username && userId) return `${username} (ID ${userId})`;
+  if (username) return username;
+  if (userId) return `ID ${userId}`;
+  return String(record.session_id || '').trim();
+};
+
 const clampPageSize = (value: number): number =>
   Math.max(MIN_USAGE_PAGE_SIZE, Math.round(value));
 
@@ -62,7 +74,7 @@ export function UsageRecordsPage() {
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
-  const [serviceEmailFilter, setServiceEmailFilter] = useState('all');
+  const [userFilter, setUserFilter] = useState('all');
   const [modelFilter, setModelFilter] = useState('all');
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(DEFAULT_USAGE_PAGE_SIZE);
@@ -104,18 +116,19 @@ export function UsageRecordsPage() {
     return () => window.clearInterval(timer);
   }, [loadRecords]);
 
-  const emailOptions = useMemo(() => {
-    const emails = Array.from(
-      new Set(
-        records
-          .map((record) => record.service_email || record.auth_id || '')
-          .map((value) => value.trim())
-          .filter(Boolean)
-      )
-    ).sort((left, right) => left.localeCompare(right));
+  const userOptions = useMemo(() => {
+    const usersByValue = new Map<string, string>();
+    records.forEach((record) => {
+      const value = getRecordUserFilterValue(record);
+      if (!value) return;
+      usersByValue.set(value, getRecordUserFilterLabel(record) || value);
+    });
+    const users = Array.from(usersByValue.entries()).sort(([, left], [, right]) =>
+      left.localeCompare(right)
+    );
     return [
-      { value: 'all', label: '全部账号' },
-      ...emails.map((email) => ({ value: email, label: email })),
+      { value: 'all', label: '全部用户' },
+      ...users.map(([value, label]) => ({ value, label })),
     ];
   }, [records]);
 
@@ -153,10 +166,7 @@ export function UsageRecordsPage() {
     const term = normalizeText(search);
     return records.filter((record) => {
       if (!matchesStatusFilter(record, statusFilter)) return false;
-      if (
-        serviceEmailFilter !== 'all' &&
-        (record.service_email || record.auth_id || '') !== serviceEmailFilter
-      ) {
+      if (userFilter !== 'all' && getRecordUserFilterValue(record) !== userFilter) {
         return false;
       }
       if (modelFilter !== 'all' && (record.alias || record.model || '') !== modelFilter) {
@@ -177,7 +187,7 @@ export function UsageRecordsPage() {
         record.request_path,
       ].some((value) => normalizeText(value).includes(term));
     });
-  }, [modelFilter, records, search, serviceEmailFilter, statusFilter]);
+  }, [modelFilter, records, search, statusFilter, userFilter]);
 
   const totals = useMemo(
     () =>
@@ -201,7 +211,7 @@ export function UsageRecordsPage() {
 
   useEffect(() => {
     setPage(1);
-  }, [modelFilter, search, serviceEmailFilter, statusFilter]);
+  }, [modelFilter, search, statusFilter, userFilter]);
 
   useEffect(() => {
     if (page > totalPages) {
@@ -224,7 +234,7 @@ export function UsageRecordsPage() {
   const clearFilters = () => {
     setSearch('');
     setStatusFilter('all');
-    setServiceEmailFilter('all');
+    setUserFilter('all');
     setModelFilter('all');
     setPage(1);
   };
@@ -290,10 +300,10 @@ export function UsageRecordsPage() {
           <Select
             className={styles.filterSelect}
             fullWidth={false}
-            value={serviceEmailFilter}
-            options={emailOptions}
-            onChange={setServiceEmailFilter}
-            ariaLabel="账号筛选"
+            value={userFilter}
+            options={userOptions}
+            onChange={setUserFilter}
+            ariaLabel="用户筛选"
           />
           <Select
             className={styles.filterSelect}
