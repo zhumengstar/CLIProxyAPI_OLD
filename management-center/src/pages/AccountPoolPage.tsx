@@ -1765,16 +1765,6 @@ export function AccountPoolPage() {
                           </strong>
                         </div>
                       </div>
-                      <div className={styles.cardActions}>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => confirmDeletePoolEntries([file])}
-                          disabled={deletingPoolEntries}
-                        >
-                          {t('common.delete')}
-                        </Button>
-                      </div>
                     </div>
                   </div>
                   {checkResult && (
