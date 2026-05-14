@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -45,6 +46,9 @@ type apiCallRequest struct {
 	AuthIndexSnake  *string           `json:"auth_index"`
 	AuthIndexCamel  *string           `json:"authIndex"`
 	AuthIndexPascal *string           `json:"AuthIndex"`
+	AuthNameSnake   *string           `json:"auth_name"`
+	AuthNameCamel   *string           `json:"authName"`
+	AuthNamePascal  *string           `json:"AuthName"`
 	Method          string            `json:"method"`
 	URL             string            `json:"url"`
 	Header          map[string]string `json:"header"`
@@ -132,7 +136,8 @@ func (h *Handler) APICall(c *gin.Context) {
 	}
 
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
-	auth := h.authByIndex(authIndex)
+	authName := firstNonEmptyString(body.AuthNameSnake, body.AuthNameCamel, body.AuthNamePascal)
+	auth := h.authByIndexOrName(authIndex, authName)
 
 	reqHeaders := body.Header
 	if reqHeaders == nil {
@@ -150,6 +155,10 @@ func (h *Handler) APICall(c *gin.Context) {
 		if !tokenResolved {
 			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth)
 			tokenResolved = true
+		}
+		if auth == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "auth not found"})
+			return
 		}
 		if auth != nil && token == "" {
 			if tokenErr != nil {
@@ -669,10 +678,16 @@ func tokenValueFromMetadata(metadata map[string]any) string {
 	return ""
 }
 
-func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
+func (h *Handler) authByIndexOrName(authIndex string, authName string) *coreauth.Auth {
 	authIndex = strings.TrimSpace(authIndex)
-	if authIndex == "" || h == nil || h.authManager == nil {
+	authName = strings.TrimSpace(authName)
+	if (authIndex == "" && authName == "") || h == nil || h.authManager == nil {
 		return nil
+	}
+	if authName != "" {
+		if auth, ok := h.authManager.GetByID(authName); ok {
+			return auth
+		}
 	}
 	auths := h.authManager.List()
 	for _, auth := range auths {
@@ -680,11 +695,18 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 			continue
 		}
 		auth.EnsureIndex()
-		if auth.Index == authIndex {
+		if authIndex != "" && auth.Index == authIndex {
+			return auth
+		}
+		if authName != "" && (auth.ID == authName || auth.FileName == authName || filepath.Base(strings.TrimSpace(authAttribute(auth, "path"))) == authName) {
 			return auth
 		}
 	}
 	return nil
+}
+
+func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
+	return h.authByIndexOrName(authIndex, "")
 }
 
 func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {

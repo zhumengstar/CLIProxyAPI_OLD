@@ -8,6 +8,7 @@ import { API_CALL_TIMEOUT_MS } from '@/utils/constants';
 
 export interface ApiCallRequest {
   authIndex?: string;
+  authName?: string;
   method: string;
   url: string;
   header?: Record<string, string>;

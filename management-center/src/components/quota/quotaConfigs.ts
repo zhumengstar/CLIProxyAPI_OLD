@@ -180,6 +180,7 @@ const fetchAntigravityQuota = async (
       const result = await apiCallApi.request(
         {
           authIndex,
+          authName: file.name,
           method: 'POST',
           url,
           header: { ...ANTIGRAVITY_REQUEST_HEADERS },
@@ -425,6 +426,7 @@ const fetchCodexQuota = async (
 
   const result = await apiCallApi.request({
     authIndex,
+    authName: file.name,
     method: 'GET',
     url: CODEX_USAGE_URL,
     header: requestHeader,
@@ -510,12 +512,14 @@ const resolveGeminiCliCreditBalance = (
 
 const fetchGeminiCliCodeAssist = async (
   authIndex: string,
+  authName: string,
   projectId: string,
   t: TFunction
 ): Promise<{ tierLabel: string | null; tierId: string | null; creditBalance: number | null }> => {
   try {
     const result = await apiCallApi.request({
       authIndex,
+      authName,
       method: 'POST',
       url: GEMINI_CLI_CODE_ASSIST_URL,
       header: { ...GEMINI_CLI_REQUEST_HEADERS },
@@ -572,7 +576,7 @@ const scheduleGeminiCliSupplementaryRefresh = (
   geminiCliSupplementaryCache.delete(fileName);
 
   void (async () => {
-    const supplementary = await fetchGeminiCliCodeAssist(authIndex, projectId, t);
+    const supplementary = await fetchGeminiCliCodeAssist(authIndex, fileName, projectId, t);
     if (geminiCliSupplementaryRequestIds.get(fileName) !== requestId) {
       return;
     }
@@ -633,6 +637,7 @@ const fetchGeminiCliQuota = async (
 
   const quotaResponse = await apiCallApi.request({
     authIndex,
+    authName: file.name,
     method: 'POST',
     url: GEMINI_CLI_QUOTA_URL,
     header: { ...GEMINI_CLI_REQUEST_HEADERS },
@@ -1014,12 +1019,14 @@ const fetchClaudeQuota = async (
   const [usageResult, profileResult] = await Promise.allSettled([
     apiCallApi.request({
       authIndex,
+      authName: file.name,
       method: 'GET',
       url: CLAUDE_USAGE_URL,
       header: { ...CLAUDE_REQUEST_HEADERS },
     }, { signal }),
     apiCallApi.request({
       authIndex,
+      authName: file.name,
       method: 'GET',
       url: CLAUDE_PROFILE_URL,
       header: { ...CLAUDE_REQUEST_HEADERS },
@@ -1274,6 +1281,7 @@ const fetchKimiQuota = async (
 
   const result = await apiCallApi.request({
     authIndex,
+    authName: file.name,
     method: 'GET',
     url: KIMI_USAGE_URL,
     header: { ...KIMI_REQUEST_HEADERS },
