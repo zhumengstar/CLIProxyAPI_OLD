@@ -1389,15 +1389,16 @@ export function AccountPoolPage() {
 
   const detectAccounts = async (targets: AuthFileItem[]) => {
     if (targets.length === 0 || checking) return;
-    let checkTargets = targets;
-    try {
-      const freshRecords = await syncAccountPoolFromAuthFiles(checkConcurrency);
-      applyRecords(freshRecords);
-      const freshByName = new Map(freshRecords.map((record) => [record.file.name, record.file]));
-      checkTargets = targets.map((file) => freshByName.get(file.name) ?? file);
-    } catch {
-      // Keep detection usable when a best-effort pre-sync fails.
-    }
+    const checkTargets = targets;
+    void syncAccountPoolFromAuthFiles(checkConcurrency)
+      .then((freshRecords) => {
+        if (!useAccountPoolCheckStore.getState().checking) {
+          applyRecords(freshRecords);
+        }
+      })
+      .catch(() => {
+        // Background sync is best-effort; detection should start immediately.
+      });
 
     setCheckViewSnapshot(checkTargets.map((file) => file.name));
     setStatusStatsSnapshot(statusCodeStats);

@@ -287,6 +287,10 @@ func (h *Handler) refreshCodexOAuthAccessToken(ctx context.Context, auth *coreau
 	if auth == nil {
 		return "", nil
 	}
+	current := strings.TrimSpace(tokenValueFromMetadata(auth.Metadata))
+	if current != "" && !codexTokenNeedsRefresh(auth.Metadata) {
+		return current, nil
+	}
 	refreshToken := stringValue(auth.Metadata, "refresh_token")
 	if refreshToken == "" {
 		return tokenValueForAuth(auth), nil
@@ -329,6 +333,35 @@ func (h *Handler) refreshCodexOAuthAccessToken(ctx context.Context, auth *coreau
 		_, _ = h.authManager.Update(ctx, auth)
 	}
 	return strings.TrimSpace(tokenData.AccessToken), nil
+}
+
+func codexTokenNeedsRefresh(metadata map[string]any) bool {
+	// Refresh a bit early to avoid requests racing token expiry.
+	const skew = 30 * time.Second
+
+	if metadata == nil {
+		return true
+	}
+	if expStr, ok := metadata["expired"].(string); ok {
+		if ts, errParse := time.Parse(time.RFC3339, strings.TrimSpace(expStr)); errParse == nil {
+			return !ts.After(time.Now().Add(skew))
+		}
+	}
+	expiresAt := int64Value(metadata["expires_at"])
+	if expiresAt > 0 {
+		exp := time.Unix(expiresAt, 0)
+		if expiresAt > 1_000_000_000_000 {
+			exp = time.UnixMilli(expiresAt)
+		}
+		return !exp.After(time.Now().Add(skew))
+	}
+	expiresIn := int64Value(metadata["expires_in"])
+	timestampMs := int64Value(metadata["timestamp"])
+	if expiresIn > 0 && timestampMs > 0 {
+		exp := time.UnixMilli(timestampMs).Add(time.Duration(expiresIn) * time.Second)
+		return !exp.After(time.Now().Add(skew))
+	}
+	return true
 }
 
 func (h *Handler) refreshGeminiOAuthAccessToken(ctx context.Context, auth *coreauth.Auth) (string, error) {
