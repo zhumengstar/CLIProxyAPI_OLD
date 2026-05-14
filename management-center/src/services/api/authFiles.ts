@@ -553,20 +553,54 @@ export const authFilesApi = {
       return { status: 'ok', deleted: 0, files: [], failed: [] };
     }
 
-    const payload = await apiClient.delete<AuthFileBatchDeleteResponse>('/auth-files', {
-      data: { names: requestedNames },
-      timeout: getDynamicAuthFilesTimeout(requestedNames.length, { perItemMs: 180 }),
-    });
-    return normalizeBatchDeleteResponse(payload, requestedNames);
+    try {
+      const payload = await apiClient.delete<AuthFileBatchDeleteResponse>('/auth-files', {
+        data: { names: requestedNames },
+        timeout: getDynamicAuthFilesTimeout(requestedNames.length, { perItemMs: 180 }),
+      });
+      return normalizeBatchDeleteResponse(payload, requestedNames);
+    } catch (err) {
+      if (getStatusCode(err) !== 404) throw err;
+
+      const deleted: string[] = [];
+      const failed: Array<{ name: string; error: string }> = [];
+      await Promise.all(
+        requestedNames.map(async (name) => {
+          try {
+            await apiClient.delete(`/auth-files?name=${encodeURIComponent(name)}`, {
+              timeout: getDynamicAuthFilesTimeout(1, { perItemMs: 180 }),
+            });
+            deleted.push(name);
+          } catch (singleErr) {
+            failed.push({
+              name,
+              error: singleErr instanceof Error ? singleErr.message : 'delete failed',
+            });
+          }
+        })
+      );
+      return {
+        status: failed.length > 0 ? 'partial' : 'ok',
+        deleted: deleted.length,
+        files: deleted,
+        failed,
+      };
+    }
   },
 
   deleteFile: (name: string) => authFilesApi.deleteFiles([name]),
 
-  deleteAll: (expectedCount = readLastAuthFilesCount()) =>
-    apiClient.delete('/auth-files', {
-      params: { all: true },
-      timeout: getDynamicAuthFilesTimeout(expectedCount, { perItemMs: 160 }),
-    }),
+  deleteAll: async (expectedCount = readLastAuthFilesCount(), fallbackNames: string[] = []) => {
+    try {
+      return await apiClient.delete('/auth-files', {
+        params: { all: true },
+        timeout: getDynamicAuthFilesTimeout(expectedCount, { perItemMs: 160 }),
+      });
+    } catch (err) {
+      if (getStatusCode(err) !== 404 || fallbackNames.length === 0) throw err;
+      return authFilesApi.deleteFiles(fallbackNames);
+    }
+  },
 
   downloadText: async (name: string): Promise<string> => {
     const response = await apiClient.getRaw(`/auth-files/download?name=${encodeURIComponent(name)}`, {
