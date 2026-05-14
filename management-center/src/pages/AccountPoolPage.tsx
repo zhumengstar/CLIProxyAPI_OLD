@@ -1389,9 +1389,19 @@ export function AccountPoolPage() {
 
   const detectAccounts = async (targets: AuthFileItem[]) => {
     if (targets.length === 0 || checking) return;
-    setCheckViewSnapshot(targets.map((file) => file.name));
+    let checkTargets = targets;
+    try {
+      const freshRecords = await syncAccountPoolFromAuthFiles(checkConcurrency);
+      applyRecords(freshRecords);
+      const freshByName = new Map(freshRecords.map((record) => [record.file.name, record.file]));
+      checkTargets = targets.map((file) => freshByName.get(file.name) ?? file);
+    } catch {
+      // Keep detection usable when a best-effort pre-sync fails.
+    }
+
+    setCheckViewSnapshot(checkTargets.map((file) => file.name));
     setStatusStatsSnapshot(statusCodeStats);
-    const runId = beginCheck(targets.map((file) => file.name));
+    const runId = beginCheck(checkTargets.map((file) => file.name));
     if (!runId) {
       setCheckViewSnapshot(null);
       setStatusStatsSnapshot(null);
@@ -1460,7 +1470,7 @@ export function AccountPoolPage() {
         if (signal?.aborted || isRunCancelled(runId)) return;
         const index = cursor;
         cursor += 1;
-        const file = targets[index];
+        const file = checkTargets[index];
         if (!file) return;
         try {
           const result = await checkOne(file);
@@ -1485,7 +1495,7 @@ export function AccountPoolPage() {
 
     try {
       await Promise.all(
-        Array.from({ length: Math.min(checkConcurrency, targets.length) }, () => worker())
+        Array.from({ length: Math.min(checkConcurrency, checkTargets.length) }, () => worker())
       );
       if (signal?.aborted || isRunCancelled(runId)) return;
       const summary = finishCheck(runId);
