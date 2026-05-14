@@ -66,6 +66,11 @@ CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
 
+## Management Center Source
+
+The management frontend source now lives in `management-center/` in this repository.
+Deployment keeps the mounted `config.yaml`, `auths/`, and `logs/` directories intact; it only replaces the running binary and web assets.
+
 ## Usage Statistics
 
 Since v6.10.0, CLIProxyAPI and [CPAMC](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) no longer ship built-in usage statistics. If you need usage statistics, use:
