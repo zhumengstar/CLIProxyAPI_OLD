@@ -1420,11 +1420,14 @@ export function AccountPoolPage() {
   return (
     <div className={styles.container}>
       <div className={styles.pageHeader}>
-        <div>
+        <div className={styles.headerIntro}>
           <h1 className={styles.pageTitle}>{t('account_pool.title')}</h1>
           <p className={styles.description}>{t('account_pool.description')}</p>
         </div>
-        <div className={styles.headerStats} aria-label={t('account_pool.status_stats', { defaultValue: '状态码统计' })}>
+        <div
+          className={styles.headerStats}
+          aria-label={t('account_pool.status_stats', { defaultValue: '状态码统计' })}
+        >
           {displayedStatusCodeStats.codes.map(([code, count]) => (
             <span
               className={getStatusCodePillClassName(code, styles)}
@@ -1600,8 +1603,8 @@ export function AccountPoolPage() {
             </div>
             <div className={styles.toolbarMeta}>
               <span className={styles.stats}>
-              {t('account_pool.stats', { visible: displayedFiles.length, total: files.length })}
-            </span>
+                {t('account_pool.stats', { visible: displayedFiles.length, total: files.length })}
+              </span>
               <label className={styles.pageSizeControl}>
                 <span>{t('auth_files.page_size_label')}</span>
                 <input

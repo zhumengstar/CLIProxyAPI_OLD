@@ -8,26 +8,31 @@
 }
 
 .pageHeader {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: $spacing-md;
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  align-items: end;
+  gap: 14px 20px;
 
   @include mobile {
-    flex-direction: column;
+    grid-template-columns: 1fr;
+    align-items: stretch;
   }
+}
+
+.headerIntro {
+  min-width: 0;
 }
 
 .pageTitle {
   margin: 0;
   color: var(--text-primary);
-  font-size: 28px;
+  font-size: 26px;
   font-weight: 700;
+  line-height: 1.2;
 }
 
 .description {
-  margin: $spacing-xs 0 0;
+  margin: 6px 0 0;
   color: var(--text-secondary);
   font-size: 14px;
 }
@@ -42,24 +47,29 @@
 }
 
 .headerActions {
-  justify-content: flex-end;
-  max-width: 960px;
+  grid-column: 1 / -1;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding-top: 2px;
 
   :global(.btn) {
-    min-height: 38px;
+    min-height: 40px;
+    padding-inline: 14px;
     white-space: nowrap;
-    min-width: 78px;
+    min-width: 82px;
+    box-shadow: 0 1px 2px color-mix(in srgb, #000 7%, transparent);
   }
 }
 
 .headerStats {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
-  flex: 1 1 280px;
+  justify-content: flex-end;
   gap: 8px;
-  min-width: 220px;
-  padding: 0 $spacing-sm;
+  min-width: 190px;
+  padding: 0;
   flex-wrap: wrap;
   min-height: 40px;
 }
@@ -69,9 +79,8 @@
   align-items: center;
   justify-content: center;
   gap: 6px;
-  min-width: 64px;
-  height: 32px;
-  padding: 0 10px;
+  height: 30px;
+  padding: 0 11px;
   border: 1px solid color-mix(in srgb, var(--border-color) 75%, transparent);
   border-radius: 999px;
   background: color-mix(in srgb, var(--bg-secondary) 82%, transparent);
@@ -80,7 +89,7 @@
   font-weight: 700;
   line-height: 1;
   white-space: nowrap;
-  min-width: 70px;
+  min-width: 72px;
 }
 
 .statPill strong {
@@ -224,24 +233,24 @@
   grid-template-columns: 1fr;
   align-items: flex-start;
   justify-content: space-between;
-  row-gap: $spacing-sm;
-  margin-bottom: $spacing-md;
+  row-gap: 12px;
+  margin-bottom: 14px;
 }
 
 .filters {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: $spacing-sm;
+  gap: 10px;
   min-width: 0;
   flex-wrap: wrap;
 }
 
 .filterControls {
   display: grid;
-  grid-template-columns: minmax(220px, 1.4fr) repeat(5, minmax(112px, 0.6fr));
+  grid-template-columns: minmax(260px, 1.6fr) repeat(5, minmax(118px, 0.6fr));
   align-items: center;
-  gap: $spacing-sm;
+  gap: 8px;
   flex: 1 1 720px;
   min-width: 0;
 
@@ -254,7 +263,7 @@
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 18px;
+  gap: 12px;
   flex: 0 1 auto;
   min-width: 0;
   flex-wrap: wrap;
@@ -283,17 +292,18 @@
 
 .stats {
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: 12px;
+  font-weight: 600;
   white-space: nowrap;
 }
 
 .pageSizeControl {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-height: var(--account-pool-control-height);
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
   white-space: nowrap;
 }
@@ -319,6 +329,7 @@
 
 .selectionActions {
   min-height: var(--account-pool-control-height);
+  padding-top: 2px;
 
   :global(.btn) {
     min-height: var(--account-pool-control-height);
@@ -330,15 +341,9 @@
 }
 
 @media (max-width: 1280px) {
-  .toolbarMeta {
-    justify-content: flex-start;
-  }
-
   .headerStats {
     justify-content: flex-start;
-    order: 3;
-    width: 100%;
-    padding: 0;
+    grid-column: 1 / -1;
   }
 }
 
