@@ -1242,12 +1242,12 @@ export function AccountPoolPage() {
     });
   };
 
-  const overwritePassedAuthFiles = async () => {
-    if (passedFiles.length === 0 || overwritingPassed) return;
+  const overwriteAccountFiles = async (targets: AuthFileItem[], mode: 'passed' | 'filtered') => {
+    if (targets.length === 0 || overwritingPassed) return;
     setOverwritingPassed(true);
     try {
       const uploadFiles = await Promise.all(
-        passedFiles.map(async (file) => {
+        targets.map(async (file) => {
           const content = await readAccountPoolFileContent(file.name);
           return new File([content], file.name, { type: 'application/json' });
         })
@@ -1256,7 +1256,7 @@ export function AccountPoolPage() {
       const result = await authFilesApi.uploadFiles(uploadFiles);
       if (result.failed.length > 0) {
         showNotification(
-          t('account_pool.overwrite_passed_partial', {
+          t(`account_pool.overwrite_${mode}_partial`, {
             success: result.uploaded,
             failed: result.failed.length,
           }),
@@ -1265,12 +1265,12 @@ export function AccountPoolPage() {
         return;
       }
       showNotification(
-        t('account_pool.overwrite_passed_success', { count: result.uploaded }),
+        t(`account_pool.overwrite_${mode}_success`, { count: result.uploaded }),
         'success'
       );
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('common.unknown_error');
-      showNotification(t('account_pool.overwrite_passed_failed', { message }), 'error');
+      showNotification(t(`account_pool.overwrite_${mode}_failed`, { message }), 'error');
     } finally {
       setOverwritingPassed(false);
     }
@@ -1283,7 +1283,23 @@ export function AccountPoolPage() {
       message: t('account_pool.overwrite_passed_confirm', { count: passedFiles.length }),
       confirmText: t('common.confirm'),
       variant: 'danger',
-      onConfirm: overwritePassedAuthFiles,
+      onConfirm: () => void overwriteAccountFiles(passedFiles, 'passed'),
+    });
+  };
+
+  const handleOverwriteFiltered = () => {
+    if (filteredFiles.length === 0) return;
+    showConfirmation({
+      title: t('account_pool.overwrite_filtered_title', {
+        defaultValue: '覆盖筛选结果',
+      }),
+      message: t('account_pool.overwrite_filtered_confirm', {
+        count: filteredFiles.length,
+        defaultValue: `确认先删除当前所有认证文件，再写入 ${filteredFiles.length} 个筛选结果中的账号 JSON？账号池缓存不会被删除。`,
+      }),
+      confirmText: t('common.confirm'),
+      variant: 'danger',
+      onConfirm: () => void overwriteAccountFiles(filteredFiles, 'filtered'),
     });
   };
 
@@ -1475,6 +1491,18 @@ export function AccountPoolPage() {
             disabled={overwritingPassed || passedFiles.length === 0}
           >
             {t('account_pool.overwrite_passed', { count: passedFiles.length })}
+          </Button>
+          <Button
+            variant="danger"
+            size="sm"
+            onClick={handleOverwriteFiltered}
+            loading={overwritingPassed}
+            disabled={overwritingPassed || filteredFiles.length === 0}
+          >
+            {t('account_pool.overwrite_filtered', {
+              count: filteredFiles.length,
+              defaultValue: `覆盖筛选 (${filteredFiles.length})`,
+            })}
           </Button>
         </div>
       </div>
