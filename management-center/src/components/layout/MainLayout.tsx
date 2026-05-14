@@ -396,6 +396,11 @@ export function MainLayout() {
       icon: sidebarIcons.logs,
     },
     { path: '/account-pool', label: t('nav.account_pool'), icon: sidebarIcons.accountPool },
+    {
+      path: '/sub2api-import',
+      label: t('nav.sub2api_import', { defaultValue: 'Sub2 转 CPA' }),
+      icon: sidebarIcons.accountPool,
+    },
   ];
   const navOrder = navItems.map((item) => item.path);
   const getRouteOrder = (pathname: string) => {

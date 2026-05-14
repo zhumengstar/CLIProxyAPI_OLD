@@ -585,6 +585,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
 		mgmt.GET("/account-pool/usage-records", s.mgmt.GetAccountPoolUsageRecords)
 		mgmt.DELETE("/account-pool/usage-records", s.mgmt.ClearAccountPoolUsageRecords)
+		mgmt.POST("/sub2api/import", s.mgmt.StartSub2APIImport)
+		mgmt.GET("/sub2api/import/:id", s.mgmt.GetSub2APIImport)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)

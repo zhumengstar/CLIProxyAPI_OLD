@@ -20,6 +20,7 @@ import { ConfigPage } from '@/pages/ConfigPage';
 import { SystemPage } from '@/pages/SystemPage';
 import { AccountPoolPage } from '@/pages/AccountPoolPage';
 import { UsageRecordsPage } from '@/pages/UsageRecordsPage';
+import { Sub2APIImportPage } from '@/pages/Sub2APIImportPage';
 
 const mainRoutes = [
   { path: '/', element: <DashboardPage /> },
@@ -78,6 +79,7 @@ const mainRoutes = [
   { path: '/system', element: <SystemPage /> },
   { path: '/usage-records', element: <UsageRecordsPage /> },
   { path: '/account-pool', element: <AccountPoolPage /> },
+  { path: '/sub2api-import', element: <Sub2APIImportPage /> },
   { path: '*', element: <Navigate to="/" replace /> },
 ];
 
