@@ -25,13 +25,6 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { ToggleSwitch } from '@/components/ui/ToggleSwitch';
 import { copyToClipboard } from '@/utils/clipboard';
 import {
-  ANTIGRAVITY_CONFIG,
-  CLAUDE_CONFIG,
-  CODEX_CONFIG,
-  GEMINI_CLI_CONFIG,
-  KIMI_CONFIG,
-} from '@/components/quota';
-import {
   MAX_CARD_PAGE_SIZE,
   MIN_CARD_PAGE_SIZE,
   QUOTA_PROVIDER_TYPES,
@@ -56,7 +49,6 @@ import { useAuthFilesModels } from '@/features/authFiles/hooks/useAuthFilesModel
 import { useAuthFilesOauth } from '@/features/authFiles/hooks/useAuthFilesOauth';
 import { useAuthFilesPrefixProxyEditor } from '@/features/authFiles/hooks/useAuthFilesPrefixProxyEditor';
 import { useAuthFilesStatusBarCache } from '@/features/authFiles/hooks/useAuthFilesStatusBarCache';
-import type { AuthFileItem } from '@/types';
 import {
   isAuthFilesSortMode,
   readAuthFilesUiState,
@@ -65,8 +57,7 @@ import {
   writePersistedAuthFilesCompactMode,
   type AuthFilesSortMode,
 } from '@/features/authFiles/uiState';
-import { useAuthStore, useNotificationStore, useThemeStore, useQuotaStore } from '@/stores';
-import { getStatusFromError, resolveAuthProvider } from '@/utils/quota';
+import { useAuthStore, useNotificationStore, useThemeStore } from '@/stores';
 import styles from './AuthFilesPage.module.scss';
 
 const easePower3Out = (progress: number) => 1 - (1 - progress) ** 4;
@@ -75,7 +66,6 @@ const BATCH_BAR_BASE_TRANSFORM = 'translateX(-50%)';
 const BATCH_BAR_HIDDEN_TRANSFORM = 'translateX(-50%) translateY(56px)';
 const DEFAULT_REGULAR_PAGE_SIZE = 9;
 const DEFAULT_COMPACT_PAGE_SIZE = 12;
-const AUTH_FILES_QUOTA_REFRESH_CONCURRENCY = 5;
 
 const escapeWildcardSearchSegment = (value: string) =>
   value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -84,42 +74,6 @@ const buildWildcardSearch = (value: string): RegExp | null => {
   if (!value.includes('*')) return null;
   const pattern = value.split('*').map(escapeWildcardSearchSegment).join('.*');
   return new RegExp(pattern, 'i');
-};
-
-const resolveQuotaType = (file: AuthFileItem): QuotaProviderType | null => {
-  const provider = resolveAuthProvider(file);
-  if (!QUOTA_PROVIDER_TYPES.has(provider as QuotaProviderType)) return null;
-  return provider as QuotaProviderType;
-};
-
-const getQuotaConfig = (type: QuotaProviderType) => {
-  if (type === 'antigravity') return ANTIGRAVITY_CONFIG;
-  if (type === 'claude') return CLAUDE_CONFIG;
-  if (type === 'codex') return CODEX_CONFIG;
-  if (type === 'kimi') return KIMI_CONFIG;
-  return GEMINI_CLI_CONFIG;
-};
-
-const updateQuotaStore = (type: QuotaProviderType, updater: (prev: Record<string, unknown>) => Record<string, unknown>) => {
-  const store = useQuotaStore.getState();
-  if (type === 'antigravity') {
-    store.setAntigravityQuota(updater as never);
-  } else if (type === 'claude') {
-    store.setClaudeQuota(updater as never);
-  } else if (type === 'codex') {
-    store.setCodexQuota(updater as never);
-  } else if (type === 'kimi') {
-    store.setKimiQuota(updater as never);
-  } else {
-    store.setGeminiCliQuota(updater as never);
-  }
-};
-
-type RuntimeQuotaConfig = {
-  fetchQuota: (file: AuthFileItem, t: ReturnType<typeof useTranslation>['t']) => Promise<unknown>;
-  buildLoadingState: () => unknown;
-  buildSuccessState: (data: unknown) => unknown;
-  buildErrorState: (message: string, status?: number) => unknown;
 };
 
 export function AuthFilesPage() {
@@ -145,7 +99,6 @@ export function AuthFilesPage() {
   const [pageSizeInput, setPageSizeInput] = useState('9');
   const [viewMode, setViewMode] = useState<'diagram' | 'list'>('list');
   const [sortMode, setSortMode] = useState<AuthFilesSortMode>('default');
-  const [refreshingAllQuota, setRefreshingAllQuota] = useState(false);
   const [batchActionBarVisible, setBatchActionBarVisible] = useState(false);
   const [uiStateHydrated, setUiStateHydrated] = useState(false);
   const floatingBatchActionsRef = useRef<HTMLDivElement>(null);
@@ -483,7 +436,7 @@ export function AuthFilesPage() {
       copy.sort((a, b) => {
         const pa = parsePriorityValue(a.priority ?? a['priority']) ?? 0;
         const pb = parsePriorityValue(b.priority ?? b['priority']) ?? 0;
-        return pb - pa; // 高优先级排前面
+        return pb - pa; // Higher priority first.
       });
     }
     return copy;
@@ -501,16 +454,6 @@ export function AuthFilesPage() {
     () => sorted.filter((file) => !isRuntimeOnlyAuthFile(file)),
     [sorted]
   );
-  const quotaRefreshTargets = useMemo(
-    () =>
-      sorted.filter((file) => {
-        if (isRuntimeOnlyAuthFile(file) || file.disabled) return false;
-        const type = resolveQuotaType(file);
-        if (!type) return false;
-        return !quotaFilterType || type === quotaFilterType;
-      }),
-    [quotaFilterType, sorted]
-  );
   const selectedNames = useMemo(() => Array.from(selectedFiles), [selectedFiles]);
   const selectedHasStatusUpdating = useMemo(
     () => selectedNames.some((name) => statusUpdating[name] === true),
@@ -521,69 +464,6 @@ export function AuthFilesPage() {
     selectedNames.length === 0 ||
     batchStatusUpdating ||
     selectedHasStatusUpdating;
-
-  const handleRefreshAllQuota = useCallback(async () => {
-    if (disableControls || refreshingAllQuota || quotaRefreshTargets.length === 0) return;
-    setRefreshingAllQuota(true);
-
-    let cursor = 0;
-    let success = 0;
-    let failed = 0;
-
-    const worker = async () => {
-      for (;;) {
-        const index = cursor;
-        cursor += 1;
-        const file = quotaRefreshTargets[index];
-        if (!file) return;
-
-        const quotaType = resolveQuotaType(file);
-        if (!quotaType) continue;
-        const config = getQuotaConfig(quotaType) as unknown as RuntimeQuotaConfig;
-
-        updateQuotaStore(quotaType, (prev) => ({
-          ...prev,
-          [file.name]: config.buildLoadingState(),
-        }));
-
-        try {
-          const data = await config.fetchQuota(file, t);
-          updateQuotaStore(quotaType, (prev) => ({
-            ...prev,
-            [file.name]: config.buildSuccessState(data),
-          }));
-          success += 1;
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : t('common.unknown_error');
-          const status = getStatusFromError(err);
-          updateQuotaStore(quotaType, (prev) => ({
-            ...prev,
-            [file.name]: config.buildErrorState(message, status),
-          }));
-          failed += 1;
-        }
-      }
-    };
-
-    try {
-      await Promise.all(
-        Array.from(
-          { length: Math.min(AUTH_FILES_QUOTA_REFRESH_CONCURRENCY, quotaRefreshTargets.length) },
-          () => worker()
-        )
-      );
-      showNotification(
-        t('auth_files.quota_refresh_all_done', {
-          success,
-          failed,
-          defaultValue: `额度刷新完成：成功 ${success}，失败 ${failed}`,
-        }),
-        failed > 0 ? 'warning' : 'success'
-      );
-    } finally {
-      setRefreshingAllQuota(false);
-    }
-  }, [disableControls, quotaRefreshTargets, refreshingAllQuota, showNotification, t]);
 
   const copyTextWithNotification = useCallback(
     async (text: string) => {
@@ -804,18 +684,6 @@ export function AuthFilesPage() {
           <div className={styles.headerActions}>
             <Button variant="secondary" size="sm" onClick={handleHeaderRefresh} disabled={loading}>
               {t('common.refresh')}
-            </Button>
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => void handleRefreshAllQuota()}
-              disabled={disableControls || refreshingAllQuota || quotaRefreshTargets.length === 0}
-              loading={refreshingAllQuota}
-            >
-              {t('auth_files.refresh_all_quota', {
-                count: quotaRefreshTargets.length,
-                defaultValue: `刷新额度 (${quotaRefreshTargets.length})`,
-              })}
             </Button>
             <Button
               size="sm"
