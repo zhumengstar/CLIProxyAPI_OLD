@@ -190,6 +190,8 @@ const readAuthFileField = (file: AuthFileItem, key: string): unknown =>
 const buildAuthFileFingerprint = (file: AuthFileItem): string => {
   const parts = [
     file.name,
+    readAuthFileField(file, 'content_hash'),
+    readAuthFileField(file, 'contentHash'),
     readAuthFileField(file, 'size'),
     readAuthFileField(file, 'modified'),
     readAuthFileField(file, 'modtime'),
@@ -199,6 +201,11 @@ const buildAuthFileFingerprint = (file: AuthFileItem): string => {
     readAuthFileField(file, 'status'),
   ];
   return parts.map((part) => String(part ?? '')).join('|');
+};
+
+const readAuthFileContentHash = (file: AuthFileItem): string => {
+  const value = readAuthFileField(file, 'content_hash') ?? readAuthFileField(file, 'contentHash');
+  return typeof value === 'string' ? value.trim() : '';
 };
 
 export const syncAccountPoolFromAuthFiles = async (
@@ -212,7 +219,9 @@ export const syncAccountPoolFromAuthFiles = async (
     const storedRecords = uniqueAccountPoolRecords(readAccountPoolRecords()).filter(
       (record) => !deletedHashes.has(record.hash)
     );
-    const response = await apiClient.get<unknown>('/auth-files');
+    const response = await apiClient.get<unknown>('/auth-files', {
+      params: { include_hash: true },
+    });
     const importedFiles = normalizeAuthFilesPayload(response).filter(
       (file) => !isRuntimeOnlyAuthPoolFile(file)
     );
@@ -231,6 +240,21 @@ export const syncAccountPoolFromAuthFiles = async (
           recordsByName.set(file.name, {
             ...existing,
             file,
+          });
+          return;
+        }
+
+        const serverContentHash = readAuthFileContentHash(file);
+        if (serverContentHash) {
+          if (deletedHashes.has(serverContentHash)) {
+            recordsByName.delete(file.name);
+            return;
+          }
+          recordsByName.set(file.name, {
+            file,
+            hash: serverContentHash,
+            savedAt: existing?.savedAt || Date.now(),
+            sourceFingerprint,
           });
           return;
         }

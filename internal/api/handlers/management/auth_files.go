@@ -253,14 +253,15 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
+	includeHash := strings.EqualFold(strings.TrimSpace(c.Query("include_hash")), "true")
 	if h.authManager == nil {
-		h.listAuthFilesFromDisk(c)
+		h.listAuthFilesFromDisk(c, includeHash)
 		return
 	}
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
+		if entry := h.buildAuthFileEntry(auth, includeHash); entry != nil {
 			files = append(files, entry)
 		}
 	}
@@ -321,7 +322,7 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 }
 
 // List auth files from disk when the auth manager is unavailable.
-func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
+func (h *Handler) listAuthFilesFromDisk(c *gin.Context, includeHash bool) {
 	entries, err := os.ReadDir(h.cfg.AuthDir)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -346,6 +347,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				if includeHash {
+					fileData["content_hash"] = hashAccountPoolContent(data)
+				}
 				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
 					switch pv.Type {
 					case gjson.Number:
@@ -369,7 +373,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 	c.JSON(200, gin.H{"files": files})
 }
 
-func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth, includeHash bool) gin.H {
 	if auth == nil {
 		return nil
 	}
@@ -434,6 +438,13 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		if info, err := os.Stat(path); err == nil {
 			entry["size"] = info.Size()
 			entry["modtime"] = info.ModTime()
+			if includeHash {
+				if data, errRead := os.ReadFile(path); errRead == nil {
+					entry["content_hash"] = hashAccountPoolContent(data)
+				} else {
+					log.WithError(errRead).Warnf("failed to hash auth file %s", path)
+				}
+			}
 		} else if os.IsNotExist(err) {
 			// Hide credentials removed from disk but still lingering in memory.
 			if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
