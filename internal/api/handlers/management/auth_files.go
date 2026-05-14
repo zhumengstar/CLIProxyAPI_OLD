@@ -1218,6 +1218,35 @@ func (h *Handler) DownloadAccountPoolArchive(c *gin.Context) {
 	c.Data(http.StatusOK, "application/zip", data)
 }
 
+func (h *Handler) DownloadAccountPoolEntry(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	name := strings.TrimSpace(c.Query("name"))
+	if isUnsafeAuthFileName(name) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid name"})
+		return
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".json") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name must end with .json"})
+		return
+	}
+
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	data, ok := entries[name]
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "account pool entry not found"})
+		return
+	}
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", name))
+	c.Data(http.StatusOK, "application/json", data)
+}
+
 func buildAccountPoolArchiveName() string {
 	return fmt.Sprintf("account-pool-%s.zip", time.Now().Format("20060102-150405"))
 }

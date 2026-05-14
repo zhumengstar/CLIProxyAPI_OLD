@@ -154,6 +154,33 @@ func TestDownloadAccountPoolArchive_PreservesDeletedFilesAndAddsCurrentFiles(t *
 	}
 }
 
+func TestDownloadAccountPoolEntry_ReadsArchivedDeletedFile(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+
+	name := "deleted.json"
+	content := []byte(`{"type":"codex","email":"deleted@example.com"}`)
+	if err := h.upsertAccountPoolArchiveFile(name, content); err != nil {
+		t.Fatalf("failed to seed account pool archive: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/account-pool/download-entry?name="+url.QueryEscape(name), nil)
+
+	h.DownloadAccountPoolEntry(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != string(content) {
+		t.Fatalf("expected archived account pool content %q, got %q", content, got)
+	}
+}
+
 func readTestZipEntries(t *testing.T, archivePath string) map[string][]byte {
 	t.Helper()
 
