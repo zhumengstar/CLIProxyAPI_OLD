@@ -504,7 +504,7 @@ const getQuotaSummary = (
 
 const matchesCheckStatusFilter = (status: string | undefined, filter: string): boolean => {
   if (filter === DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER) return true;
-  if (filter === 'unchecked') return !status;
+  if (filter === 'unchecked') return !status || status === 'loading';
   return status === filter;
 };
 
