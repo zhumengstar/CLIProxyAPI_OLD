@@ -43,6 +43,12 @@ const DEFAULT_ACCOUNT_POOL_PLAN_FILTER = 'all';
 const DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER = 'all';
 const DEFAULT_ACCOUNT_POOL_QUOTA_FILTER = 'all';
 const LOW_ACCOUNT_POOL_QUOTA_PERCENT = 20;
+type AccountPoolStatusCodeStats = {
+  codes: Array<[number, number]>;
+  unchecked: number;
+  unsupported: number;
+  unknownError: number;
+};
 const QUOTA_CONFIGS = [
   CLAUDE_CONFIG,
   ANTIGRAVITY_CONFIG,
@@ -711,6 +717,10 @@ export function AccountPoolPage() {
   const [checkConcurrencyInput, setCheckConcurrencyInput] = useState(String(checkConcurrency));
   const [selectedNames, setSelectedNames] = useState<string[]>([]);
   const [usageSummaries, setUsageSummaries] = useState<AccountPoolUsageSummary[]>([]);
+  const [checkViewSnapshot, setCheckViewSnapshot] = useState<string[] | null>(null);
+  const [statusStatsSnapshot, setStatusStatsSnapshot] = useState<AccountPoolStatusCodeStats | null>(
+    null
+  );
 
   const applyRecords = useCallback((records: AccountPoolRecord[]) => {
     const nextRecords = uniqueAccountPoolRecords(records);
@@ -968,16 +978,27 @@ export function AccountPoolPage() {
     compareUsageMetric,
   ]);
 
+  const displayedFiles = useMemo(() => {
+    if (!checking || !checkViewSnapshot || checkViewSnapshot.length === 0) {
+      return filteredFiles;
+    }
+    const order = new Map(checkViewSnapshot.map((name, index) => [name, index]));
+    return filteredFiles
+      .filter((file) => order.has(file.name))
+      .slice()
+      .sort((left, right) => (order.get(left.name) ?? 0) - (order.get(right.name) ?? 0));
+  }, [checkViewSnapshot, checking, filteredFiles]);
+
   const selectedSet = useMemo(() => new Set(selectedNames), [selectedNames]);
-  const totalPages = Math.max(1, Math.ceil(filteredFiles.length / pageSize));
+  const totalPages = Math.max(1, Math.ceil(displayedFiles.length / pageSize));
   const currentPage = Math.min(page, totalPages);
   const pageStart = (currentPage - 1) * pageSize;
-  const pageItems = filteredFiles.slice(pageStart, pageStart + pageSize);
+  const pageItems = displayedFiles.slice(pageStart, pageStart + pageSize);
   const visibleSelectedCount = pageItems.filter((file) => selectedSet.has(file.name)).length;
   const allVisibleSelected = pageItems.length > 0 && visibleSelectedCount === pageItems.length;
-  const filteredSelectedCount = filteredFiles.filter((file) => selectedSet.has(file.name)).length;
+  const filteredSelectedCount = displayedFiles.filter((file) => selectedSet.has(file.name)).length;
   const allFilteredSelected =
-    filteredFiles.length > 0 && filteredSelectedCount === filteredFiles.length;
+    displayedFiles.length > 0 && filteredSelectedCount === displayedFiles.length;
 
   const selectedFiles = useMemo(
     () => files.filter((file) => selectedSet.has(file.name)),
@@ -1022,6 +1043,9 @@ export function AccountPoolPage() {
     };
   }, [checkResults, files]);
 
+  const displayedStatusCodeStats =
+    checking && statusStatsSnapshot ? statusStatsSnapshot : statusCodeStats;
+
   useEffect(() => {
     if (page > totalPages) {
       setPage(totalPages);
@@ -1031,6 +1055,13 @@ export function AccountPoolPage() {
   useEffect(() => {
     setPage(1);
   }, [checkStatusFilter, planFilter, quotaFilter, search, sortMode, typeFilter]);
+
+  useEffect(() => {
+    if (!checking) {
+      setCheckViewSnapshot(null);
+      setStatusStatsSnapshot(null);
+    }
+  }, [checking]);
 
   const commitPageSizeInput = (rawValue: string) => {
     const trimmed = rawValue.trim();
@@ -1132,7 +1163,7 @@ export function AccountPoolPage() {
   const toggleFiltered = (checked: boolean) => {
     setSelectedNames((current) => {
       const next = new Set(current);
-      filteredFiles.forEach((file) => {
+      displayedFiles.forEach((file) => {
         if (checked) {
           next.add(file.name);
         } else {
@@ -1288,25 +1319,31 @@ export function AccountPoolPage() {
   };
 
   const handleOverwriteFiltered = () => {
-    if (filteredFiles.length === 0) return;
+    if (displayedFiles.length === 0) return;
     showConfirmation({
       title: t('account_pool.overwrite_filtered_title', {
         defaultValue: '覆盖筛选结果',
       }),
       message: t('account_pool.overwrite_filtered_confirm', {
-        count: filteredFiles.length,
-        defaultValue: `确认先删除当前所有认证文件，再写入 ${filteredFiles.length} 个筛选结果中的账号 JSON？账号池缓存不会被删除。`,
+        count: displayedFiles.length,
+        defaultValue: `确认先删除当前所有认证文件，再写入 ${displayedFiles.length} 个筛选结果中的账号 JSON？账号池缓存不会被删除。`,
       }),
       confirmText: t('common.confirm'),
       variant: 'danger',
-      onConfirm: () => void overwriteAccountFiles(filteredFiles, 'filtered'),
+      onConfirm: () => void overwriteAccountFiles(displayedFiles, 'filtered'),
     });
   };
 
   const detectAccounts = async (targets: AuthFileItem[]) => {
     if (targets.length === 0 || checking) return;
+    setCheckViewSnapshot(targets.map((file) => file.name));
+    setStatusStatsSnapshot(statusCodeStats);
     const runId = beginCheck(targets.map((file) => file.name));
-    if (!runId) return;
+    if (!runId) {
+      setCheckViewSnapshot(null);
+      setStatusStatsSnapshot(null);
+      return;
+    }
 
     let cursor = 0;
     const worker = async () => {
@@ -1388,7 +1425,7 @@ export function AccountPoolPage() {
           <p className={styles.description}>{t('account_pool.description')}</p>
         </div>
         <div className={styles.headerStats} aria-label={t('account_pool.status_stats', { defaultValue: '状态码统计' })}>
-          {statusCodeStats.codes.map(([code, count]) => (
+          {displayedStatusCodeStats.codes.map(([code, count]) => (
             <span
               className={getStatusCodePillClassName(code, styles)}
               key={code}
@@ -1398,25 +1435,25 @@ export function AccountPoolPage() {
               <strong>{count}</strong>
             </span>
           ))}
-          {statusCodeStats.unknownError > 0 && (
+          {displayedStatusCodeStats.unknownError > 0 && (
             <span
               className={`${styles.statPill} ${styles.statPillError}`}
               title="未知错误：检测过程抛出了错误，但没有拿到明确的 HTTP 状态码。"
             >
               {t('account_pool.stat_unknown_error', { defaultValue: '未知错误' })}
-              <strong>{statusCodeStats.unknownError}</strong>
+              <strong>{displayedStatusCodeStats.unknownError}</strong>
             </span>
           )}
-          {statusCodeStats.unsupported > 0 && (
+          {displayedStatusCodeStats.unsupported > 0 && (
             <span className={styles.statPill} title="不支持：该认证文件类型暂未接入额度检测逻辑。">
               {t('account_pool.stat_unsupported', { defaultValue: '不支持' })}
-              <strong>{statusCodeStats.unsupported}</strong>
+              <strong>{displayedStatusCodeStats.unsupported}</strong>
             </span>
           )}
-          {statusCodeStats.unchecked > 0 && (
+          {displayedStatusCodeStats.unchecked > 0 && (
             <span className={styles.statPill} title="未检测：该账号还没有执行过检测，或当前正在等待检测结果。">
               {t('account_pool.stat_unchecked', { defaultValue: '未检测' })}
-              <strong>{statusCodeStats.unchecked}</strong>
+              <strong>{displayedStatusCodeStats.unchecked}</strong>
             </span>
           )}
         </div>
@@ -1436,20 +1473,20 @@ export function AccountPoolPage() {
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => void detectAccounts(filteredFiles)}
-            loading={checking && selectedFiles.length === 0 && filteredFiles.length < files.length}
-            disabled={checking || filteredFiles.length === 0}
+            onClick={() => void detectAccounts(displayedFiles)}
+            loading={checking && selectedFiles.length === 0 && displayedFiles.length < files.length}
+            disabled={checking || displayedFiles.length === 0}
           >
             {t('account_pool.check_filtered', {
-              count: filteredFiles.length,
-              defaultValue: `检测筛选 (${filteredFiles.length})`,
+              count: displayedFiles.length,
+              defaultValue: `检测筛选 (${displayedFiles.length})`,
             })}
           </Button>
           <Button
             variant="secondary"
             size="sm"
             onClick={() => void detectAccounts(files)}
-            loading={checking && selectedFiles.length === 0 && filteredFiles.length === files.length}
+            loading={checking && selectedFiles.length === 0 && displayedFiles.length === files.length}
             disabled={checking || files.length === 0}
           >
             {t('account_pool.check_all')}
@@ -1497,11 +1534,11 @@ export function AccountPoolPage() {
             size="sm"
             onClick={handleOverwriteFiltered}
             loading={overwritingPassed}
-            disabled={overwritingPassed || filteredFiles.length === 0}
+            disabled={overwritingPassed || displayedFiles.length === 0}
           >
             {t('account_pool.overwrite_filtered', {
-              count: filteredFiles.length,
-              defaultValue: `覆盖筛选 (${filteredFiles.length})`,
+              count: displayedFiles.length,
+              defaultValue: `覆盖筛选 (${displayedFiles.length})`,
             })}
           </Button>
         </div>
@@ -1563,8 +1600,8 @@ export function AccountPoolPage() {
             </div>
             <div className={styles.toolbarMeta}>
               <span className={styles.stats}>
-                {t('account_pool.stats', { visible: filteredFiles.length, total: files.length })}
-              </span>
+              {t('account_pool.stats', { visible: displayedFiles.length, total: files.length })}
+            </span>
               <label className={styles.pageSizeControl}>
                 <span>{t('auth_files.page_size_label')}</span>
                 <input
@@ -1613,23 +1650,23 @@ export function AccountPoolPage() {
             <SelectionCheckbox
               checked={allFilteredSelected}
               onChange={toggleFiltered}
-              disabled={filteredFiles.length === 0}
-              label={t('account_pool.select_filtered', {
-                defaultValue: '选择筛选结果',
-              })}
-            />
+                disabled={displayedFiles.length === 0}
+                label={t('account_pool.select_filtered', {
+                  defaultValue: '选择筛选结果',
+                })}
+              />
             <Button variant="ghost" size="sm" onClick={() => setSelectedNames([])}>
               {t('account_pool.clear_selection')}
             </Button>
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => confirmDeletePoolEntries(filteredFiles)}
-              disabled={deletingPoolEntries || filteredFiles.length === 0}
+              onClick={() => confirmDeletePoolEntries(displayedFiles)}
+              disabled={deletingPoolEntries || displayedFiles.length === 0}
             >
               {t('account_pool.delete_filtered', {
-                count: filteredFiles.length,
-                defaultValue: `删除筛选结果 (${filteredFiles.length})`,
+                count: displayedFiles.length,
+                defaultValue: `删除筛选结果 (${displayedFiles.length})`,
               })}
             </Button>
           </div>
@@ -1649,7 +1686,7 @@ export function AccountPoolPage() {
 
         {loading ? (
           <div className={styles.hint}>{t('common.loading')}</div>
-        ) : filteredFiles.length === 0 ? (
+        ) : displayedFiles.length === 0 ? (
           <EmptyState
             title={t('account_pool.empty_title')}
             description={t('account_pool.empty_desc')}
@@ -1822,7 +1859,7 @@ export function AccountPoolPage() {
           </div>
         )}
 
-        {!loading && filteredFiles.length > pageSize && (
+        {!loading && displayedFiles.length > pageSize && (
           <div className={styles.pagination}>
             <Button
               variant="secondary"
@@ -1836,7 +1873,7 @@ export function AccountPoolPage() {
               {t('auth_files.pagination_info', {
                 current: currentPage,
                 total: totalPages,
-                count: filteredFiles.length,
+                count: displayedFiles.length,
               })}
             </div>
             <Button

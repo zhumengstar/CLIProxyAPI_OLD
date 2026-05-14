@@ -48,6 +48,7 @@
   :global(.btn) {
     min-height: 38px;
     white-space: nowrap;
+    min-width: 78px;
   }
 }
 
@@ -60,6 +61,7 @@
   min-width: 220px;
   padding: 0 $spacing-sm;
   flex-wrap: wrap;
+  min-height: 40px;
 }
 
 .statPill {
@@ -78,9 +80,12 @@
   font-weight: 700;
   line-height: 1;
   white-space: nowrap;
+  min-width: 70px;
 }
 
 .statPill strong {
+  min-width: 2ch;
+  text-align: right;
   color: var(--text-primary);
   font-size: 13px;
   font-weight: 800;
