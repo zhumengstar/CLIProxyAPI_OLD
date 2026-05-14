@@ -29,11 +29,16 @@ type AccountCheckSummary = {
 
 interface AccountPoolCheckState {
   activeRunId: string | null;
+  activeNames: string[];
+  activePreviousResults: Record<string, AccountCheckResult | undefined>;
   checking: boolean;
   results: Record<string, AccountCheckResult>;
   resultHashes: Record<string, string>;
   summary: AccountCheckSummary;
   beginCheck: (names: string[]) => string | null;
+  cancelCheck: () => AccountCheckSummary | null;
+  getRunSignal: (runId: string) => AbortSignal | undefined;
+  isRunCancelled: (runId: string) => boolean;
   setResult: (runId: string, name: string, result: AccountCheckResult, hash?: string) => void;
   finishCheck: (runId: string) => AccountCheckSummary | null;
   pruneResults: (records: AccountCheckRecordRef[]) => void;
@@ -51,6 +56,7 @@ const emptySummary = (): AccountCheckSummary => ({
 });
 
 const createRunId = () => `account-pool-check-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const runAbortControllers = new Map<string, AbortController>();
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object';
@@ -136,6 +142,8 @@ const initialPersisted = readPersistedResults();
 
 export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get) => ({
   activeRunId: null,
+  activeNames: [],
+  activePreviousResults: {},
   checking: false,
   results: initialPersisted.results,
   resultHashes: initialPersisted.resultHashes,
@@ -146,9 +154,12 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
     if (uniqueNames.length === 0 || get().checking) return null;
 
     const runId = createRunId();
+    runAbortControllers.set(runId, new AbortController());
     set((state) => {
       const nextResults = { ...state.results };
+      const activePreviousResults: Record<string, AccountCheckResult | undefined> = {};
       uniqueNames.forEach((name) => {
+        activePreviousResults[name] = nextResults[name];
         nextResults[name] = {
           ...nextResults[name],
           status: 'loading',
@@ -156,6 +167,8 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
       });
       return {
         activeRunId: runId,
+        activeNames: uniqueNames,
+        activePreviousResults,
         checking: true,
         results: nextResults,
         summary: {
@@ -167,9 +180,46 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
     return runId;
   },
 
+  cancelCheck: () => {
+    const state = get();
+    const runId = state.activeRunId;
+    if (!runId) return null;
+
+    runAbortControllers.get(runId)?.abort();
+    runAbortControllers.delete(runId);
+    const summary = state.summary;
+
+    set((current) => {
+      const nextResults = { ...current.results };
+      current.activeNames.forEach((name) => {
+        if (nextResults[name]?.status !== 'loading') return;
+        const previous = current.activePreviousResults[name];
+        if (previous) {
+          nextResults[name] = previous;
+        } else {
+          delete nextResults[name];
+        }
+      });
+      writePersistedResults(nextResults, current.resultHashes);
+      return {
+        activeRunId: null,
+        activeNames: [],
+        activePreviousResults: {},
+        checking: false,
+        results: nextResults,
+        summary
+      };
+    });
+    return summary;
+  },
+
+  getRunSignal: (runId) => runAbortControllers.get(runId)?.signal,
+
+  isRunCancelled: (runId) => runAbortControllers.get(runId)?.signal.aborted ?? true,
+
   setResult: (runId, name, result, hash) => {
     const state = get();
-    if (state.activeRunId !== runId) return;
+    if (state.activeRunId !== runId || state.isRunCancelled(runId)) return;
 
     set((current) => {
       const previous = current.results[name];
@@ -206,8 +256,11 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
     const state = get();
     if (state.activeRunId !== runId) return null;
     const summary = state.summary;
+    runAbortControllers.delete(runId);
     set({
       activeRunId: null,
+      activeNames: [],
+      activePreviousResults: {},
       checking: false,
       summary
     });
@@ -247,6 +300,8 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
     writePersistedResults({}, {});
     set({
       activeRunId: null,
+      activeNames: [],
+      activePreviousResults: {},
       checking: false,
       results: {},
       resultHashes: {},

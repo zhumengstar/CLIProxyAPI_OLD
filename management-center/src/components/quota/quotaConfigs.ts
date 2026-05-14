@@ -111,7 +111,7 @@ export interface QuotaConfig<TState, TData> {
   i18nPrefix: string;
   cardIdleMessageKey?: string;
   filterFn: (file: AuthFileItem) => boolean;
-  fetchQuota: (file: AuthFileItem, t: TFunction) => Promise<TData>;
+  fetchQuota: (file: AuthFileItem, t: TFunction, signal?: AbortSignal) => Promise<TData>;
   storeSelector: (state: QuotaStore) => Record<string, TState>;
   storeSetter: keyof QuotaStore;
   buildLoadingState: () => TState;
@@ -158,7 +158,8 @@ const resolveAntigravityProjectId = async (file: AuthFileItem): Promise<string> 
 
 const fetchAntigravityQuota = async (
   file: AuthFileItem,
-  t: TFunction
+  t: TFunction,
+  signal?: AbortSignal
 ): Promise<AntigravityQuotaGroup[]> => {
   const rawAuthIndex = file['auth_index'] ?? file.authIndex;
   const authIndex = normalizeAuthIndex(rawAuthIndex);
@@ -176,13 +177,16 @@ const fetchAntigravityQuota = async (
 
   for (const url of ANTIGRAVITY_QUOTA_URLS) {
     try {
-      const result = await apiCallApi.request({
-        authIndex,
-        method: 'POST',
-        url,
-        header: { ...ANTIGRAVITY_REQUEST_HEADERS },
-        data: requestBody,
-      });
+      const result = await apiCallApi.request(
+        {
+          authIndex,
+          method: 'POST',
+          url,
+          header: { ...ANTIGRAVITY_REQUEST_HEADERS },
+          data: requestBody,
+        },
+        { signal }
+      );
 
       if (result.statusCode < 200 || result.statusCode >= 300) {
         lastError = getApiCallErrorMessage(result);
@@ -400,7 +404,8 @@ const buildCodexQuotaWindows = (payload: CodexUsagePayload, t: TFunction): Codex
 
 const fetchCodexQuota = async (
   file: AuthFileItem,
-  t: TFunction
+  t: TFunction,
+  signal?: AbortSignal
 ): Promise<{ planType: string | null; windows: CodexQuotaWindow[] }> => {
   const rawAuthIndex = file['auth_index'] ?? file.authIndex;
   const authIndex = normalizeAuthIndex(rawAuthIndex);
@@ -423,7 +428,7 @@ const fetchCodexQuota = async (
     method: 'GET',
     url: CODEX_USAGE_URL,
     header: requestHeader,
-  });
+  }, { signal });
 
   if (result.statusCode < 200 || result.statusCode >= 300) {
     throw createStatusError(getApiCallErrorMessage(result), result.statusCode);
@@ -605,7 +610,8 @@ const scheduleGeminiCliSupplementaryRefresh = (
 
 const fetchGeminiCliQuota = async (
   file: AuthFileItem,
-  t: TFunction
+  t: TFunction,
+  signal?: AbortSignal
 ): Promise<{
   fileName: string;
   supplementaryRequestId: number;
@@ -631,7 +637,7 @@ const fetchGeminiCliQuota = async (
     url: GEMINI_CLI_QUOTA_URL,
     header: { ...GEMINI_CLI_REQUEST_HEADERS },
     data: JSON.stringify({ project: projectId }),
-  });
+  }, { signal });
   if (quotaResponse.statusCode < 200 || quotaResponse.statusCode >= 300) {
     throw createStatusError(getApiCallErrorMessage(quotaResponse), quotaResponse.statusCode);
   }
@@ -996,7 +1002,8 @@ const resolveClaudePlanType = (profile: ClaudeProfileResponse | null): string | 
 
 const fetchClaudeQuota = async (
   file: AuthFileItem,
-  t: TFunction
+  t: TFunction,
+  signal?: AbortSignal
 ): Promise<{ windows: ClaudeQuotaWindow[]; extraUsage?: ClaudeExtraUsage | null; planType?: string | null }> => {
   const rawAuthIndex = file['auth_index'] ?? file.authIndex;
   const authIndex = normalizeAuthIndex(rawAuthIndex);
@@ -1010,13 +1017,13 @@ const fetchClaudeQuota = async (
       method: 'GET',
       url: CLAUDE_USAGE_URL,
       header: { ...CLAUDE_REQUEST_HEADERS },
-    }),
+    }, { signal }),
     apiCallApi.request({
       authIndex,
       method: 'GET',
       url: CLAUDE_PROFILE_URL,
       header: { ...CLAUDE_REQUEST_HEADERS },
-    }),
+    }, { signal }),
   ]);
 
   if (usageResult.status === 'rejected') {
@@ -1256,7 +1263,8 @@ export const GEMINI_CLI_CONFIG: QuotaConfig<
 
 const fetchKimiQuota = async (
   file: AuthFileItem,
-  t: TFunction
+  t: TFunction,
+  signal?: AbortSignal
 ): Promise<KimiQuotaRow[]> => {
   const rawAuthIndex = file['auth_index'] ?? file.authIndex;
   const authIndex = normalizeAuthIndex(rawAuthIndex);
@@ -1269,7 +1277,7 @@ const fetchKimiQuota = async (
     method: 'GET',
     url: KIMI_USAGE_URL,
     header: { ...KIMI_REQUEST_HEADERS },
-  });
+  }, { signal });
 
   if (result.statusCode < 200 || result.statusCode >= 300) {
     throw createStatusError(getApiCallErrorMessage(result), result.statusCode);

@@ -666,6 +666,22 @@ const getStatusCodePillClassName = (code: number, styles: Record<string, string>
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => window.setTimeout(resolve, ms));
 
+const isAbortError = (err: unknown): boolean => {
+  if (!err || typeof err !== 'object') return false;
+  const record = err as { name?: unknown; code?: unknown; message?: unknown };
+  const name = typeof record.name === 'string' ? record.name.toLowerCase() : '';
+  const code = typeof record.code === 'string' ? record.code.toLowerCase() : '';
+  const message = typeof record.message === 'string' ? record.message.toLowerCase() : '';
+  return (
+    name === 'aborterror' ||
+    code === 'err_canceled' ||
+    code === 'abort_err' ||
+    message.includes('canceled') ||
+    message.includes('cancelled') ||
+    message.includes('aborted')
+  );
+};
+
 const getAccountPoolCheckErrorStatus = (err: unknown): number | undefined => {
   const status = getStatusFromError(err);
   if (status) return status;
@@ -721,6 +737,9 @@ export function AccountPoolPage() {
   const checkResults = useAccountPoolCheckStore((state) => state.results);
   const checkSummary = useAccountPoolCheckStore((state) => state.summary);
   const beginCheck = useAccountPoolCheckStore((state) => state.beginCheck);
+  const cancelCheck = useAccountPoolCheckStore((state) => state.cancelCheck);
+  const getRunSignal = useAccountPoolCheckStore((state) => state.getRunSignal);
+  const isRunCancelled = useAccountPoolCheckStore((state) => state.isRunCancelled);
   const setCheckResult = useAccountPoolCheckStore((state) => state.setResult);
   const finishCheck = useAccountPoolCheckStore((state) => state.finishCheck);
   const pruneCheckResults = useAccountPoolCheckStore((state) => state.pruneResults);
@@ -1375,8 +1394,12 @@ export function AccountPoolPage() {
       setStatusStatsSnapshot(null);
       return;
     }
+    const signal = getRunSignal(runId);
 
     const checkOne = async (file: AuthFileItem): Promise<AccountCheckResult> => {
+      if (signal?.aborted || isRunCancelled(runId)) {
+        throw new DOMException('Account pool check aborted', 'AbortError');
+      }
       const config = resolveQuotaConfig(file);
       if (!config) {
         return {
@@ -1388,8 +1411,11 @@ export function AccountPoolPage() {
 
       let lastError: unknown;
       for (let attempt = 0; attempt <= ACCOUNT_POOL_CHECK_RETRY_ATTEMPTS; attempt += 1) {
+        if (signal?.aborted || isRunCancelled(runId)) {
+          throw new DOMException('Account pool check aborted', 'AbortError');
+        }
         try {
-          const quota = await config.fetchQuota(file, t);
+          const quota = await config.fetchQuota(file, t, signal);
           const quotaSummary = getQuotaSummary(quota, t);
           return {
             status: 'success',
@@ -1401,6 +1427,9 @@ export function AccountPoolPage() {
             checkedAt: Date.now(),
           };
         } catch (err: unknown) {
+          if (isAbortError(err) || signal?.aborted || isRunCancelled(runId)) {
+            throw err;
+          }
           lastError = err;
           if (
             attempt >= ACCOUNT_POOL_CHECK_RETRY_ATTEMPTS ||
@@ -1425,11 +1454,29 @@ export function AccountPoolPage() {
     let cursor = 0;
     const worker = async () => {
       for (;;) {
+        if (signal?.aborted || isRunCancelled(runId)) return;
         const index = cursor;
         cursor += 1;
         const file = targets[index];
         if (!file) return;
-        setCheckResult(runId, file.name, await checkOne(file), hashByName.get(file.name));
+        try {
+          const result = await checkOne(file);
+          if (signal?.aborted || isRunCancelled(runId)) return;
+          setCheckResult(runId, file.name, result, hashByName.get(file.name));
+        } catch (err: unknown) {
+          if (isAbortError(err) || signal?.aborted || isRunCancelled(runId)) return;
+          setCheckResult(
+            runId,
+            file.name,
+            {
+              status: 'error',
+              message: err instanceof Error ? err.message : t('common.unknown_error'),
+              statusCode: getAccountPoolCheckErrorStatus(err),
+              checkedAt: Date.now(),
+            },
+            hashByName.get(file.name)
+          );
+        }
       }
     };
 
@@ -1437,6 +1484,7 @@ export function AccountPoolPage() {
       await Promise.all(
         Array.from({ length: Math.min(checkConcurrency, targets.length) }, () => worker())
       );
+      if (signal?.aborted || isRunCancelled(runId)) return;
       const summary = finishCheck(runId);
       if (!summary) return;
       showNotification(
@@ -1448,6 +1496,7 @@ export function AccountPoolPage() {
         summary.failed > 0 ? 'warning' : 'success'
       );
     } catch {
+      if (signal?.aborted || isRunCancelled(runId)) return;
       const summary = finishCheck(runId);
       if (summary) {
         showNotification(
@@ -1460,6 +1509,19 @@ export function AccountPoolPage() {
         );
       }
     }
+  };
+
+  const interruptCheck = () => {
+    const summary = cancelCheck();
+    if (!summary) return;
+    showNotification(
+      t('account_pool.check_cancelled', {
+        done: summary.done,
+        total: summary.total,
+        defaultValue: `检测已中断：已完成 ${summary.done} / ${summary.total}`,
+      }),
+      'warning'
+    );
   };
 
   return (
@@ -1539,6 +1601,15 @@ export function AccountPoolPage() {
           >
             {t('account_pool.check_all')}
           </Button>
+          {checking && (
+            <Button
+              variant="danger"
+              size="sm"
+              onClick={interruptCheck}
+            >
+              {t('account_pool.interrupt_check', { defaultValue: '中断检测' })}
+            </Button>
+          )}
           <Button
             size="sm"
             onClick={handleDownloadSelected}
@@ -1722,13 +1793,18 @@ export function AccountPoolPage() {
 
         {checking && (
           <div className={styles.checkProgress}>
-            {t('account_pool.check_progress', {
-              done: checkSummary.done,
-              total: checkSummary.total,
-              success: checkSummary.success,
-              failed: checkSummary.failed,
-              unsupported: checkSummary.unsupported,
-            })}
+            <span>
+              {t('account_pool.check_progress', {
+                done: checkSummary.done,
+                total: checkSummary.total,
+                success: checkSummary.success,
+                failed: checkSummary.failed,
+                unsupported: checkSummary.unsupported,
+              })}
+            </span>
+            <Button variant="danger" size="sm" onClick={interruptCheck}>
+              {t('account_pool.interrupt_check', { defaultValue: '中断检测' })}
+            </Button>
           </div>
         )}
 
