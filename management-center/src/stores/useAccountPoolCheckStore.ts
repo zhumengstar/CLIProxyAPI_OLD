@@ -46,6 +46,7 @@ interface AccountPoolCheckState {
 }
 
 const ACCOUNT_POOL_CHECK_RESULTS_STORAGE_KEY = 'cli-proxy-account-pool-check-results';
+const ACCOUNT_POOL_CHECK_PENDING_STORAGE_KEY = 'cli-proxy-account-pool-check-pending';
 
 const emptySummary = (): AccountCheckSummary => ({
   total: 0,
@@ -138,6 +139,51 @@ const writePersistedResults = (
   );
 };
 
+type PendingAccountPoolCheck = {
+  names: string[];
+  completed: string[];
+  startedAt: number;
+};
+
+const readPendingAccountPoolCheck = (): PendingAccountPoolCheck | null => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(ACCOUNT_POOL_CHECK_PENDING_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed) || !Array.isArray(parsed.names)) return null;
+    const names = parsed.names.filter((name): name is string => typeof name === 'string' && Boolean(name.trim()));
+    if (names.length === 0) return null;
+    const completed = Array.isArray(parsed.completed)
+      ? parsed.completed.filter((name): name is string => typeof name === 'string' && Boolean(name.trim()))
+      : [];
+    return {
+      names: Array.from(new Set(names)),
+      completed: Array.from(new Set(completed)),
+      startedAt: typeof parsed.startedAt === 'number' ? parsed.startedAt : Date.now(),
+    };
+  } catch {
+    return null;
+  }
+};
+
+const writePendingAccountPoolCheck = (pending: PendingAccountPoolCheck) => {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(ACCOUNT_POOL_CHECK_PENDING_STORAGE_KEY, JSON.stringify(pending));
+};
+
+const clearPendingAccountPoolCheck = () => {
+  if (typeof window === 'undefined') return;
+  window.localStorage.removeItem(ACCOUNT_POOL_CHECK_PENDING_STORAGE_KEY);
+};
+
+export const readPendingAccountPoolCheckNames = (): string[] => {
+  const pending = readPendingAccountPoolCheck();
+  if (!pending) return [];
+  const completed = new Set(pending.completed);
+  return pending.names.filter((name) => !completed.has(name));
+};
+
 const initialPersisted = readPersistedResults();
 
 export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get) => ({
@@ -155,6 +201,7 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
 
     const runId = createRunId();
     runAbortControllers.set(runId, new AbortController());
+    writePendingAccountPoolCheck({ names: uniqueNames, completed: [], startedAt: Date.now() });
     set((state) => {
       const nextResults = { ...state.results };
       const activePreviousResults: Record<string, AccountCheckResult | undefined> = {};
@@ -187,6 +234,7 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
 
     runAbortControllers.get(runId)?.abort();
     runAbortControllers.delete(runId);
+    clearPendingAccountPoolCheck();
     const summary = state.summary;
 
     set((current) => {
@@ -248,6 +296,13 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
         summary: nextSummary
       };
       writePersistedResults(nextState.results, nextState.resultHashes);
+      const pending = readPendingAccountPoolCheck();
+      if (pending) {
+        writePendingAccountPoolCheck({
+          ...pending,
+          completed: Array.from(new Set([...pending.completed, name])),
+        });
+      }
       return nextState;
     });
   },
@@ -257,6 +312,7 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
     if (state.activeRunId !== runId) return null;
     const summary = state.summary;
     runAbortControllers.delete(runId);
+    clearPendingAccountPoolCheck();
     set({
       activeRunId: null,
       activeNames: [],
@@ -298,6 +354,7 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
 
   clearResults: () => {
     writePersistedResults({}, {});
+    clearPendingAccountPoolCheck();
     set({
       activeRunId: null,
       activeNames: [],

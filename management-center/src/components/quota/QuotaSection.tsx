@@ -33,6 +33,69 @@ const MAX_QUOTA_REFRESH_CONCURRENCY = 20;
 
 type QuotaSortMode = 'quota_desc' | 'quota_asc' | 'name_asc';
 
+type PendingQuotaRefresh = {
+  names: string[];
+  completed: string[];
+  concurrency: number;
+  startedAt: number;
+};
+
+const quotaRefreshAbortControllers = new Map<string, AbortController>();
+
+const quotaPendingKey = (type: string) => `cli-proxy-quota-refresh-pending:${type}`;
+
+const readPendingQuotaRefresh = (type: string): PendingQuotaRefresh | null => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(quotaPendingKey(type));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PendingQuotaRefresh>;
+    const names = Array.isArray(parsed.names)
+      ? parsed.names.filter((name): name is string => typeof name === 'string' && Boolean(name.trim()))
+      : [];
+    if (names.length === 0) return null;
+    const completed = Array.isArray(parsed.completed)
+      ? parsed.completed.filter((name): name is string => typeof name === 'string' && Boolean(name.trim()))
+      : [];
+    return {
+      names: Array.from(new Set(names)),
+      completed: Array.from(new Set(completed)),
+      concurrency: typeof parsed.concurrency === 'number' && Number.isFinite(parsed.concurrency)
+        ? parsed.concurrency
+        : DEFAULT_QUOTA_REFRESH_CONCURRENCY,
+      startedAt: typeof parsed.startedAt === 'number' ? parsed.startedAt : Date.now(),
+    };
+  } catch {
+    return null;
+  }
+};
+
+const writePendingQuotaRefresh = (type: string, pending: PendingQuotaRefresh) => {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(quotaPendingKey(type), JSON.stringify(pending));
+};
+
+const clearPendingQuotaRefresh = (type: string) => {
+  if (typeof window === 'undefined') return;
+  window.localStorage.removeItem(quotaPendingKey(type));
+};
+
+const getRemainingPendingQuotaNames = (type: string): string[] => {
+  const pending = readPendingQuotaRefresh(type);
+  if (!pending) return [];
+  const completed = new Set(pending.completed);
+  return pending.names.filter((name) => !completed.has(name));
+};
+
+const markPendingQuotaCompleted = (type: string, name: string) => {
+  const pending = readPendingQuotaRefresh(type);
+  if (!pending) return;
+  writePendingQuotaRefresh(type, {
+    ...pending,
+    completed: Array.from(new Set([...pending.completed, name])),
+  });
+};
+
 interface QuotaPaginationState<T> {
   pageSize: number;
   totalPages: number;
@@ -118,6 +181,7 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
     String(DEFAULT_QUOTA_REFRESH_CONCURRENCY)
   );
   const [showTooManyWarning, setShowTooManyWarning] = useState(false);
+  const [resumedPendingRefresh, setResumedPendingRefresh] = useState(false);
 
   const filteredFiles = useMemo(() => files.filter((file) => config.filterFn(file)), [files, config]);
   const showAllAllowed = filteredFiles.length <= MAX_SHOW_ALL_THRESHOLD;
@@ -367,13 +431,29 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
     [clampQuotaRefreshConcurrency, config.type, setRefreshStoreConcurrency]
   );
 
-  const handleRefresh = useCallback(async () => {
+  const runRefreshTargets = useCallback(async (
+    targets: AuthFileItem[],
+    options: { resume?: boolean; concurrency?: number } = {}
+  ) => {
     if (disabled || refreshTask.refreshing) return;
-    const targets = sortedFiles;
     if (targets.length === 0) return;
 
-    const runId = beginRefresh(config.type, targets.length, refreshConcurrency);
+    const concurrency = Math.max(
+      MIN_QUOTA_REFRESH_CONCURRENCY,
+      Math.round(options.concurrency ?? refreshConcurrency)
+    );
+    const runId = beginRefresh(config.type, targets.length, concurrency);
     if (!runId) return;
+    const controller = new AbortController();
+    quotaRefreshAbortControllers.set(config.type, controller);
+    if (!options.resume) {
+      writePendingQuotaRefresh(config.type, {
+        names: targets.map((file) => file.name),
+        completed: [],
+        concurrency,
+        startedAt: Date.now(),
+      });
+    }
 
     setQuota((prev) => {
       const next = { ...prev };
@@ -384,22 +464,26 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
     });
 
     let cursor = 0;
-    const workerCount = Math.max(1, Math.min(refreshConcurrency, targets.length));
+    const workerCount = Math.max(1, Math.min(concurrency, targets.length));
 
     const worker = async () => {
       for (;;) {
+        if (controller.signal.aborted) return;
         const index = cursor;
         cursor += 1;
         const file = targets[index];
         if (!file) return;
         try {
-          const data = await config.fetchQuota(file, t);
+          const data = await config.fetchQuota(file, t, controller.signal);
+          if (controller.signal.aborted) return;
           setQuota((prev) => ({
             ...prev,
             [file.name]: config.buildSuccessState(data),
           }));
           advanceRefresh(config.type, runId, true);
+          markPendingQuotaCompleted(config.type, file.name);
         } catch (err: unknown) {
+          if (controller.signal.aborted) return;
           const message = err instanceof Error ? err.message : t('common.unknown_error');
           const status = getStatusFromError(err);
           setQuota((prev) => ({
@@ -407,12 +491,14 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
             [file.name]: config.buildErrorState(message, status),
           }));
           advanceRefresh(config.type, runId, false);
+          markPendingQuotaCompleted(config.type, file.name);
         }
       }
     };
 
     try {
       await Promise.all(Array.from({ length: workerCount }, () => worker()));
+      if (controller.signal.aborted) return;
       const latest = useQuotaRefreshStore.getState().tasks[config.type];
       const summary = latest.summary;
       showNotification(
@@ -423,7 +509,9 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
         }),
         summary.failed > 0 ? 'warning' : 'success'
       );
+      clearPendingQuotaRefresh(config.type);
     } finally {
+      quotaRefreshAbortControllers.delete(config.type);
       finishRefresh(config.type, runId);
     }
   }, [
@@ -436,7 +524,44 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
     refreshTask.refreshing,
     setQuota,
     showNotification,
-    sortedFiles,
+    t,
+  ]);
+
+  const handleRefresh = useCallback(async () => {
+    await runRefreshTargets(sortedFiles);
+  }, [runRefreshTargets, sortedFiles]);
+
+  useEffect(() => {
+    if (resumedPendingRefresh || disabled || refreshTask.refreshing || filteredFiles.length === 0) return;
+    const pending = readPendingQuotaRefresh(config.type);
+    const remainingNames = getRemainingPendingQuotaNames(config.type);
+    if (!pending || remainingNames.length === 0) {
+      setResumedPendingRefresh(true);
+      if (pending) {
+        clearPendingQuotaRefresh(config.type);
+      }
+      return;
+    }
+    const remainingSet = new Set(remainingNames);
+    const targets = filteredFiles.filter((file) => remainingSet.has(file.name));
+    if (targets.length === 0) return;
+    setResumedPendingRefresh(true);
+    showNotification(
+      t('quota_management.refresh_resumed', {
+        count: targets.length,
+        defaultValue: `已自动恢复后台刷新：剩余 ${targets.length} 个`,
+      }),
+      'info'
+    );
+    void runRefreshTargets(targets, { resume: true, concurrency: pending.concurrency });
+  }, [
+    config.type,
+    disabled,
+    filteredFiles,
+    refreshTask.refreshing,
+    resumedPendingRefresh,
+    runRefreshTargets,
+    showNotification,
     t,
   ]);
 
@@ -503,6 +628,22 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
   );
 
   const isRefreshing = refreshTask.refreshing;
+  const interruptRefresh = useCallback(() => {
+    const runId = refreshTask.activeRunId;
+    if (!runId) return;
+    quotaRefreshAbortControllers.get(config.type)?.abort();
+    quotaRefreshAbortControllers.delete(config.type);
+    clearPendingQuotaRefresh(config.type);
+    finishRefresh(config.type, runId);
+    showNotification(
+      t('quota_management.refresh_cancelled', {
+        done: refreshTask.summary.done,
+        total: refreshTask.summary.total,
+        defaultValue: `刷新已中断：已完成 ${refreshTask.summary.done} / ${refreshTask.summary.total}`,
+      }),
+      'warning'
+    );
+  }, [config.type, finishRefresh, refreshTask.activeRunId, refreshTask.summary, showNotification, t]);
 
   return (
     <Card
@@ -601,6 +742,16 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
             {!isRefreshing && <IconRefreshCw size={16} />}
             {t('quota_management.refresh_all_credentials')}
           </Button>
+          {isRefreshing && (
+            <Button
+              variant="danger"
+              size="sm"
+              className={styles.refreshAllButton}
+              onClick={interruptRefresh}
+            >
+              {t('quota_management.interrupt_refresh', { defaultValue: '中断刷新' })}
+            </Button>
+          )}
         </div>
       }
     >

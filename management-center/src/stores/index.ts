@@ -10,7 +10,10 @@ export { useConfigStore } from './useConfigStore';
 export { useModelsStore } from './useModelsStore';
 export { useQuotaStore } from './useQuotaStore';
 export { useQuotaRefreshStore } from './useQuotaRefreshStore';
-export { useAccountPoolCheckStore } from './useAccountPoolCheckStore';
+export {
+  readPendingAccountPoolCheckNames,
+  useAccountPoolCheckStore,
+} from './useAccountPoolCheckStore';
 export type { AccountCheckResult } from './useAccountPoolCheckStore';
 export { useOpenAIEditDraftStore } from './useOpenAIEditDraftStore';
 export { useClaudeEditDraftStore } from './useClaudeEditDraftStore';

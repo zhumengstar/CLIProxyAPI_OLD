@@ -6,7 +6,12 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { SelectionCheckbox } from '@/components/ui/SelectionCheckbox';
-import { useAccountPoolCheckStore, useNotificationStore, type AccountCheckResult } from '@/stores';
+import {
+  readPendingAccountPoolCheckNames,
+  useAccountPoolCheckStore,
+  useNotificationStore,
+  type AccountCheckResult,
+} from '@/stores';
 import { authFilesApi, type AccountPoolUsageSummary } from '@/services/api';
 import {
   ANTIGRAVITY_CONFIG,
@@ -772,6 +777,7 @@ export function AccountPoolPage() {
   const [statusStatsSnapshot, setStatusStatsSnapshot] = useState<AccountPoolStatusCodeStats | null>(
     null
   );
+  const [resumedPendingCheck, setResumedPendingCheck] = useState(false);
 
   const applyRecords = useCallback((records: AccountPoolRecord[]) => {
     const nextRecords = uniqueAccountPoolRecords(records);
@@ -1540,6 +1546,27 @@ export function AccountPoolPage() {
       }
     }
   };
+
+  useEffect(() => {
+    if (resumedPendingCheck || checking || loading || files.length === 0) return;
+    const pendingNames = readPendingAccountPoolCheckNames();
+    if (pendingNames.length === 0) {
+      setResumedPendingCheck(true);
+      return;
+    }
+    const pendingSet = new Set(pendingNames);
+    const targets = files.filter((file) => pendingSet.has(file.name));
+    if (targets.length === 0) return;
+    setResumedPendingCheck(true);
+    showNotification(
+      t('account_pool.check_resumed', {
+        count: targets.length,
+        defaultValue: `已自动恢复检测任务：剩余 ${targets.length} 个`,
+      }),
+      'info'
+    );
+    void detectAccounts(targets);
+  }, [checking, files, loading, resumedPendingCheck, showNotification, t]);
 
   const interruptCheck = () => {
     const summary = cancelCheck();
