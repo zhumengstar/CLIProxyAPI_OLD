@@ -171,23 +171,36 @@ func (r *accountPoolUsageRecorder) HandleUsage(ctx context.Context, record usage
 }
 
 func (r *accountPoolUsageRecorder) List(limit int) []accountPoolUsageRecord {
+	records, _ := r.ListPage(limit, 0)
+	return records
+}
+
+func (r *accountPoolUsageRecorder) ListPage(limit int, offset int) ([]accountPoolUsageRecord, int) {
 	if r == nil {
-		return nil
+		return nil, 0
 	}
 	if limit <= 0 || limit > maxAccountPoolUsageRecords {
 		limit = 80
 	}
+	if offset < 0 {
+		offset = 0
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	count := len(r.records)
-	if limit < count {
-		count = limit
+	total := len(r.records)
+	if offset >= total {
+		return []accountPoolUsageRecord{}, total
 	}
-	out := make([]accountPoolUsageRecord, 0, count)
-	for i := len(r.records) - 1; i >= 0 && len(out) < count; i-- {
+	out := make([]accountPoolUsageRecord, 0, limit)
+	skipped := 0
+	for i := len(r.records) - 1; i >= 0 && len(out) < limit; i-- {
+		if skipped < offset {
+			skipped++
+			continue
+		}
 		out = append(out, r.records[i])
 	}
-	return out
+	return out, total
 }
 
 func (r *accountPoolUsageRecorder) Clear() {
@@ -362,9 +375,30 @@ func (h *Handler) GetAccountPoolUsageRecords(c *gin.Context) {
 		}
 		limit = parsed
 	}
+	offset := 0
+	if raw := strings.TrimSpace(c.Query("offset")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid offset: %s", raw)})
+			return
+		}
+		offset = parsed
+	}
+	if raw := strings.TrimSpace(c.Query("page")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid page: %s", raw)})
+			return
+		}
+		offset = (parsed - 1) * limit
+	}
+	records, total := accountPoolUsage.ListPage(limit, offset)
 	c.JSON(http.StatusOK, gin.H{
-		"records":   accountPoolUsage.List(limit),
+		"records":   records,
 		"summaries": accountPoolUsage.Summaries(),
+		"total":     total,
+		"limit":     limit,
+		"offset":    offset,
 	})
 }
 

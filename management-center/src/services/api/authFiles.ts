@@ -88,6 +88,9 @@ export type AccountPoolUsageSummary = {
 export type AccountPoolUsageResponse = {
   records: AccountPoolUsageRecord[];
   summaries: AccountPoolUsageSummary[];
+  total?: number;
+  limit?: number;
+  offset?: number;
 };
 
 export const AUTH_FILE_INVALID_JSON_OBJECT_ERROR = 'AUTH_FILE_INVALID_JSON_OBJECT';
@@ -638,16 +641,34 @@ export const authFilesApi = {
     return normalizeBatchDeleteResponse(payload, requestedNames);
   },
 
-  getAccountPoolUsageRecords: async (limit = 80): Promise<AccountPoolUsageResponse> => {
+  getAccountPoolUsageRecords: async (
+    limitOrOptions: number | { limit?: number; page?: number; offset?: number } = 80
+  ): Promise<AccountPoolUsageResponse> => {
+    const options =
+      typeof limitOrOptions === 'number' ? { limit: limitOrOptions } : limitOrOptions;
+    const params = new URLSearchParams();
+    params.set('limit', String(options.limit ?? 80));
+    if (typeof options.page === 'number') {
+      params.set('page', String(options.page));
+    }
+    if (typeof options.offset === 'number') {
+      params.set('offset', String(options.offset));
+    }
     const response = await apiClient.get<{
       records?: AccountPoolUsageRecord[];
       summaries?: AccountPoolUsageSummary[];
+      total?: number;
+      limit?: number;
+      offset?: number;
     }>(
-      `/account-pool/usage-records?limit=${encodeURIComponent(String(limit))}`
+      `/account-pool/usage-records?${params.toString()}`
     );
     return {
       records: Array.isArray(response.records) ? response.records : [],
       summaries: Array.isArray(response.summaries) ? response.summaries : [],
+      total: typeof response.total === 'number' ? response.total : undefined,
+      limit: typeof response.limit === 'number' ? response.limit : undefined,
+      offset: typeof response.offset === 'number' ? response.offset : undefined,
     };
   },
 

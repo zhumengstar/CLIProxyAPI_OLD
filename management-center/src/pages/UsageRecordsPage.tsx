@@ -72,6 +72,7 @@ export function UsageRecordsPage() {
   const showNotification = useNotificationStore((state) => state.showNotification);
   const [records, setRecords] = useState<AccountPoolUsageRecord[]>([]);
   const [summaries, setSummaries] = useState<AccountPoolUsageSummary[]>([]);
+  const [totalRecords, setTotalRecords] = useState(0);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
@@ -85,24 +86,27 @@ export function UsageRecordsPage() {
   const loadRecords = useCallback(async () => {
     setLoading(true);
     try {
-      const response = await authFilesApi.getAccountPoolUsageRecords(300);
+      const response = await authFilesApi.getAccountPoolUsageRecords({ limit: pageSize, page });
       setRecords(response.records);
       setSummaries(response.summaries);
+      setTotalRecords(response.total ?? response.records.length);
     } catch (err: unknown) {
       setRecords([]);
       setSummaries([]);
+      setTotalRecords(0);
       const message = err instanceof Error ? err.message : t('common.unknown_error');
       showNotification(message, 'error');
     } finally {
       setLoading(false);
     }
-  }, [showNotification, t]);
+  }, [page, pageSize, showNotification, t]);
 
   const clearRecords = useCallback(async () => {
     try {
       await authFilesApi.clearAccountPoolUsageRecords();
       setRecords([]);
       setSummaries([]);
+      setTotalRecords(0);
       showNotification('使用记录已清空', 'success');
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('common.unknown_error');
@@ -206,10 +210,9 @@ export function UsageRecordsPage() {
     [filteredRecords]
   );
 
-  const totalPages = Math.max(1, Math.ceil(filteredRecords.length / pageSize));
+  const totalPages = Math.max(1, Math.ceil(totalRecords / pageSize));
   const currentPage = Math.min(page, totalPages);
-  const pageStart = (currentPage - 1) * pageSize;
-  const pageRecords = filteredRecords.slice(pageStart, pageStart + pageSize);
+  const pageRecords = filteredRecords;
 
   useEffect(() => {
     setPage(1);
@@ -335,7 +338,7 @@ export function UsageRecordsPage() {
           <>
             <div className={styles.tableMeta}>
               <span>
-                共 {filteredRecords.length} 条记录，{summaryCount} 个账号有汇总
+                当前页 {filteredRecords.length} 条，共 {totalRecords} 条记录，{summaryCount} 个账号有汇总
               </span>
               <label className={styles.pageSizeControl}>
                 <span>每页</span>
