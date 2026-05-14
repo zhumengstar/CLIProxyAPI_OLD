@@ -14,6 +14,43 @@ export const ACCOUNT_POOL_UPDATED_EVENT = 'cli-proxy-account-pool-updated';
 const ACCOUNT_POOL_DELETED_HASHES_STORAGE_KEY = 'cli-proxy-account-pool-deleted-hashes';
 const ACCOUNT_POOL_SYNC_DEBOUNCE_MS = 400;
 const ACCOUNT_POOL_SYNC_CONCURRENCY = 5;
+const ACCOUNT_POOL_FILE_STORAGE_KEYS = [
+  'id',
+  'auth_id',
+  'authId',
+  'auth_index',
+  'authIndex',
+  'name',
+  'type',
+  'provider',
+  'label',
+  'status',
+  'status_message',
+  'statusMessage',
+  'disabled',
+  'unavailable',
+  'runtime_only',
+  'runtimeOnly',
+  'source',
+  'size',
+  'modified',
+  'modtime',
+  'updated_at',
+  'updatedAt',
+  'last_refresh',
+  'lastRefresh',
+  'created_at',
+  'createdAt',
+  'email',
+  'service_email',
+  'account',
+  'account_type',
+  'priority',
+  'note',
+  'content_hash',
+  'contentHash',
+  'id_token',
+] as const;
 
 let syncTimer: ReturnType<typeof setTimeout> | null = null;
 let syncInFlight: Promise<AccountPoolRecord[]> | null = null;
@@ -53,6 +90,17 @@ const hashText = async (value: string): Promise<string> => {
     .join('');
 };
 
+const compactAuthFileForAccountPool = (file: AuthFileItem): AuthFileItem => {
+  const compact: AuthFileItem = { name: file.name };
+  ACCOUNT_POOL_FILE_STORAGE_KEYS.forEach((key) => {
+    const value = (file as Record<string, unknown>)[key];
+    if (value === undefined || value === null) return;
+    if (typeof value === 'string' && !value.trim()) return;
+    (compact as Record<string, unknown>)[key] = value;
+  });
+  return compact;
+};
+
 export const readAccountPoolRecords = (): AccountPoolRecord[] => {
   if (typeof window === 'undefined') return [];
   try {
@@ -83,12 +131,22 @@ export const readAccountPoolRecords = (): AccountPoolRecord[] => {
 export const writeAccountPoolRecords = (records: AccountPoolRecord[]) => {
   if (typeof window === 'undefined') return;
   const compactRecords = records.map((record) => ({
-    file: record.file,
+    file: compactAuthFileForAccountPool(record.file),
     hash: record.hash,
     savedAt: record.savedAt,
     sourceFingerprint: record.sourceFingerprint,
   }));
-  window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, JSON.stringify(compactRecords));
+  const serialized = JSON.stringify(compactRecords);
+  try {
+    window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, serialized);
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'QuotaExceededError') {
+      window.localStorage.removeItem(ACCOUNT_POOL_STORAGE_KEY);
+      window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, serialized);
+      return;
+    }
+    throw err;
+  }
 };
 
 const readDeletedAccountPoolHashes = (): Set<string> => {
