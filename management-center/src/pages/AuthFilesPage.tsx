@@ -152,12 +152,16 @@ export function AuthFilesPage() {
   const batchActionAnimationRef = useRef<AnimationPlaybackControlsWithThen | null>(null);
   const previousSelectionCountRef = useRef(0);
   const selectionCountRef = useRef(0);
+  const pageSize = compactMode ? pageSizeByMode.compact : pageSizeByMode.regular;
 
   const {
     files,
     selectedFiles,
     selectionCount,
     loading,
+    stagedLoading,
+    stagedLoadedCount,
+    stagedTotalCount,
     error,
     uploading,
     deleting,
@@ -179,7 +183,11 @@ export function AuthFilesPage() {
     batchDownload,
     batchSetStatus,
     batchDelete,
-  } = useAuthFilesData();
+  } = useAuthFilesData({
+    stagedPageSize: pageSize,
+    stagedInitialPages: 3,
+    stagedBatchPages: 3,
+  });
 
   const statusBarCache = useAuthFilesStatusBarCache(files);
 
@@ -231,7 +239,6 @@ export function AuthFilesPage() {
   )
     ? (normalizedFilter as QuotaProviderType)
     : null;
-  const pageSize = compactMode ? pageSizeByMode.compact : pageSizeByMode.regular;
 
   useEffect(() => {
     const persistedCompactMode = readPersistedAuthFilesCompactMode();
@@ -1001,6 +1008,15 @@ export function AuthFilesPage() {
                     onToggleSelect={toggleSelect}
                   />
                 ))}
+              </div>
+            )}
+
+            {!loading && stagedLoading && stagedTotalCount > stagedLoadedCount && (
+              <div className={styles.stagedLoadingHint}>
+                {t('auth_files.staged_loading', {
+                  loaded: stagedLoadedCount,
+                  total: stagedTotalCount,
+                })}
               </div>
             )}
 

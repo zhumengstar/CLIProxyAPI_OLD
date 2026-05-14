@@ -517,6 +517,7 @@
     "pagination_prev": "上一頁",
     "pagination_next": "下一頁",
     "pagination_info": "第 {{current}} / {{total}} 頁 · 共 {{count}} 個檔案",
+    "staged_loading": "已載入 {{loaded}} / {{total}} 個檔案，後續頁面正在背景載入。",
     "search_label": "搜尋設定檔",
     "search_placeholder": "輸入名稱、類型或供應方關鍵字，支援 * 萬用字元",
     "problem_filter_label": "問題篩選",

@@ -518,6 +518,7 @@
     "pagination_prev": "上一页",
     "pagination_next": "下一页",
     "pagination_info": "第 {{current}} / {{total}} 页 · 共 {{count}} 个文件",
+    "staged_loading": "已加载 {{loaded}} / {{total}} 个文件，后续页面正在后台加载。",
     "search_label": "搜索配置文件",
     "search_placeholder": "输入名称、类型或提供方关键字，支持 * 通配",
     "problem_filter_label": "问题筛选",

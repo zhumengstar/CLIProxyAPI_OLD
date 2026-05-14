@@ -33,11 +33,20 @@ type DeleteAllOptions = {
   onResetDisabledOnly: () => void;
 };
 
+type UseAuthFilesDataOptions = {
+  stagedPageSize?: number;
+  stagedInitialPages?: number;
+  stagedBatchPages?: number;
+};
+
 export type UseAuthFilesDataResult = {
   files: AuthFileItem[];
   selectedFiles: Set<string>;
   selectionCount: number;
   loading: boolean;
+  stagedLoading: boolean;
+  stagedLoadedCount: number;
+  stagedTotalCount: number;
   error: string;
   uploading: boolean;
   deleting: string | null;
@@ -61,12 +70,32 @@ export type UseAuthFilesDataResult = {
   batchDelete: (names: string[]) => void;
 };
 
-export function useAuthFilesData(): UseAuthFilesDataResult {
+const DEFAULT_STAGED_PAGE_SIZE = 100;
+const DEFAULT_STAGED_INITIAL_PAGES = 3;
+const DEFAULT_STAGED_BATCH_PAGES = 3;
+const STAGED_AUTH_FILES_BATCH_DELAY_MS = 16;
+
+export function useAuthFilesData(options: UseAuthFilesDataOptions = {}): UseAuthFilesDataResult {
   const { t } = useTranslation();
   const { showNotification, showConfirmation } = useNotificationStore();
+  const stagedPageSize = Math.max(
+    1,
+    Math.round(options.stagedPageSize || DEFAULT_STAGED_PAGE_SIZE)
+  );
+  const stagedInitialPages = Math.max(
+    1,
+    Math.round(options.stagedInitialPages || DEFAULT_STAGED_INITIAL_PAGES)
+  );
+  const stagedBatchPages = Math.max(
+    1,
+    Math.round(options.stagedBatchPages || DEFAULT_STAGED_BATCH_PAGES)
+  );
 
   const [files, setFiles] = useState<AuthFileItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [stagedLoading, setStagedLoading] = useState(false);
+  const [stagedLoadedCount, setStagedLoadedCount] = useState(0);
+  const [stagedTotalCount, setStagedTotalCount] = useState(0);
   const [error, setError] = useState('');
   const [uploading, setUploading] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
@@ -77,7 +106,28 @@ export function useAuthFilesData(): UseAuthFilesDataResult {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const batchStatusPendingRef = useRef(false);
+  const stagedLoadSeqRef = useRef(0);
+  const stagedLoadTimerRef = useRef<number | null>(null);
   const selectionCount = selectedFiles.size;
+
+  const cancelStagedLoad = useCallback(() => {
+    stagedLoadSeqRef.current += 1;
+    if (stagedLoadTimerRef.current !== null) {
+      window.clearTimeout(stagedLoadTimerRef.current);
+      stagedLoadTimerRef.current = null;
+    }
+    setStagedLoading(false);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (stagedLoadTimerRef.current !== null) {
+        window.clearTimeout(stagedLoadTimerRef.current);
+      }
+    },
+    []
+  );
+
   const toggleSelect = useCallback((name: string) => {
     setSelectedFiles((prev) => {
       const next = new Set(prev);
@@ -135,6 +185,7 @@ export function useAuthFilesData(): UseAuthFilesDataResult {
     );
     if (deletedNames.length === 0) return;
 
+    cancelStagedLoad();
     const deletedSet = new Set(deletedNames);
     setFiles((prev) => prev.filter((file) => !deletedSet.has(file.name)));
     setSelectedFiles((prev) => {
@@ -150,10 +201,11 @@ export function useAuthFilesData(): UseAuthFilesDataResult {
       });
       return changed ? next : prev;
     });
-  }, []);
+  }, [cancelStagedLoad]);
 
   useEffect(() => {
     if (selectedFiles.size === 0) return;
+    if (stagedLoading) return;
     const existingNames = new Set(files.map((file) => file.name));
     setSelectedFiles((prev) => {
       let changed = false;
@@ -167,21 +219,80 @@ export function useAuthFilesData(): UseAuthFilesDataResult {
       });
       return changed ? next : prev;
     });
-  }, [files, selectedFiles.size]);
+  }, [files, selectedFiles.size, stagedLoading]);
 
   const loadFiles = useCallback(async () => {
+    const loadSeq = stagedLoadSeqRef.current + 1;
+    stagedLoadSeqRef.current = loadSeq;
+    if (stagedLoadTimerRef.current !== null) {
+      window.clearTimeout(stagedLoadTimerRef.current);
+      stagedLoadTimerRef.current = null;
+    }
     setLoading(true);
+    setStagedLoading(false);
+    setStagedLoadedCount(0);
+    setStagedTotalCount(0);
     setError('');
     try {
       const data = await authFilesApi.list();
-      setFiles(data?.files || []);
+      if (stagedLoadSeqRef.current !== loadSeq) return;
+
+      const nextFiles = data?.files || [];
+      const initialSize = Math.min(nextFiles.length, stagedPageSize * stagedInitialPages);
+      const batchSize = Math.max(1, stagedPageSize * stagedBatchPages);
+
+      setStagedTotalCount(nextFiles.length);
+      setStagedLoadedCount(initialSize);
+      setFiles(nextFiles.slice(0, initialSize));
+      setLoading(false);
+
+      if (initialSize >= nextFiles.length) {
+        setStagedLoading(false);
+        return;
+      }
+
+      setStagedLoading(true);
+      let loadedCount = initialSize;
+
+      const appendBatch = () => {
+        if (stagedLoadSeqRef.current !== loadSeq) return;
+
+        loadedCount = Math.min(nextFiles.length, loadedCount + batchSize);
+        const stagedSlice = nextFiles.slice(0, loadedCount);
+        setFiles((prev) => {
+          const currentByName = new Map(prev.map((file) => [file.name, file]));
+          return stagedSlice.map((file) => currentByName.get(file.name) || file);
+        });
+        setStagedLoadedCount(loadedCount);
+
+        if (loadedCount >= nextFiles.length) {
+          stagedLoadTimerRef.current = null;
+          setStagedLoading(false);
+          return;
+        }
+
+        stagedLoadTimerRef.current = window.setTimeout(
+          appendBatch,
+          STAGED_AUTH_FILES_BATCH_DELAY_MS
+        );
+      };
+
+      stagedLoadTimerRef.current = window.setTimeout(
+        appendBatch,
+        STAGED_AUTH_FILES_BATCH_DELAY_MS
+      );
     } catch (err: unknown) {
+      if (stagedLoadSeqRef.current !== loadSeq) return;
       const errorMessage = err instanceof Error ? err.message : t('notification.refresh_failed');
       setError(errorMessage);
-    } finally {
       setLoading(false);
+      setStagedLoading(false);
+    } finally {
+      if (stagedLoadSeqRef.current === loadSeq) {
+        setLoading(false);
+      }
     }
-  }, [t]);
+  }, [stagedBatchPages, stagedInitialPages, stagedPageSize, t]);
 
   const handleUploadClick = useCallback(() => {
     fileInputRef.current?.click();
@@ -649,6 +760,9 @@ export function useAuthFilesData(): UseAuthFilesDataResult {
     selectedFiles,
     selectionCount,
     loading,
+    stagedLoading,
+    stagedLoadedCount,
+    stagedTotalCount,
     error,
     uploading,
     deleting,

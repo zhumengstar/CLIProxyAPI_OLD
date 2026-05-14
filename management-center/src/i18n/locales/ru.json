@@ -517,6 +517,7 @@
     "pagination_prev": "Предыдущая",
     "pagination_next": "Следующая",
     "pagination_info": "Страница {{current}} / {{total}} · {{count}} файлов",
+    "staged_loading": "Загружено {{loaded}} / {{total}} файлов. Остальные страницы загружаются в фоне.",
     "search_label": "Поиск конфигов",
     "search_placeholder": "Фильтр по имени, типу или провайдеру, поддерживается wildcard *",
     "problem_filter_label": "Фильтр проблем",

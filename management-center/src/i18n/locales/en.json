@@ -517,6 +517,7 @@
     "pagination_prev": "Previous",
     "pagination_next": "Next",
     "pagination_info": "Page {{current}} / {{total}} · {{count}} files",
+    "staged_loading": "Loaded {{loaded}} / {{total}} files. Remaining pages are loading in the background.",
     "search_label": "Search configs",
     "search_placeholder": "Filter by name, type, or provider. Use * as a wildcard",
     "problem_filter_label": "Problem Filter",
