@@ -66,6 +66,7 @@ export type AccountPoolUsageRecord = {
   input_tokens?: number;
   output_tokens?: number;
   total_tokens?: number;
+  request_params?: string;
 };
 export type AccountPoolUsageSummary = {
   key: string;

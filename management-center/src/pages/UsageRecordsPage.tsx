@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Input } from '@/components/ui/Input';
+import { Modal } from '@/components/ui/Modal';
 import { Select } from '@/components/ui/Select';
 import {
   authFilesApi,
@@ -76,6 +77,7 @@ export function UsageRecordsPage() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [userFilter, setUserFilter] = useState('all');
   const [modelFilter, setModelFilter] = useState('all');
+  const [detailRecord, setDetailRecord] = useState<AccountPoolUsageRecord | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(DEFAULT_USAGE_PAGE_SIZE);
   const [pageSizeInput, setPageSizeInput] = useState(String(DEFAULT_USAGE_PAGE_SIZE));
@@ -240,6 +242,7 @@ export function UsageRecordsPage() {
   };
 
   const summaryCount = summaries.length;
+  const requestParamsText = detailRecord?.request_params?.trim() || '{}';
 
   return (
     <div className={styles.container}>
@@ -378,7 +381,16 @@ export function UsageRecordsPage() {
                     const statusCode = getRecordStatusCode(record);
                     return (
                       <tr key={record.id}>
-                        <td>{formatUsageRecordTime(record.requested_at)}</td>
+                        <td>
+                          <div>{formatUsageRecordTime(record.requested_at)}</div>
+                          <button
+                            type="button"
+                            className={styles.detailButton}
+                            onClick={() => setDetailRecord(record)}
+                          >
+                            查看参数
+                          </button>
+                        </td>
                         <td>
                           <div className={styles.strong}>{userLabel}</div>
                           {record.newapi_user_id ? <div className={styles.muted}>ID {record.newapi_user_id}</div> : null}
@@ -436,6 +448,23 @@ export function UsageRecordsPage() {
           </>
         )}
       </Card>
+
+      <Modal
+        open={Boolean(detailRecord)}
+        title="请求参数"
+        onClose={() => setDetailRecord(null)}
+        width={760}
+      >
+        <div className={styles.detailMeta}>
+          <span>{detailRecord ? formatUsageRecordTime(detailRecord.requested_at) : '-'}</span>
+          <span>{detailRecord?.alias || detailRecord?.model || '-'}</span>
+          <span>{detailRecord?.request_path || '-'}</span>
+        </div>
+        <div className={styles.contextNotice}>
+          用户上下文已置空，不记录和展示 messages / input / contents / prompt 等内容。
+        </div>
+        <pre className={styles.requestParams}>{requestParamsText}</pre>
+      </Modal>
     </div>
   );
 }

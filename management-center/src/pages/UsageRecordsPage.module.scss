@@ -202,6 +202,63 @@
   text-align: center;
 }
 
+.detailButton {
+  margin-top: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--primary-color);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 0;
+}
+
+.detailButton:hover {
+  text-decoration: underline;
+}
+
+.detailMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.detailMeta span {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  padding: 6px 8px;
+}
+
+.contextNotice {
+  margin-bottom: 10px;
+  border: 1px solid color-mix(in srgb, var(--warning-color) 28%, var(--border-color));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warning-color) 8%, var(--bg-secondary));
+  color: var(--text-secondary);
+  font-size: 12px;
+  padding: 8px 10px;
+}
+
+.requestParams {
+  max-height: min(58vh, 560px);
+  overflow: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  margin: 0;
+  padding: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 @media (max-width: 900px) {
   .stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	apimiddleware "github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
@@ -18,26 +20,27 @@ import (
 const maxAccountPoolUsageRecords = 300
 
 type accountPoolUsageRecord struct {
-	ID           string `json:"id"`
-	RequestedAt  string `json:"requested_at"`
-	RequestID    string `json:"request_id,omitempty"`
-	RequestPath  string `json:"request_path,omitempty"`
-	SessionID    string `json:"session_id,omitempty"`
-	NewAPIUserID string `json:"newapi_user_id,omitempty"`
-	Username     string `json:"username,omitempty"`
-	Provider     string `json:"provider,omitempty"`
-	Model        string `json:"model,omitempty"`
-	Alias        string `json:"alias,omitempty"`
-	ServiceEmail string `json:"service_email,omitempty"`
-	AuthID       string `json:"auth_id,omitempty"`
-	AuthIndex    string `json:"auth_index,omitempty"`
-	AuthType     string `json:"auth_type,omitempty"`
-	Success      bool   `json:"success"`
-	StatusCode   int    `json:"status_code,omitempty"`
-	LatencyMS    int64  `json:"latency_ms,omitempty"`
-	InputTokens  int64  `json:"input_tokens,omitempty"`
-	OutputTokens int64  `json:"output_tokens,omitempty"`
-	TotalTokens  int64  `json:"total_tokens,omitempty"`
+	ID            string `json:"id"`
+	RequestedAt   string `json:"requested_at"`
+	RequestID     string `json:"request_id,omitempty"`
+	RequestPath   string `json:"request_path,omitempty"`
+	SessionID     string `json:"session_id,omitempty"`
+	NewAPIUserID  string `json:"newapi_user_id,omitempty"`
+	Username      string `json:"username,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	Model         string `json:"model,omitempty"`
+	Alias         string `json:"alias,omitempty"`
+	ServiceEmail  string `json:"service_email,omitempty"`
+	AuthID        string `json:"auth_id,omitempty"`
+	AuthIndex     string `json:"auth_index,omitempty"`
+	AuthType      string `json:"auth_type,omitempty"`
+	Success       bool   `json:"success"`
+	StatusCode    int    `json:"status_code,omitempty"`
+	LatencyMS     int64  `json:"latency_ms,omitempty"`
+	InputTokens   int64  `json:"input_tokens,omitempty"`
+	OutputTokens  int64  `json:"output_tokens,omitempty"`
+	TotalTokens   int64  `json:"total_tokens,omitempty"`
+	RequestParams string `json:"request_params,omitempty"`
 }
 
 type accountPoolUsageSummary struct {
@@ -75,7 +78,7 @@ func (r *accountPoolUsageRecorder) HandleUsage(ctx context.Context, record usage
 	if r == nil {
 		return
 	}
-	sessionID, userID, username, requestPath := accountPoolRequestIdentity(ctx)
+	sessionID, userID, username, requestPath, requestParams := accountPoolRequestIdentity(ctx)
 	requestedAt := record.RequestedAt
 	if requestedAt.IsZero() {
 		requestedAt = time.Now()
@@ -88,26 +91,27 @@ func (r *accountPoolUsageRecorder) HandleUsage(ctx context.Context, record usage
 	r.mu.Lock()
 	r.nextID++
 	item := accountPoolUsageRecord{
-		ID:           strconv.FormatUint(r.nextID, 10),
-		RequestedAt:  requestedAt.Format(time.RFC3339),
-		RequestID:    logging.GetRequestID(ctx),
-		RequestPath:  requestPath,
-		SessionID:    sessionID,
-		NewAPIUserID: userID,
-		Username:     username,
-		Provider:     record.Provider,
-		Model:        record.Model,
-		Alias:        record.Alias,
-		ServiceEmail: record.Source,
-		AuthID:       record.AuthID,
-		AuthIndex:    record.AuthIndex,
-		AuthType:     record.AuthType,
-		Success:      !record.Failed,
-		StatusCode:   statusCode,
-		LatencyMS:    record.Latency.Milliseconds(),
-		InputTokens:  record.Detail.InputTokens,
-		OutputTokens: record.Detail.OutputTokens,
-		TotalTokens:  record.Detail.TotalTokens,
+		ID:            strconv.FormatUint(r.nextID, 10),
+		RequestedAt:   requestedAt.Format(time.RFC3339),
+		RequestID:     logging.GetRequestID(ctx),
+		RequestPath:   requestPath,
+		SessionID:     sessionID,
+		NewAPIUserID:  userID,
+		Username:      username,
+		Provider:      record.Provider,
+		Model:         record.Model,
+		Alias:         record.Alias,
+		ServiceEmail:  record.Source,
+		AuthID:        record.AuthID,
+		AuthIndex:     record.AuthIndex,
+		AuthType:      record.AuthType,
+		Success:       !record.Failed,
+		StatusCode:    statusCode,
+		LatencyMS:     record.Latency.Milliseconds(),
+		InputTokens:   record.Detail.InputTokens,
+		OutputTokens:  record.Detail.OutputTokens,
+		TotalTokens:   record.Detail.TotalTokens,
+		RequestParams: requestParams,
 	}
 	key := accountPoolUsageSummaryKey(item)
 	r.records = append(r.records, item)
@@ -240,17 +244,95 @@ func accountPoolUsageSummaryKey(item accountPoolUsageRecord) string {
 	return "unknown"
 }
 
-func accountPoolRequestIdentity(ctx context.Context) (sessionID string, userID string, username string, requestPath string) {
+func accountPoolRequestIdentity(ctx context.Context) (sessionID string, userID string, username string, requestPath string, requestParams string) {
 	ginCtx, ok := ctx.Value("gin").(*gin.Context)
 	if !ok || ginCtx == nil || ginCtx.Request == nil {
-		return "", "", "", ""
+		return "", "", "", "", ""
 	}
 	sessionID = strings.TrimSpace(ginCtx.GetHeader("X-Session-ID"))
 	userID, username = parseNewAPISessionID(sessionID)
 	if ginCtx.Request.URL != nil {
 		requestPath = strings.TrimSpace(ginCtx.Request.URL.Path)
 	}
-	return sessionID, userID, username, requestPath
+	requestParams = sanitizeAccountPoolUsageRequestParams(apimiddleware.CapturedRequestBody(ginCtx))
+	return sessionID, userID, username, requestPath, requestParams
+}
+
+func sanitizeAccountPoolUsageRequestParams(body []byte) string {
+	body = []byte(strings.TrimSpace(string(body)))
+	if len(body) == 0 {
+		return ""
+	}
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	sanitized := sanitizeUsageValue(payload)
+	out, err := json.MarshalIndent(sanitized, "", "  ")
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+func sanitizeUsageValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			if isUsageContextKey(key) {
+				out[key] = emptyUsageContextValue(child)
+				continue
+			}
+			if isUsageSecretKey(key) {
+				out[key] = "[redacted]"
+				continue
+			}
+			out[key] = sanitizeUsageValue(child)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, child := range typed {
+			out[i] = sanitizeUsageValue(child)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func isUsageContextKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "messages", "input", "contents", "prompt", "prompts", "context", "contexts",
+		"conversation", "conversation_history", "chat_history", "history", "system",
+		"system_instruction", "instructions":
+		return true
+	default:
+		return false
+	}
+}
+
+func isUsageSecretKey(key string) bool {
+	lower := strings.ToLower(strings.TrimSpace(key))
+	return strings.Contains(lower, "token") ||
+		strings.Contains(lower, "secret") ||
+		strings.Contains(lower, "api_key") ||
+		strings.Contains(lower, "apikey") ||
+		strings.Contains(lower, "authorization")
+}
+
+func emptyUsageContextValue(value any) any {
+	switch value.(type) {
+	case []any:
+		return []any{}
+	case map[string]any:
+		return map[string]any{}
+	case string:
+		return ""
+	default:
+		return nil
+	}
 }
 
 func parseNewAPISessionID(sessionID string) (userID string, username string) {

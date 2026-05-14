@@ -16,6 +16,26 @@ import (
 )
 
 const maxErrorOnlyCapturedRequestBodyBytes int64 = 1 << 20 // 1 MiB
+const capturedRequestBodyContextKey = "CAPTURED_REQUEST_BODY"
+
+// CapturedRequestBody returns the request body captured by request logging middleware.
+func CapturedRequestBody(c *gin.Context) []byte {
+	if c == nil {
+		return nil
+	}
+	raw, ok := c.Get(capturedRequestBodyContextKey)
+	if !ok {
+		return nil
+	}
+	switch value := raw.(type) {
+	case []byte:
+		return append([]byte(nil), value...)
+	case string:
+		return []byte(value)
+	default:
+		return nil
+	}
+}
 
 // RequestLoggingMiddleware creates a Gin middleware that logs HTTP requests and responses.
 // It captures detailed information about the request and response, including headers and body,
@@ -137,6 +157,7 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 		// Restore the body for the actual request processing
 		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		body = bodyBytes
+		c.Set(capturedRequestBodyContextKey, append([]byte(nil), bodyBytes...))
 	}
 
 	return &RequestInfo{
