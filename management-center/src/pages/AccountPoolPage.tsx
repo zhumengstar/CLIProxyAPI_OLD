@@ -6,7 +6,7 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { SelectionCheckbox } from '@/components/ui/SelectionCheckbox';
-import { useAccountPoolCheckStore, useNotificationStore } from '@/stores';
+import { useAccountPoolCheckStore, useNotificationStore, type AccountCheckResult } from '@/stores';
 import { authFilesApi, type AccountPoolUsageSummary } from '@/services/api';
 import {
   ANTIGRAVITY_CONFIG,
@@ -43,6 +43,8 @@ const DEFAULT_ACCOUNT_POOL_PLAN_FILTER = 'all';
 const DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER = 'all';
 const DEFAULT_ACCOUNT_POOL_QUOTA_FILTER = 'all';
 const LOW_ACCOUNT_POOL_QUOTA_PERCENT = 20;
+const ACCOUNT_POOL_CHECK_RETRY_ATTEMPTS = 2;
+const ACCOUNT_POOL_CHECK_RETRY_DELAY_MS = 700;
 type AccountPoolStatusCodeStats = {
   codes: Array<[number, number]>;
   unchecked: number;
@@ -660,6 +662,33 @@ const getStatusCodePillClassName = (code: number, styles: Record<string, string>
   }
   if (code >= 400) return `${styles.statPill} ${styles.statPillWarning}`;
   return styles.statPill;
+};
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+const getAccountPoolCheckErrorStatus = (err: unknown): number | undefined => {
+  const status = getStatusFromError(err);
+  if (status) return status;
+  if (err && typeof err === 'object' && 'code' in err) {
+    const code = String((err as { code?: unknown }).code || '').toUpperCase();
+    if (code === 'ECONNABORTED' || code === 'ETIMEDOUT') return 408;
+  }
+  const message = err instanceof Error ? err.message.toLowerCase() : '';
+  if (message.includes('timeout')) return 408;
+  return undefined;
+};
+
+const isRetryableAccountPoolCheckError = (err: unknown): boolean => {
+  const status = getAccountPoolCheckErrorStatus(err);
+  if (status === 408 || status === 409 || status === 425 || status === 429) return true;
+  if (typeof status === 'number' && status >= 500) return true;
+  const message = err instanceof Error ? err.message.toLowerCase() : '';
+  return (
+    message.includes('timeout') ||
+    message.includes('network') ||
+    message.includes('request failed') ||
+    message.includes('token refresh failed')
+  );
 };
 
 const compareOptionalTime = (
@@ -1345,28 +1374,22 @@ export function AccountPoolPage() {
       return;
     }
 
-    let cursor = 0;
-    const worker = async () => {
-      for (;;) {
-        const index = cursor;
-        cursor += 1;
-        const file = targets[index];
-        if (!file) return;
+    const checkOne = async (file: AuthFileItem): Promise<AccountCheckResult> => {
+      const config = resolveQuotaConfig(file);
+      if (!config) {
+        return {
+          status: 'unsupported',
+          message: t('account_pool.check_unsupported'),
+          checkedAt: Date.now(),
+        };
+      }
 
-        const config = resolveQuotaConfig(file);
-        if (!config) {
-          setCheckResult(runId, file.name, {
-            status: 'unsupported',
-            message: t('account_pool.check_unsupported'),
-            checkedAt: Date.now(),
-          });
-          continue;
-        }
-
+      let lastError: unknown;
+      for (let attempt = 0; attempt <= ACCOUNT_POOL_CHECK_RETRY_ATTEMPTS; attempt += 1) {
         try {
           const quota = await config.fetchQuota(file, t);
           const quotaSummary = getQuotaSummary(quota, t);
-          setCheckResult(runId, file.name, {
+          return {
             status: 'success',
             message: t('account_pool.check_success'),
             plan: getDetectedPlan(quota),
@@ -1374,17 +1397,37 @@ export function AccountPoolPage() {
             quotaRemainingPercent: quotaSummary.remainingPercent,
             statusCode: 200,
             checkedAt: Date.now(),
-          });
+          };
         } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : t('common.unknown_error');
-          const status = getStatusFromError(err);
-          setCheckResult(runId, file.name, {
-            status: 'error',
-            message: status ? `${status}: ${message}` : message,
-            statusCode: status,
-            checkedAt: Date.now(),
-          });
+          lastError = err;
+          if (
+            attempt >= ACCOUNT_POOL_CHECK_RETRY_ATTEMPTS ||
+            !isRetryableAccountPoolCheckError(err)
+          ) {
+            break;
+          }
+          await sleep(ACCOUNT_POOL_CHECK_RETRY_DELAY_MS * (attempt + 1));
         }
+      }
+
+      const message = lastError instanceof Error ? lastError.message : t('common.unknown_error');
+      const status = getAccountPoolCheckErrorStatus(lastError);
+      return {
+        status: 'error',
+        message: status ? `${status}: ${message}` : message,
+        statusCode: status,
+        checkedAt: Date.now(),
+      };
+    };
+
+    let cursor = 0;
+    const worker = async () => {
+      for (;;) {
+        const index = cursor;
+        cursor += 1;
+        const file = targets[index];
+        if (!file) return;
+        setCheckResult(runId, file.name, await checkOne(file));
       }
     };
 
