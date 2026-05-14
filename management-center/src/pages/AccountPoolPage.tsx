@@ -1694,7 +1694,7 @@ export function AccountPoolPage() {
                       <div className={styles.usageMetricRow}>
                         <div className={styles.usageMetric}>
                           <span className={styles.usageMetricLabel}>
-                            {t('account_pool.usage_requests', { defaultValue: '璇锋眰' })}
+                            {t('account_pool.usage_requests', { defaultValue: '请求' })}
                           </span>
                           <strong className={styles.usageMetricValue}>
                             {formatUsageMetric(usageSummary?.requests)}
@@ -1702,7 +1702,7 @@ export function AccountPoolPage() {
                         </div>
                         <div className={styles.usageMetric}>
                           <span className={styles.usageMetricLabel}>
-                            {t('account_pool.usage_successes', { defaultValue: '鎴愬姛' })}
+                            {t('account_pool.usage_successes', { defaultValue: '成功' })}
                           </span>
                           <strong className={styles.usageMetricValue}>
                             {formatUsageMetric(usageSummary?.successes)}
@@ -1718,7 +1718,7 @@ export function AccountPoolPage() {
                         </div>
                         <div className={styles.usageMetric}>
                           <span className={styles.usageMetricLabel}>
-                            {t('account_pool.usage_failures', { defaultValue: '澶辫触' })}
+                            {t('account_pool.usage_failures', { defaultValue: '失败' })}
                           </span>
                           <strong className={styles.usageMetricValue}>
                             {formatUsageMetric(usageSummary?.failures)}
