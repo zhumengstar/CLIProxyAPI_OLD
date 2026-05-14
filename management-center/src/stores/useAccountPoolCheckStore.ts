@@ -34,7 +34,7 @@ interface AccountPoolCheckState {
   resultHashes: Record<string, string>;
   summary: AccountCheckSummary;
   beginCheck: (names: string[]) => string | null;
-  setResult: (runId: string, name: string, result: AccountCheckResult) => void;
+  setResult: (runId: string, name: string, result: AccountCheckResult, hash?: string) => void;
   finishCheck: (runId: string) => AccountCheckSummary | null;
   pruneResults: (records: AccountCheckRecordRef[]) => void;
   clearResults: () => void;
@@ -167,7 +167,7 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
     return runId;
   },
 
-  setResult: (runId, name, result) => {
+  setResult: (runId, name, result, hash) => {
     const state = get();
     if (state.activeRunId !== runId) return;
 
@@ -191,9 +191,13 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
           ...current.results,
           [name]: result
         },
+        resultHashes: {
+          ...current.resultHashes,
+          ...(hash ? { [name]: hash } : {}),
+        },
         summary: nextSummary
       };
-      writePersistedResults(nextState.results, current.resultHashes);
+      writePersistedResults(nextState.results, nextState.resultHashes);
       return nextState;
     });
   },
@@ -222,7 +226,12 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
       const nextHashes: Record<string, string> = {};
       Object.entries(state.results).forEach(([name, result]) => {
         const hash = allowedHashes.get(name);
-        if (hash && (!state.resultHashes[name] || state.resultHashes[name] === hash)) {
+        if (
+          hash &&
+          (!state.resultHashes[name] ||
+            state.resultHashes[name] === hash ||
+            (state.checking && result.status === 'loading'))
+        ) {
           next[name] = result;
         }
       });

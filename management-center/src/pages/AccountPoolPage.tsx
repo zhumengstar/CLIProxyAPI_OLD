@@ -727,6 +727,7 @@ export function AccountPoolPage() {
   const [files, setFiles] = useState<AuthFileItem[]>([]);
   const [fileContentCache, setFileContentCache] = useState<Record<string, string>>({});
   const [savedAtByName, setSavedAtByName] = useState<Map<string, number>>(() => new Map());
+  const [hashByName, setHashByName] = useState<Map<string, string>>(() => new Map());
   const [loading, setLoading] = useState(true);
   const [downloading, setDownloading] = useState(false);
   const [downloadingArchive, setDownloadingArchive] = useState(false);
@@ -754,6 +755,7 @@ export function AccountPoolPage() {
   const applyRecords = useCallback((records: AccountPoolRecord[]) => {
     const nextRecords = uniqueAccountPoolRecords(records);
     applyAccountPoolRecords(nextRecords, setFiles, setFileContentCache, setSavedAtByName);
+    setHashByName(new Map(nextRecords.map((record) => [record.file.name, record.hash])));
     setSelectedNames((current) =>
       current.filter((name) => nextRecords.some((record) => record.file.name === name))
     );
@@ -1427,7 +1429,7 @@ export function AccountPoolPage() {
         cursor += 1;
         const file = targets[index];
         if (!file) return;
-        setCheckResult(runId, file.name, await checkOne(file));
+        setCheckResult(runId, file.name, await checkOne(file), hashByName.get(file.name));
       }
     };
 
