@@ -105,6 +105,7 @@ export function AuthFilesPage() {
   const batchActionAnimationRef = useRef<AnimationPlaybackControlsWithThen | null>(null);
   const previousSelectionCountRef = useRef(0);
   const selectionCountRef = useRef(0);
+  const autoLoadStartedRef = useRef(false);
   const pageSize = compactMode ? pageSizeByMode.compact : pageSizeByMode.regular;
 
   const {
@@ -160,6 +161,16 @@ export function AuthFilesPage() {
     handleRenameAlias,
     handleDeleteAlias,
   } = useAuthFilesOauth({ viewMode, files });
+
+  const loadFilesRef = useRef(loadFiles);
+  const loadExcludedRef = useRef(loadExcluded);
+  const loadModelAliasRef = useRef(loadModelAlias);
+
+  useEffect(() => {
+    loadFilesRef.current = loadFiles;
+    loadExcludedRef.current = loadExcluded;
+    loadModelAliasRef.current = loadModelAlias;
+  }, [loadFiles, loadExcluded, loadModelAlias]);
 
   const {
     modelsModalOpen,
@@ -346,11 +357,17 @@ export function AuthFilesPage() {
   useHeaderRefresh(handleHeaderRefresh);
 
   useEffect(() => {
-    if (!isCurrentLayer) return;
-    loadFiles();
-    loadExcluded();
-    loadModelAlias();
-  }, [isCurrentLayer, loadFiles, loadExcluded, loadModelAlias]);
+    if (!isCurrentLayer || connectionStatus !== 'connected') {
+      autoLoadStartedRef.current = false;
+      return;
+    }
+    if (autoLoadStartedRef.current) return;
+    autoLoadStartedRef.current = true;
+
+    loadFilesRef.current();
+    loadExcludedRef.current();
+    loadModelAliasRef.current();
+  }, [connectionStatus, isCurrentLayer]);
 
   useInterval(
     () => {
