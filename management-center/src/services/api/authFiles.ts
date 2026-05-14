@@ -5,6 +5,7 @@
 import { apiClient } from './client';
 import { scheduleAccountPoolSync } from '@/utils/accountPool';
 import { computeApiUrl, detectApiBaseFromLocation } from '@/utils/connection';
+import { REQUEST_TIMEOUT_MS } from '@/utils/constants';
 import type { AuthFilesResponse } from '@/types/authFile';
 import type { OAuthModelAliasEntry } from '@/types';
 import { parseTimestampMs } from '@/utils/timestamp';
@@ -372,7 +373,9 @@ const buildAuthFilesFormData = (files: File[]): FormData => {
 };
 
 const uploadAuthFilesForm = (url: string, files: File[]): Promise<AuthFileBatchUploadResponse> =>
-  apiClient.postForm<AuthFileBatchUploadResponse>(url, buildAuthFilesFormData(files));
+  apiClient.postForm<AuthFileBatchUploadResponse>(url, buildAuthFilesFormData(files), {
+    timeout: getDynamicAuthFilesTimeout(files.length, { perItemMs: 220 }),
+  });
 
 export const isAuthFileInvalidJsonObjectError = (err: unknown): boolean =>
   err instanceof Error && err.message === AUTH_FILE_INVALID_JSON_OBJECT_ERROR;
@@ -463,15 +466,54 @@ const normalizeOauthModelAlias = (payload: unknown): Record<string, OAuthModelAl
 };
 
 const OAUTH_MODEL_ALIAS_ENDPOINT = '/oauth-model-alias';
+const AUTH_FILES_LAST_COUNT_STORAGE_KEY = 'cli-proxy-auth-files-last-count';
+const AUTH_FILES_LIST_UNKNOWN_COUNT_TIMEOUT_MS = 120 * 1000;
+const AUTH_FILES_DYNAMIC_TIMEOUT_MAX_MS = 10 * 60 * 1000;
+
+export const getDynamicAuthFilesTimeout = (
+  count: number,
+  options: { baseMs?: number; perItemMs?: number; maxMs?: number } = {}
+): number => {
+  const safeCount = Math.max(0, Math.ceil(Number.isFinite(count) ? count : 0));
+  const baseMs = options.baseMs ?? REQUEST_TIMEOUT_MS;
+  const perItemMs = options.perItemMs ?? 250;
+  const maxMs = options.maxMs ?? AUTH_FILES_DYNAMIC_TIMEOUT_MAX_MS;
+  return Math.min(maxMs, Math.max(baseMs, baseMs + safeCount * perItemMs));
+};
+
+const readLastAuthFilesCount = (): number => {
+  if (typeof window === 'undefined') return 0;
+  const value = Number(window.localStorage.getItem(AUTH_FILES_LAST_COUNT_STORAGE_KEY));
+  return Number.isFinite(value) && value > 0 ? value : 0;
+};
+
+const writeLastAuthFilesCount = (count: number) => {
+  if (typeof window === 'undefined') return;
+  if (!Number.isFinite(count) || count < 0) return;
+  window.localStorage.setItem(AUTH_FILES_LAST_COUNT_STORAGE_KEY, String(Math.ceil(count)));
+};
 
 export const authFilesApi = {
-  list: async () => {
+  list: async (options: { expectedCount?: number } = {}) => {
+    const expectedCount = Math.max(options.expectedCount || 0, readLastAuthFilesCount());
+    const timeout =
+      expectedCount > 0
+        ? getDynamicAuthFilesTimeout(expectedCount, { perItemMs: 120 })
+        : AUTH_FILES_LIST_UNKNOWN_COUNT_TIMEOUT_MS;
     try {
-      return dedupeAuthFilesResponse(await apiClient.get<AuthFilesResponse>('/auth-files'));
+      const response = dedupeAuthFilesResponse(
+        await apiClient.get<AuthFilesResponse>('/auth-files', { timeout })
+      );
+      writeLastAuthFilesCount(response.files.length);
+      return response;
     } catch (err) {
       const fallbackUrl = getStatusCode(err) === 404 ? getLocalManagementUrl('/auth-files') : null;
       if (!fallbackUrl) throw err;
-      return dedupeAuthFilesResponse(await apiClient.get<AuthFilesResponse>(fallbackUrl));
+      const response = dedupeAuthFilesResponse(
+        await apiClient.get<AuthFilesResponse>(fallbackUrl, { timeout })
+      );
+      writeLastAuthFilesCount(response.files.length);
+      return response;
     }
   },
 
@@ -512,13 +554,18 @@ export const authFilesApi = {
 
     const payload = await apiClient.delete<AuthFileBatchDeleteResponse>('/auth-files', {
       data: { names: requestedNames },
+      timeout: getDynamicAuthFilesTimeout(requestedNames.length, { perItemMs: 180 }),
     });
     return normalizeBatchDeleteResponse(payload, requestedNames);
   },
 
   deleteFile: (name: string) => authFilesApi.deleteFiles([name]),
 
-  deleteAll: () => apiClient.delete('/auth-files', { params: { all: true } }),
+  deleteAll: (expectedCount = readLastAuthFilesCount()) =>
+    apiClient.delete('/auth-files', {
+      params: { all: true },
+      timeout: getDynamicAuthFilesTimeout(expectedCount, { perItemMs: 160 }),
+    }),
 
   downloadText: async (name: string): Promise<string> => {
     const response = await apiClient.getRaw(`/auth-files/download?name=${encodeURIComponent(name)}`, {
@@ -530,7 +577,8 @@ export const authFilesApi = {
 
   downloadAccountPoolArchive: async (): Promise<Blob> => {
     const response = await apiClient.getRaw('/account-pool/download', {
-      responseType: 'blob'
+      responseType: 'blob',
+      timeout: getDynamicAuthFilesTimeout(readLastAuthFilesCount(), { perItemMs: 120 })
     });
     return response.data as Blob;
   },
@@ -550,6 +598,7 @@ export const authFilesApi = {
     }
     const payload = await apiClient.delete<AuthFileBatchDeleteResponse>('/account-pool', {
       data: { names: requestedNames },
+      timeout: getDynamicAuthFilesTimeout(requestedNames.length, { perItemMs: 180 }),
     });
     return normalizeBatchDeleteResponse(payload, requestedNames);
   },

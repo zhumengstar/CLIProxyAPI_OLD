@@ -1312,7 +1312,7 @@ export function AccountPoolPage() {
           return new File([content], file.name, { type: 'application/json' });
         })
       );
-      await authFilesApi.deleteAll();
+      await authFilesApi.deleteAll(Math.max(files.length, targets.length));
       const result = await authFilesApi.uploadFiles(uploadFiles);
       if (result.failed.length > 0) {
         showNotification(

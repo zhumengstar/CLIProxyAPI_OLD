@@ -1,5 +1,6 @@
 import { apiClient } from '@/services/api/client';
 import type { AuthFileItem, AuthFilesResponse } from '@/types/authFile';
+import { REQUEST_TIMEOUT_MS } from '@/utils/constants';
 
 export type AccountPoolRecord = {
   file: AuthFileItem;
@@ -14,6 +15,16 @@ export const ACCOUNT_POOL_UPDATED_EVENT = 'cli-proxy-account-pool-updated';
 const ACCOUNT_POOL_DELETED_HASHES_STORAGE_KEY = 'cli-proxy-account-pool-deleted-hashes';
 const ACCOUNT_POOL_SYNC_DEBOUNCE_MS = 400;
 const ACCOUNT_POOL_SYNC_CONCURRENCY = 5;
+const ACCOUNT_POOL_DYNAMIC_TIMEOUT_MAX_MS = 10 * 60 * 1000;
+
+const getAccountPoolDynamicTimeout = (count: number, perItemMs = 140): number => {
+  const safeCount = Math.max(0, Math.ceil(Number.isFinite(count) ? count : 0));
+  return Math.min(
+    ACCOUNT_POOL_DYNAMIC_TIMEOUT_MAX_MS,
+    Math.max(REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS + safeCount * perItemMs)
+  );
+};
+
 const ACCOUNT_POOL_FILE_STORAGE_KEYS = [
   'id',
   'auth_id',
@@ -279,6 +290,7 @@ export const syncAccountPoolFromAuthFiles = async (
     );
     const response = await apiClient.get<unknown>('/auth-files', {
       params: { include_hash: true },
+      timeout: getAccountPoolDynamicTimeout(storedRecords.length || 1000, 120),
     });
     const importedFiles = normalizeAuthFilesPayload(response).filter(
       (file) => !isRuntimeOnlyAuthPoolFile(file)
@@ -320,7 +332,7 @@ export const syncAccountPoolFromAuthFiles = async (
         try {
           const responseText = await apiClient.getRaw(
             `/auth-files/download?name=${encodeURIComponent(file.name)}`,
-            { responseType: 'blob' }
+            { responseType: 'blob', timeout: getAccountPoolDynamicTimeout(importedFiles.length, 80) }
           );
           const rawText = await (responseText.data as Blob).text();
           const hash = await hashText(normalizeJsonForDedupe(rawText));

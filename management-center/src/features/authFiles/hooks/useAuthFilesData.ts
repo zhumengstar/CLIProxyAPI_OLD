@@ -234,7 +234,9 @@ export function useAuthFilesData(options: UseAuthFilesDataOptions = {}): UseAuth
     setStagedTotalCount(0);
     setError('');
     try {
-      const data = await authFilesApi.list();
+      const data = await authFilesApi.list({
+        expectedCount: Math.max(files.length, stagedTotalCount),
+      });
       if (stagedLoadSeqRef.current !== loadSeq) return;
 
       const nextFiles = data?.files || [];
@@ -292,7 +294,7 @@ export function useAuthFilesData(options: UseAuthFilesDataOptions = {}): UseAuth
         setLoading(false);
       }
     }
-  }, [stagedBatchPages, stagedInitialPages, stagedPageSize, t]);
+  }, [files.length, stagedBatchPages, stagedInitialPages, stagedPageSize, stagedTotalCount, t]);
 
   const handleUploadClick = useCallback(() => {
     fileInputRef.current?.click();
@@ -430,7 +432,7 @@ export function useAuthFilesData(options: UseAuthFilesDataOptions = {}): UseAuth
           setDeletingAll(true);
           try {
             if (!isFiltered && !isProblemOnly && !isDisabledOnly) {
-              await authFilesApi.deleteAll();
+              await authFilesApi.deleteAll(files.length);
               showNotification(t('auth_files.delete_all_success'), 'success');
               setFiles((prev) => prev.filter((file) => isRuntimeOnlyAuthFile(file)));
               deselectAll();
