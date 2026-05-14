@@ -149,7 +149,10 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
     set((state) => {
       const nextResults = { ...state.results };
       uniqueNames.forEach((name) => {
-        nextResults[name] = { status: 'loading' };
+        nextResults[name] = {
+          ...nextResults[name],
+          status: 'loading',
+        };
       });
       return {
         activeRunId: runId,

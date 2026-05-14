@@ -38,7 +38,7 @@ const DEFAULT_ACCOUNT_POOL_CHECK_CONCURRENCY = 5;
 const MIN_ACCOUNT_POOL_PAGE_SIZE = 1;
 const MAX_ACCOUNT_POOL_PAGE_SIZE = 200;
 const DEFAULT_ACCOUNT_POOL_PAGE_SIZE = 100;
-const DEFAULT_ACCOUNT_POOL_SORT_MODE = 'check';
+const DEFAULT_ACCOUNT_POOL_SORT_MODE = 'quota_desc';
 const DEFAULT_ACCOUNT_POOL_PLAN_FILTER = 'all';
 const DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER = 'all';
 const DEFAULT_ACCOUNT_POOL_QUOTA_FILTER = 'all';
@@ -343,7 +343,7 @@ const formatQuotaResetMeta = (
   value: string
 ): string => {
   if (!value || value === '-') return '';
-  if (value.includes('閲嶇疆') || value.toLowerCase().includes('reset')) return value;
+  if (value.includes('重置') || value.toLowerCase().includes('reset')) return value;
   return t('quota_management.reset_time_label', {
     time: value,
     defaultValue: `Reset time: ${value}`,
@@ -1749,71 +1749,69 @@ export function AccountPoolPage() {
                               : styles.checkError
                       }`}
                     >
-                      {checkResult.status === 'loading' ? (
-                        t('account_pool.checking')
-                      ) : (
-                        <>
-                          <div className={styles.checkHeader}>
-                            <span className={styles.checkStatusPill}>{checkResult.message}</span>
-                            {planLabel && <span className={styles.checkPlanPill}>{planLabel}</span>}
-                            {checkedAtLabel && <span className={styles.checkTime}>{checkedAtLabel}</span>}
-                          </div>
-                          {quotaDetails.length > 0 && (
-                            <div className={styles.quotaPanel}>
-                              {quotaDetails.map((quota) => {
-                                const percent =
-                                  typeof quota.percent === 'number'
-                                    ? Math.max(0, Math.min(100, quota.percent))
-                                    : null;
-                                const empty = percent !== null && percent <= 0;
-                                const low =
-                                  percent !== null &&
-                                  percent > 0 &&
-                                  percent <= LOW_ACCOUNT_POOL_QUOTA_PERCENT;
-                                return (
-                                  <div
-                                    className={empty ? styles.quotaItemEmpty : styles.quotaItem}
-                                    key={`${quota.label}-${quota.reset}`}
+                      <div className={styles.checkHeader}>
+                        <span className={styles.checkStatusPill}>
+                          {checkResult.status === 'loading'
+                            ? t('account_pool.checking')
+                            : checkResult.message}
+                        </span>
+                        {planLabel && <span className={styles.checkPlanPill}>{planLabel}</span>}
+                        {checkedAtLabel && <span className={styles.checkTime}>{checkedAtLabel}</span>}
+                      </div>
+                      {quotaDetails.length > 0 && (
+                        <div className={styles.quotaPanel}>
+                          {quotaDetails.map((quota) => {
+                            const percent =
+                              typeof quota.percent === 'number'
+                                ? Math.max(0, Math.min(100, quota.percent))
+                                : null;
+                            const empty = percent !== null && percent <= 0;
+                            const low =
+                              percent !== null &&
+                              percent > 0 &&
+                              percent <= LOW_ACCOUNT_POOL_QUOTA_PERCENT;
+                            return (
+                              <div
+                                className={empty ? styles.quotaItemEmpty : styles.quotaItem}
+                                key={`${quota.label}-${quota.reset}`}
+                              >
+                                <div className={styles.quotaItemTop}>
+                                  <span className={styles.quotaName}>{quota.label}</span>
+                                  <span
+                                    className={
+                                      empty
+                                        ? styles.quotaEmptyValue
+                                        : low
+                                          ? styles.quotaLowValue
+                                          : styles.quotaValue
+                                    }
                                   >
-                                    <div className={styles.quotaItemTop}>
-                                      <span className={styles.quotaName}>{quota.label}</span>
-                                      <span
-                                        className={
-                                          empty
-                                            ? styles.quotaEmptyValue
-                                            : low
-                                              ? styles.quotaLowValue
-                                              : styles.quotaValue
-                                        }
-                                      >
-                                        {quota.remaining}
-                                      </span>
-                                    </div>
-                                    {percent !== null && (
-                                      <div className={styles.quotaTrack}>
-                                        <span
-                                          className={
-                                            empty
-                                              ? styles.quotaFillEmpty
-                                              : low
-                                                ? styles.quotaFillLow
-                                                : styles.quotaFill
-                                          }
-                                          style={{ width: `${percent}%` }}
-                                        />
-                                      </div>
-                                    )}
-                                    {quota.reset && (
-                                      <div className={styles.quotaReset}>
-                                        {formatQuotaResetMeta(t, quota.reset)}
-                                      </div>
-                                    )}
+                                    {quota.remaining}
+                                  </span>
+                                </div>
+                                {percent !== null && (
+                                  <div className={styles.quotaTrack}>
+                                    <span
+                                      className={
+                                        empty
+                                          ? styles.quotaFillEmpty
+                                          : low
+                                            ? styles.quotaFillLow
+                                            : styles.quotaFill
+                                      }
+                                      style={{ width: `${percent}%` }}
+                                    />
                                   </div>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </>
+                                )}
+                                {quota.reset && (
+                                  <div className={styles.quotaReset}>
+                                    {formatQuotaResetMeta(t, quota.reset)}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
                       )}
                     </div>
                   )}
