@@ -1247,6 +1247,61 @@ func (h *Handler) DownloadAccountPoolEntry(c *gin.Context) {
 	c.Data(http.StatusOK, "application/json", data)
 }
 
+func (h *Handler) DeleteAccountPoolEntries(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+
+	names, err := requestedAuthFileNamesForDelete(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if len(names) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no account pool entries specified"})
+		return
+	}
+
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	deleted := make([]string, 0, len(names))
+	failed := make([]gin.H, 0)
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if isUnsafeAuthFileName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			failed = append(failed, gin.H{"name": name, "error": "invalid name"})
+			continue
+		}
+		if _, ok := entries[name]; ok {
+			delete(entries, name)
+			deleted = append(deleted, name)
+		}
+	}
+
+	if len(deleted) > 0 {
+		if err := h.writeAccountPoolArchive(entries); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	if len(failed) > 0 {
+		c.JSON(http.StatusMultiStatus, gin.H{
+			"status":  "partial",
+			"deleted": len(deleted),
+			"files":   deleted,
+			"failed":  failed,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(deleted), "files": deleted})
+}
+
 func buildAccountPoolArchiveName() string {
 	return fmt.Sprintf("account-pool-%s.zip", time.Now().Format("20060102-150405"))
 }

@@ -181,6 +181,52 @@ func TestDownloadAccountPoolEntry_ReadsArchivedDeletedFile(t *testing.T) {
 	}
 }
 
+func TestDeleteAccountPoolEntries_RemovesOnlyArchiveEntries(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+
+	removeName := "remove.json"
+	keepName := "keep.json"
+	removeContent := []byte(`{"type":"codex","email":"remove@example.com"}`)
+	keepContent := []byte(`{"type":"codex","email":"keep@example.com"}`)
+	if err := h.upsertAccountPoolArchiveFile(removeName, removeContent); err != nil {
+		t.Fatalf("failed to seed removable account pool archive entry: %v", err)
+	}
+	if err := h.upsertAccountPoolArchiveFile(keepName, keepContent); err != nil {
+		t.Fatalf("failed to seed kept account pool archive entry: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(authDir, removeName), removeContent, 0o600); err != nil {
+		t.Fatalf("failed to seed auth file: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(
+		http.MethodDelete,
+		"/v0/management/account-pool?name="+url.QueryEscape(removeName),
+		nil,
+	)
+
+	h.DeleteAccountPoolEntries(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	entries := readTestZipEntries(t, filepath.Join(authDir, "account-pool.zip"))
+	if _, ok := entries[removeName]; ok {
+		t.Fatalf("expected account pool archive entry %s to be removed", removeName)
+	}
+	if got := string(entries[keepName]); got != string(keepContent) {
+		t.Fatalf("expected kept archive entry content %q, got %q", keepContent, got)
+	}
+	if _, err := os.Stat(filepath.Join(authDir, removeName)); err != nil {
+		t.Fatalf("expected auth file to remain after account pool delete: %v", err)
+	}
+}
+
 func readTestZipEntries(t *testing.T, archivePath string) map[string][]byte {
 	t.Helper()
 
