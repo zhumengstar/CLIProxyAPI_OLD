@@ -10,6 +10,18 @@ export type AccountPoolRecord = {
   sourceFingerprint?: string;
 };
 
+export type AccountPoolSyncProgress = {
+  phase: 'listing' | 'syncing' | 'saving' | 'done';
+  total: number;
+  processed: number;
+  added: number;
+  updated: number;
+  unchanged: number;
+  skipped: number;
+  failed: number;
+  deduped: number;
+};
+
 export const ACCOUNT_POOL_STORAGE_KEY = 'cli-proxy-account-pool';
 export const ACCOUNT_POOL_UPDATED_EVENT = 'cli-proxy-account-pool-updated';
 const ACCOUNT_POOL_DELETED_HASHES_STORAGE_KEY = 'cli-proxy-account-pool-deleted-hashes';
@@ -65,6 +77,8 @@ const ACCOUNT_POOL_FILE_STORAGE_KEYS = [
 
 let syncTimer: ReturnType<typeof setTimeout> | null = null;
 let syncInFlight: Promise<AccountPoolRecord[]> | null = null;
+let latestSyncProgress: AccountPoolSyncProgress | null = null;
+const syncProgressListeners = new Set<(progress: AccountPoolSyncProgress) => void>();
 
 export const isRuntimeOnlyAuthPoolFile = (file: AuthFileItem): boolean => {
   const value = file.runtimeOnly ?? file['runtime_only'];
@@ -278,12 +292,49 @@ const readAuthFileContentHash = (file: AuthFileItem): string => {
 };
 
 export const syncAccountPoolFromAuthFiles = async (
-  concurrency = ACCOUNT_POOL_SYNC_CONCURRENCY
+  concurrency = ACCOUNT_POOL_SYNC_CONCURRENCY,
+  onProgress?: (progress: AccountPoolSyncProgress) => void
 ): Promise<AccountPoolRecord[]> => {
-  if (syncInFlight) return syncInFlight;
+  if (onProgress) {
+    syncProgressListeners.add(onProgress);
+    if (latestSyncProgress) {
+      onProgress({ ...latestSyncProgress });
+    }
+  }
+  if (syncInFlight) {
+    try {
+      return await syncInFlight;
+    } finally {
+      if (onProgress) {
+        syncProgressListeners.delete(onProgress);
+      }
+    }
+  }
 
   syncInFlight = (async () => {
     const syncConcurrency = Math.max(1, Math.floor(concurrency));
+    const progress: AccountPoolSyncProgress = {
+      phase: 'listing',
+      total: 0,
+      processed: 0,
+      added: 0,
+      updated: 0,
+      unchanged: 0,
+      skipped: 0,
+      failed: 0,
+      deduped: 0,
+    };
+    let lastProgressAt = 0;
+    const reportProgress = (force = false) => {
+      if (syncProgressListeners.size === 0) return;
+      const now = Date.now();
+      if (!force && now - lastProgressAt < 120 && progress.processed < progress.total) return;
+      lastProgressAt = now;
+      latestSyncProgress = { ...progress };
+      syncProgressListeners.forEach((listener) => listener({ ...progress }));
+    };
+
+    reportProgress(true);
     const deletedHashes = readDeletedAccountPoolHashes();
     const storedRecords = uniqueAccountPoolRecords(readAccountPoolRecords()).filter(
       (record) => !deletedHashes.has(record.hash)
@@ -295,6 +346,9 @@ export const syncAccountPoolFromAuthFiles = async (
     const importedFiles = normalizeAuthFilesPayload(response).filter(
       (file) => !isRuntimeOnlyAuthPoolFile(file)
     );
+    progress.phase = 'syncing';
+    progress.total = importedFiles.length;
+    reportProgress(true);
     const recordsByName = new Map<string, AccountPoolRecord>();
     storedRecords.forEach((record) => {
       recordsByName.set(record.file.name, record);
@@ -311,6 +365,9 @@ export const syncAccountPoolFromAuthFiles = async (
             ...existing,
             file,
           });
+          progress.unchanged += 1;
+          progress.processed += 1;
+          reportProgress();
           return;
         }
 
@@ -318,6 +375,9 @@ export const syncAccountPoolFromAuthFiles = async (
         if (serverContentHash) {
           if (deletedHashes.has(serverContentHash)) {
             recordsByName.delete(file.name);
+            progress.skipped += 1;
+            progress.processed += 1;
+            reportProgress();
             return;
           }
           recordsByName.set(file.name, {
@@ -326,6 +386,13 @@ export const syncAccountPoolFromAuthFiles = async (
             savedAt: existing?.savedAt || Date.now(),
             sourceFingerprint,
           });
+          if (existing) {
+            progress.updated += 1;
+          } else {
+            progress.added += 1;
+          }
+          progress.processed += 1;
+          reportProgress();
           return;
         }
 
@@ -338,6 +405,9 @@ export const syncAccountPoolFromAuthFiles = async (
           const hash = await hashText(normalizeJsonForDedupe(rawText));
           if (deletedHashes.has(hash)) {
             recordsByName.delete(file.name);
+            progress.skipped += 1;
+            progress.processed += 1;
+            reportProgress();
             return;
           }
           recordsByName.set(file.name, {
@@ -346,15 +416,29 @@ export const syncAccountPoolFromAuthFiles = async (
             savedAt: Date.now(),
             sourceFingerprint,
           });
+          if (existing) {
+            progress.updated += 1;
+          } else {
+            progress.added += 1;
+          }
         } catch {
           // Keep the existing pool intact even when a source auth file can no longer be read.
+          progress.failed += 1;
         }
+        progress.processed += 1;
+        reportProgress();
       }
     );
 
+    progress.phase = 'saving';
+    reportProgress(true);
     const mergedRecords = uniqueAccountPoolRecords(Array.from(recordsByName.values()));
+    progress.deduped = Math.max(0, importedFiles.length - mergedRecords.length);
     writeAccountPoolRecords(mergedRecords);
     emitAccountPoolUpdated(mergedRecords);
+    progress.phase = 'done';
+    progress.processed = progress.total;
+    reportProgress(true);
     return mergedRecords;
   })();
 
@@ -362,6 +446,9 @@ export const syncAccountPoolFromAuthFiles = async (
     return await syncInFlight;
   } finally {
     syncInFlight = null;
+    if (onProgress) {
+      syncProgressListeners.delete(onProgress);
+    }
   }
 };
 

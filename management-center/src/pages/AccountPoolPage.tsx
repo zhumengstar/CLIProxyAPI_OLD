@@ -28,6 +28,7 @@ import {
   readAccountPoolRecords,
   syncAccountPoolFromAuthFiles,
   uniqueAccountPoolRecords,
+  type AccountPoolSyncProgress,
   type AccountPoolRecord,
 } from '@/utils/accountPool';
 import styles from './AccountPoolPage.module.scss';
@@ -753,6 +754,7 @@ export function AccountPoolPage() {
   const [overwritingPassed, setOverwritingPassed] = useState(false);
   const [deletingPoolEntries, setDeletingPoolEntries] = useState(false);
   const [error, setError] = useState('');
+  const [syncProgress, setSyncProgress] = useState<AccountPoolSyncProgress | null>(null);
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('all');
   const [planFilter, setPlanFilter] = useState(DEFAULT_ACCOUNT_POOL_PLAN_FILTER);
@@ -793,10 +795,12 @@ export function AccountPoolPage() {
       setLoading(true);
     }
     setError('');
+    setSyncProgress(null);
     hydrateStoredPool();
     try {
-      const mergedRecords = await syncAccountPoolFromAuthFiles(checkConcurrency);
+      const mergedRecords = await syncAccountPoolFromAuthFiles(checkConcurrency, setSyncProgress);
       applyRecords(mergedRecords);
+      setSyncProgress((current) => current ? { ...current, phase: 'done' } : current);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('notification.refresh_failed');
       setError(message);
@@ -1095,6 +1099,18 @@ export function AccountPoolPage() {
 
   const displayedStatusCodeStats =
     checking && statusStatsSnapshot ? statusStatsSnapshot : statusCodeStats;
+  const syncProgressPercent = syncProgress?.total
+    ? Math.round((syncProgress.processed / syncProgress.total) * 100)
+    : 0;
+  const syncPhaseLabel = syncProgress
+    ? syncProgress.phase === 'listing'
+      ? t('account_pool.sync_phase_listing', { defaultValue: '读取认证列表' })
+      : syncProgress.phase === 'saving'
+        ? t('account_pool.sync_phase_saving', { defaultValue: '保存账号池' })
+        : syncProgress.phase === 'done'
+          ? t('account_pool.sync_phase_done', { defaultValue: '同步完成' })
+          : t('account_pool.sync_phase_syncing', { defaultValue: '同步中' })
+    : '';
 
   useEffect(() => {
     if (page > totalPages) {
@@ -1679,6 +1695,31 @@ export function AccountPoolPage() {
 
       {error && <div className={styles.errorBox}>{error}</div>}
 
+      {syncProgress && (
+        <div className={styles.syncProgressPanel}>
+          <div className={styles.syncProgressHeader}>
+            <strong>{syncPhaseLabel}</strong>
+            <span>
+              {syncProgress.processed}/{syncProgress.total || 0}
+              {syncProgress.total > 0 ? ` · ${syncProgressPercent}%` : ''}
+            </span>
+          </div>
+          <div className={styles.syncProgressTrack}>
+            <div
+              className={styles.syncProgressBar}
+              style={{ width: `${syncProgress.total > 0 ? syncProgressPercent : 8}%` }}
+            />
+          </div>
+          <div className={styles.syncProgressStats}>
+            <span>{t('account_pool.sync_added', { count: syncProgress.added, defaultValue: `新增 ${syncProgress.added}` })}</span>
+            <span>{t('account_pool.sync_updated', { count: syncProgress.updated, defaultValue: `更新 ${syncProgress.updated}` })}</span>
+            <span>{t('account_pool.sync_unchanged', { count: syncProgress.unchanged, defaultValue: `未变 ${syncProgress.unchanged}` })}</span>
+            <span>{t('account_pool.sync_skipped', { count: syncProgress.skipped, defaultValue: `跳过 ${syncProgress.skipped}` })}</span>
+            <span>{t('account_pool.sync_failed', { count: syncProgress.failed, defaultValue: `失败 ${syncProgress.failed}` })}</span>
+            <span>{t('account_pool.sync_deduped', { count: syncProgress.deduped, defaultValue: `去重 ${syncProgress.deduped}` })}</span>
+          </div>
+        </div>
+      )}
 
       <Card>
         <div className={styles.toolbar}>
