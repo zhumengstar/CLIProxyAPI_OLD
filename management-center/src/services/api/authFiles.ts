@@ -8,6 +8,7 @@ import { REQUEST_TIMEOUT_MS } from '@/utils/constants';
 import type { AuthFilesResponse } from '@/types/authFile';
 import type { OAuthModelAliasEntry } from '@/types';
 import { parseTimestampMs } from '@/utils/timestamp';
+import { readZipTextFiles } from '@/utils/zip';
 
 type StatusError = { status?: number };
 type AuthFileStatusResponse = { status: string; disabled: boolean };
@@ -367,6 +368,43 @@ const saveAuthFileText = async (name: string, text: string) => {
   await authFilesApi.upload(file);
 };
 
+const hashTextForAccountPool = async (value: string): Promise<string> => {
+  const bytes = new TextEncoder().encode(value.trim());
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+};
+
+const buildAccountPoolResponseFromArchive = async (blob: Blob): Promise<AuthFilesResponse> => {
+  const zipFiles = await readZipTextFiles(blob);
+  const files = await Promise.all(
+    zipFiles.map(async (file) => {
+      let parsed: Record<string, unknown> = {};
+      try {
+        parsed = JSON.parse(file.text) as Record<string, unknown>;
+      } catch {
+        parsed = {};
+      }
+      const type = typeof parsed.type === 'string' ? parsed.type : '';
+      const email = typeof parsed.email === 'string' ? parsed.email : '';
+      return {
+        name: file.name,
+        id: file.name,
+        auth_id: file.name,
+        auth_index: file.name,
+        type,
+        provider: type,
+        email,
+        size: file.text.length,
+        source: 'account_pool_archive',
+        content_hash: await hashTextForAccountPool(file.text),
+      } as AuthFileEntry;
+    })
+  );
+  return { files, total: files.length } as AuthFilesResponse;
+};
+
 const buildAuthFilesFormData = (files: File[]): FormData => {
   const formData = new FormData();
   files.forEach((file) => {
@@ -688,7 +726,14 @@ export const authFilesApi = {
       payload = await apiClient.get<AuthFilesResponse>('/account-pool/list', config);
     } catch (err) {
       if (getStatusCode(err) !== 404) throw err;
-      payload = await apiClient.get<AuthFilesResponse>('/account-pool', config);
+      try {
+        payload = await apiClient.get<AuthFilesResponse>('/account-pool', config);
+      } catch (fallbackErr) {
+        if (getStatusCode(fallbackErr) !== 404) throw fallbackErr;
+        payload = await buildAccountPoolResponseFromArchive(
+          await authFilesApi.downloadAccountPoolArchive()
+        );
+      }
     }
     const response = dedupeAuthFilesResponse(payload);
     return response;

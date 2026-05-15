@@ -1,6 +1,7 @@
 import { apiClient } from '@/services/api/client';
 import type { AuthFileItem, AuthFilesResponse } from '@/types/authFile';
 import { REQUEST_TIMEOUT_MS } from '@/utils/constants';
+import { readZipTextFiles } from '@/utils/zip';
 
 export type AccountPoolRecord = {
   file: AuthFileItem;
@@ -264,6 +265,38 @@ const normalizeAuthFilesPayload = (payload: unknown): AuthFileItem[] => {
   return Array.isArray(files) ? files : [];
 };
 
+const buildAccountPoolFilesFromArchive = async (): Promise<AuthFileItem[]> => {
+  const response = await apiClient.getRaw('/account-pool/download', {
+    responseType: 'blob',
+    timeout: getAccountPoolDynamicTimeout(1000, 120),
+  });
+  const zipFiles = await readZipTextFiles(response.data as Blob);
+  return Promise.all(
+    zipFiles.map(async (file) => {
+      let parsed: Record<string, unknown> = {};
+      try {
+        parsed = JSON.parse(file.text) as Record<string, unknown>;
+      } catch {
+        parsed = {};
+      }
+      const type = typeof parsed.type === 'string' ? parsed.type : '';
+      const email = typeof parsed.email === 'string' ? parsed.email : '';
+      return {
+        name: file.name,
+        id: file.name,
+        auth_id: file.name,
+        auth_index: file.name,
+        type,
+        provider: type,
+        email,
+        size: file.text.length,
+        source: 'account_pool_archive',
+        content_hash: await hashText(normalizeJsonForDedupe(file.text)),
+      } as AuthFileItem;
+    })
+  );
+};
+
 const readAuthFileField = (file: AuthFileItem, key: string): unknown =>
   (file as Record<string, unknown>)[key];
 
@@ -344,7 +377,18 @@ export const syncAccountPoolFromAuthFiles = async (
       if (!err || typeof err !== 'object' || (err as { status?: number }).status !== 404) {
         throw err;
       }
-      response = await apiClient.get<unknown>('/account-pool', listConfig);
+      try {
+        response = await apiClient.get<unknown>('/account-pool', listConfig);
+      } catch (fallbackErr) {
+        if (
+          !fallbackErr ||
+          typeof fallbackErr !== 'object' ||
+          (fallbackErr as { status?: number }).status !== 404
+        ) {
+          throw fallbackErr;
+        }
+        response = { files: await buildAccountPoolFilesFromArchive() };
+      }
     }
     const importedFiles = normalizeAuthFilesPayload(response).filter(
       (file) => !isRuntimeOnlyAuthPoolFile(file)

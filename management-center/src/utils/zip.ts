@@ -1,4 +1,5 @@
 const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 const crcTable = new Uint32Array(256);
 
@@ -125,4 +126,75 @@ export const createZipBlob = (files: ZipTextFile[]): Blob => {
   return new Blob([zipBuffer], {
     type: 'application/zip',
   });
+};
+
+const readUint16 = (view: DataView, offset: number): number => view.getUint16(offset, true);
+const readUint32 = (view: DataView, offset: number): number => view.getUint32(offset, true);
+
+const findEndOfCentralDirectory = (bytes: Uint8Array): number => {
+  const minOffset = Math.max(0, bytes.length - 0xffff - 22);
+  for (let offset = bytes.length - 22; offset >= minOffset; offset -= 1) {
+    if (
+      bytes[offset] === 0x50 &&
+      bytes[offset + 1] === 0x4b &&
+      bytes[offset + 2] === 0x05 &&
+      bytes[offset + 3] === 0x06
+    ) {
+      return offset;
+    }
+  }
+  return -1;
+};
+
+const inflateRaw = async (bytes: Uint8Array): Promise<Uint8Array> => {
+  const DecompressionStreamCtor = (globalThis as {
+    DecompressionStream?: new (format: string) => DecompressionStream;
+  }).DecompressionStream;
+  if (!DecompressionStreamCtor) {
+    throw new Error('当前浏览器不支持解压账号池 ZIP');
+  }
+  const buffer = bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength
+  ) as ArrayBuffer;
+  const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStreamCtor('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+};
+
+export const readZipTextFiles = async (blob: Blob): Promise<ZipTextFile[]> => {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const eocdOffset = findEndOfCentralDirectory(bytes);
+  if (eocdOffset < 0) throw new Error('账号池 ZIP 格式无效');
+
+  const entryCount = readUint16(view, eocdOffset + 10);
+  const centralOffset = readUint32(view, eocdOffset + 16);
+  const files: ZipTextFile[] = [];
+  let cursor = centralOffset;
+
+  for (let index = 0; index < entryCount; index += 1) {
+    if (readUint32(view, cursor) !== 0x02014b50) break;
+    const method = readUint16(view, cursor + 10);
+    const compressedSize = readUint32(view, cursor + 20);
+    const fileNameLength = readUint16(view, cursor + 28);
+    const extraLength = readUint16(view, cursor + 30);
+    const commentLength = readUint16(view, cursor + 32);
+    const localOffset = readUint32(view, cursor + 42);
+    const nameStart = cursor + 46;
+    const name = textDecoder.decode(bytes.subarray(nameStart, nameStart + fileNameLength));
+    cursor = nameStart + fileNameLength + extraLength + commentLength;
+
+    if (!name.toLowerCase().endsWith('.json')) continue;
+    if (readUint32(view, localOffset) !== 0x04034b50) continue;
+    const localNameLength = readUint16(view, localOffset + 26);
+    const localExtraLength = readUint16(view, localOffset + 28);
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    const compressed = bytes.subarray(dataStart, dataStart + compressedSize);
+    const data =
+      method === 0 ? compressed : method === 8 ? await inflateRaw(compressed) : null;
+    if (!data) continue;
+    files.push({ name: name.split(/[\\/]/).pop() || name, text: textDecoder.decode(data) });
+  }
+
+  return files;
 };
