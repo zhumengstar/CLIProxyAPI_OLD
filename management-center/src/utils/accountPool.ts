@@ -333,10 +333,19 @@ export const syncAccountPoolFromAuthFiles = async (
 
     reportProgress(true);
     const storedRecords = uniqueAccountPoolRecords(readAccountPoolRecords());
-    const response = await apiClient.get<unknown>('/account-pool', {
+    const listConfig = {
       params: { include_hash: true },
       timeout: getAccountPoolDynamicTimeout(storedRecords.length || 1000, 120),
-    });
+    };
+    let response: unknown;
+    try {
+      response = await apiClient.get<unknown>('/account-pool/list', listConfig);
+    } catch (err) {
+      if (!err || typeof err !== 'object' || (err as { status?: number }).status !== 404) {
+        throw err;
+      }
+      response = await apiClient.get<unknown>('/account-pool', listConfig);
+    }
     const importedFiles = normalizeAuthFilesPayload(response).filter(
       (file) => !isRuntimeOnlyAuthPoolFile(file)
     );

@@ -629,10 +629,19 @@ export const authFilesApi = {
     if (requestedNames.length === 0) {
       return { status: 'ok', deleted: 0, files: [], failed: [] };
     }
-    const payload = await apiClient.delete<AuthFileBatchDeleteResponse>('/account-pool', {
-      data: { names: requestedNames },
-      timeout: getDynamicAuthFilesTimeout(requestedNames.length, { perItemMs: 180 }),
-    });
+    let payload: AuthFileBatchDeleteResponse;
+    try {
+      payload = await apiClient.delete<AuthFileBatchDeleteResponse>('/account-pool/delete', {
+        data: { names: requestedNames },
+        timeout: getDynamicAuthFilesTimeout(requestedNames.length, { perItemMs: 180 }),
+      });
+    } catch (err) {
+      if (getStatusCode(err) !== 404) throw err;
+      payload = await apiClient.delete<AuthFileBatchDeleteResponse>('/account-pool', {
+        data: { names: requestedNames },
+        timeout: getDynamicAuthFilesTimeout(requestedNames.length, { perItemMs: 180 }),
+      });
+    }
     return normalizeBatchDeleteResponse(payload, requestedNames);
   },
 
@@ -668,14 +677,20 @@ export const authFilesApi = {
   },
 
   listAccountPoolEntries: async (): Promise<AuthFilesResponse> => {
-    const response = dedupeAuthFilesResponse(
-      await apiClient.get<AuthFilesResponse>('/account-pool', {
-        params: { include_hash: true },
-        timeout: getDynamicAuthFilesTimeout(readLastAuthFilesCount() || 1000, {
-          perItemMs: 120,
-        }),
-      })
-    );
+    const config = {
+      params: { include_hash: true },
+      timeout: getDynamicAuthFilesTimeout(readLastAuthFilesCount() || 1000, {
+        perItemMs: 120,
+      }),
+    };
+    let payload: AuthFilesResponse;
+    try {
+      payload = await apiClient.get<AuthFilesResponse>('/account-pool/list', config);
+    } catch (err) {
+      if (getStatusCode(err) !== 404) throw err;
+      payload = await apiClient.get<AuthFilesResponse>('/account-pool', config);
+    }
+    const response = dedupeAuthFilesResponse(payload);
     return response;
   },
 
@@ -684,13 +699,25 @@ export const authFilesApi = {
     if (requestedNames.length === 0) {
       return { status: 'ok', uploaded: 0, files: [], failed: [] };
     }
-    const payload = await apiClient.postForm<AuthFileBatchUploadResponse>(
-      '/account-pool',
-      buildAuthFilesFormData(files),
-      {
-        timeout: getDynamicAuthFilesTimeout(files.length, { perItemMs: 220 }),
-      }
-    );
+    const formData = buildAuthFilesFormData(files);
+    const config = {
+      timeout: getDynamicAuthFilesTimeout(files.length, { perItemMs: 220 }),
+    };
+    let payload: AuthFileBatchUploadResponse;
+    try {
+      payload = await apiClient.postForm<AuthFileBatchUploadResponse>(
+        '/account-pool/upload',
+        formData,
+        config
+      );
+    } catch (err) {
+      if (getStatusCode(err) !== 404) throw err;
+      payload = await apiClient.postForm<AuthFileBatchUploadResponse>(
+        '/account-pool',
+        buildAuthFilesFormData(files),
+        config
+      );
+    }
     return normalizeBatchUploadResponse(payload, requestedNames);
   },
 
