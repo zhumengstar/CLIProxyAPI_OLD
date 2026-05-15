@@ -3,7 +3,6 @@
  */
 
 import { apiClient } from './client';
-import { scheduleAccountPoolSync } from '@/utils/accountPool';
 import { computeApiUrl, detectApiBaseFromLocation } from '@/utils/connection';
 import { REQUEST_TIMEOUT_MS } from '@/utils/constants';
 import type { AuthFilesResponse } from '@/types/authFile';
@@ -525,10 +524,7 @@ export const authFilesApi = {
     apiClient.patch<AuthFileStatusResponse>('/auth-files/status', { name, disabled }),
 
   patchFields: (name: string, fields: AuthFileFieldsPatch) =>
-    apiClient.patch('/auth-files/fields', { name, ...fields }).then((result) => {
-      scheduleAccountPoolSync();
-      return result;
-    }),
+    apiClient.patch('/auth-files/fields', { name, ...fields }),
 
   uploadFiles: async (files: File[]): Promise<AuthFileBatchUploadResult> => {
     const requestedNames = files.map((file) => file.name);
@@ -544,7 +540,6 @@ export const authFilesApi = {
       if (!fallbackUrl) throw err;
       payload = await uploadAuthFilesForm(fallbackUrl, files);
     }
-    scheduleAccountPoolSync();
     return normalizeBatchUploadResponse(payload, requestedNames);
   },
 
@@ -670,6 +665,33 @@ export const authFilesApi = {
       limit: typeof response.limit === 'number' ? response.limit : undefined,
       offset: typeof response.offset === 'number' ? response.offset : undefined,
     };
+  },
+
+  listAccountPoolEntries: async (): Promise<AuthFilesResponse> => {
+    const response = dedupeAuthFilesResponse(
+      await apiClient.get<AuthFilesResponse>('/account-pool', {
+        params: { include_hash: true },
+        timeout: getDynamicAuthFilesTimeout(readLastAuthFilesCount() || 1000, {
+          perItemMs: 120,
+        }),
+      })
+    );
+    return response;
+  },
+
+  uploadAccountPoolFiles: async (files: File[]): Promise<AuthFileBatchUploadResult> => {
+    const requestedNames = files.map((file) => file.name);
+    if (requestedNames.length === 0) {
+      return { status: 'ok', uploaded: 0, files: [], failed: [] };
+    }
+    const payload = await apiClient.postForm<AuthFileBatchUploadResponse>(
+      '/account-pool',
+      buildAuthFilesFormData(files),
+      {
+        timeout: getDynamicAuthFilesTimeout(files.length, { perItemMs: 220 }),
+      }
+    );
+    return normalizeBatchUploadResponse(payload, requestedNames);
   },
 
   clearAccountPoolUsageRecords: () => apiClient.delete('/account-pool/usage-records'),

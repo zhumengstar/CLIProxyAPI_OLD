@@ -714,28 +714,57 @@ func tokenValueFromMetadata(metadata map[string]any) string {
 func (h *Handler) authByIndexOrName(authIndex string, authName string) *coreauth.Auth {
 	authIndex = strings.TrimSpace(authIndex)
 	authName = strings.TrimSpace(authName)
-	if (authIndex == "" && authName == "") || h == nil || h.authManager == nil {
+	if (authIndex == "" && authName == "") || h == nil {
 		return nil
 	}
-	if authName != "" {
-		if auth, ok := h.authManager.GetByID(authName); ok {
-			return auth
+	if h.authManager != nil {
+		if authName != "" {
+			if auth, ok := h.authManager.GetByID(authName); ok {
+				return auth
+			}
+		}
+		auths := h.authManager.List()
+		for _, auth := range auths {
+			if auth == nil {
+				continue
+			}
+			auth.EnsureIndex()
+			if authIndex != "" && auth.Index == authIndex {
+				return auth
+			}
+			if authName != "" && (auth.ID == authName || auth.FileName == authName || filepath.Base(strings.TrimSpace(authAttribute(auth, "path"))) == authName) {
+				return auth
+			}
 		}
 	}
-	auths := h.authManager.List()
-	for _, auth := range auths {
-		if auth == nil {
-			continue
-		}
-		auth.EnsureIndex()
-		if authIndex != "" && auth.Index == authIndex {
-			return auth
-		}
-		if authName != "" && (auth.ID == authName || auth.FileName == authName || filepath.Base(strings.TrimSpace(authAttribute(auth, "path"))) == authName) {
+	if authName != "" {
+		if auth := h.accountPoolAuthByName(authName); auth != nil {
 			return auth
 		}
 	}
 	return nil
+}
+
+func (h *Handler) accountPoolAuthByName(authName string) *coreauth.Auth {
+	authName = filepath.Base(strings.TrimSpace(authName))
+	if h == nil || h.cfg == nil || authName == "" || isUnsafeAuthFileName(authName) || !strings.HasSuffix(strings.ToLower(authName), ".json") {
+		return nil
+	}
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		return nil
+	}
+	data, ok := entries[authName]
+	if !ok {
+		return nil
+	}
+	auth, err := h.buildAuthFromFileData(filepath.Join(h.cfg.AuthDir, ".account-pool", authName), data)
+	if err != nil {
+		return nil
+	}
+	auth.FileName = authName
+	auth.ID = authName
+	return auth
 }
 
 func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {

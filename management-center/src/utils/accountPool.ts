@@ -160,13 +160,34 @@ export const writeAccountPoolRecords = (records: AccountPoolRecord[]) => {
     savedAt: record.savedAt,
     sourceFingerprint: record.sourceFingerprint,
   }));
+  const minimalRecords = records.map((record) => ({
+    file: {
+      name: record.file.name,
+      type: record.file.type,
+      provider: record.file.provider,
+      auth_index: record.file['auth_index'] ?? record.file.authIndex ?? record.file.name,
+      email: record.file.email,
+      content_hash: record.file['content_hash'] ?? record.file.contentHash,
+    },
+    hash: record.hash,
+    savedAt: record.savedAt,
+    sourceFingerprint: record.sourceFingerprint,
+  }));
   const serialized = JSON.stringify(compactRecords);
   try {
     window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, serialized);
   } catch (err) {
     if (err instanceof DOMException && err.name === 'QuotaExceededError') {
       window.localStorage.removeItem(ACCOUNT_POOL_STORAGE_KEY);
-      window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, serialized);
+      try {
+        window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, serialized);
+      } catch {
+        try {
+          window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, JSON.stringify(minimalRecords));
+        } catch {
+          window.localStorage.removeItem(ACCOUNT_POOL_STORAGE_KEY);
+        }
+      }
       return;
     }
     throw err;
@@ -312,7 +333,7 @@ export const syncAccountPoolFromAuthFiles = async (
 
     reportProgress(true);
     const storedRecords = uniqueAccountPoolRecords(readAccountPoolRecords());
-    const response = await apiClient.get<unknown>('/auth-files', {
+    const response = await apiClient.get<unknown>('/account-pool', {
       params: { include_hash: true },
       timeout: getAccountPoolDynamicTimeout(storedRecords.length || 1000, 120),
     });
@@ -364,7 +385,7 @@ export const syncAccountPoolFromAuthFiles = async (
 
         try {
           const responseText = await apiClient.getRaw(
-            `/auth-files/download?name=${encodeURIComponent(file.name)}`,
+            `/account-pool/download-entry?name=${encodeURIComponent(file.name)}`,
             { responseType: 'blob', timeout: getAccountPoolDynamicTimeout(importedFiles.length, 80) }
           );
           const rawText = await (responseText.data as Blob).text();

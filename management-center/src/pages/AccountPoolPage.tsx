@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useState, type ChangeEvent } from 'react';
+﻿import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
@@ -756,6 +756,7 @@ export function AccountPoolPage() {
   const [loading, setLoading] = useState(true);
   const [downloading, setDownloading] = useState(false);
   const [downloadingArchive, setDownloadingArchive] = useState(false);
+  const [importingPool, setImportingPool] = useState(false);
   const [overwritingPassed, setOverwritingPassed] = useState(false);
   const [deletingPoolEntries, setDeletingPoolEntries] = useState(false);
   const [error, setError] = useState('');
@@ -778,6 +779,7 @@ export function AccountPoolPage() {
     null
   );
   const [resumedPendingCheck, setResumedPendingCheck] = useState(false);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
 
   const applyRecords = useCallback((records: AccountPoolRecord[]) => {
     const nextRecords = uniqueAccountPoolRecords(records);
@@ -1110,7 +1112,7 @@ export function AccountPoolPage() {
     : 0;
   const syncPhaseLabel = syncProgress
     ? syncProgress.phase === 'listing'
-      ? t('account_pool.sync_phase_listing', { defaultValue: '读取认证列表' })
+      ? t('account_pool.sync_phase_listing', { defaultValue: '读取账号池' })
       : syncProgress.phase === 'saving'
         ? t('account_pool.sync_phase_saving', { defaultValue: '保存账号池' })
         : syncProgress.phase === 'done'
@@ -1251,12 +1253,12 @@ export function AccountPoolPage() {
     if (cachedContent) return cachedContent;
 
     try {
-      return await authFilesApi.downloadText(name);
-    } catch (authFileErr) {
+      return await authFilesApi.downloadAccountPoolText(name);
+    } catch (accountPoolErr) {
       try {
-        return await authFilesApi.downloadAccountPoolText(name);
+        return await authFilesApi.downloadText(name);
       } catch {
-        throw authFileErr;
+        throw accountPoolErr;
       }
     }
   };
@@ -1296,6 +1298,41 @@ export function AccountPoolPage() {
       showNotification(t('account_pool.download_failed', { message }), 'error');
     } finally {
       setDownloadingArchive(false);
+    }
+  };
+
+  const handleImportAccountPoolFiles = async (event: ChangeEvent<HTMLInputElement>) => {
+    const uploadFiles = Array.from(event.currentTarget.files ?? []);
+    event.currentTarget.value = '';
+    if (uploadFiles.length === 0 || importingPool) return;
+    setImportingPool(true);
+    try {
+      const result = await authFilesApi.uploadAccountPoolFiles(uploadFiles);
+      await syncFiles(false);
+      showNotification(
+        result.failed.length > 0
+          ? t('account_pool.import_partial', {
+              success: result.uploaded,
+              failed: result.failed.length,
+              defaultValue: `已导入账号池 ${result.uploaded} 个，失败 ${result.failed.length} 个`,
+            })
+          : t('account_pool.import_success', {
+              count: result.uploaded,
+              defaultValue: `已导入账号池 ${result.uploaded} 个`,
+            }),
+        result.failed.length > 0 ? 'warning' : 'success'
+      );
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : t('common.unknown_error');
+      showNotification(
+        t('account_pool.import_failed', {
+          message,
+          defaultValue: `导入账号池失败：${message}`,
+        }),
+        'error'
+      );
+    } finally {
+      setImportingPool(false);
     }
   };
 
@@ -1382,6 +1419,49 @@ export function AccountPoolPage() {
     }
   };
 
+  const appendAccountFiles = async (targets: AuthFileItem[], mode: 'passed' | 'filtered') => {
+    if (targets.length === 0 || overwritingPassed) return;
+    setOverwritingPassed(true);
+    try {
+      const uploadFiles = await Promise.all(
+        targets.map(async (file) => {
+          const content = await readAccountPoolFileContent(file.name);
+          return new File([content], file.name, { type: 'application/json' });
+        })
+      );
+      const result = await authFilesApi.uploadFiles(uploadFiles);
+      if (result.failed.length > 0) {
+        showNotification(
+          t(`account_pool.append_${mode}_partial`, {
+            success: result.uploaded,
+            failed: result.failed.length,
+            defaultValue: `追加部分完成：成功 ${result.uploaded}，失败 ${result.failed.length}`,
+          }),
+          'warning'
+        );
+        return;
+      }
+      showNotification(
+        t(`account_pool.append_${mode}_success`, {
+          count: result.uploaded,
+          defaultValue: `已追加 ${result.uploaded} 个账号到认证文件`,
+        }),
+        'success'
+      );
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : t('common.unknown_error');
+      showNotification(
+        t(`account_pool.append_${mode}_failed`, {
+          message,
+          defaultValue: `追加失败：${message}`,
+        }),
+        'error'
+      );
+    } finally {
+      setOverwritingPassed(false);
+    }
+  };
+
   const handleOverwritePassed = () => {
     if (passedFiles.length === 0) return;
     showConfirmation({
@@ -1406,6 +1486,32 @@ export function AccountPoolPage() {
       confirmText: t('common.confirm'),
       variant: 'danger',
       onConfirm: () => void overwriteAccountFiles(displayedFiles, 'filtered'),
+    });
+  };
+
+  const handleAppendPassed = () => {
+    if (passedFiles.length === 0) return;
+    showConfirmation({
+      title: t('account_pool.append_passed_title', { defaultValue: '追加通过账号' }),
+      message: t('account_pool.append_passed_confirm', {
+        count: passedFiles.length,
+        defaultValue: `确认将 ${passedFiles.length} 个检测通过的账号 JSON 追加到认证文件？现有认证文件不会删除。`,
+      }),
+      confirmText: t('common.confirm'),
+      onConfirm: () => void appendAccountFiles(passedFiles, 'passed'),
+    });
+  };
+
+  const handleAppendFiltered = () => {
+    if (displayedFiles.length === 0) return;
+    showConfirmation({
+      title: t('account_pool.append_filtered_title', { defaultValue: '追加筛选结果' }),
+      message: t('account_pool.append_filtered_confirm', {
+        count: displayedFiles.length,
+        defaultValue: `确认将 ${displayedFiles.length} 个筛选结果账号 JSON 追加到认证文件？现有认证文件不会删除。`,
+      }),
+      confirmText: t('common.confirm'),
+      onConfirm: () => void appendAccountFiles(displayedFiles, 'filtered'),
     });
   };
 
@@ -1628,6 +1734,23 @@ export function AccountPoolPage() {
           <Button variant="secondary" size="sm" onClick={() => void syncFiles()} loading={loading}>
             {t('account_pool.sync')}
           </Button>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".json,.zip,application/json,application/zip"
+            multiple
+            hidden
+            onChange={handleImportAccountPoolFiles}
+          />
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => importInputRef.current?.click()}
+            loading={importingPool}
+            disabled={importingPool}
+          >
+            {t('account_pool.import', { defaultValue: '导入账号池' })}
+          </Button>
           <Button
             variant="secondary"
             size="sm"
@@ -1706,6 +1829,18 @@ export function AccountPoolPage() {
             {t('account_pool.overwrite_passed', { count: passedFiles.length })}
           </Button>
           <Button
+            variant="secondary"
+            size="sm"
+            onClick={handleAppendPassed}
+            loading={overwritingPassed}
+            disabled={overwritingPassed || passedFiles.length === 0}
+          >
+            {t('account_pool.append_passed', {
+              count: passedFiles.length,
+              defaultValue: `追加通过 (${passedFiles.length})`,
+            })}
+          </Button>
+          <Button
             variant="danger"
             size="sm"
             onClick={handleOverwriteFiltered}
@@ -1715,6 +1850,18 @@ export function AccountPoolPage() {
             {t('account_pool.overwrite_filtered', {
               count: displayedFiles.length,
               defaultValue: `覆盖筛选 (${displayedFiles.length})`,
+            })}
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={handleAppendFiltered}
+            loading={overwritingPassed}
+            disabled={overwritingPassed || displayedFiles.length === 0}
+          >
+            {t('account_pool.append_filtered', {
+              count: displayedFiles.length,
+              defaultValue: `追加筛选 (${displayedFiles.length})`,
             })}
           </Button>
         </div>
@@ -1859,17 +2006,6 @@ export function AccountPoolPage() {
             <Button variant="ghost" size="sm" onClick={() => setSelectedNames([])}>
               {t('account_pool.clear_selection')}
             </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => confirmDeletePoolEntries(displayedFiles)}
-              disabled={deletingPoolEntries || displayedFiles.length === 0}
-            >
-              {t('account_pool.delete_filtered', {
-                count: displayedFiles.length,
-                defaultValue: `删除筛选结果 (${displayedFiles.length})`,
-              })}
-            </Button>
           </div>
         </div>
 
@@ -1916,6 +2052,10 @@ export function AccountPoolPage() {
                 ? formatUnixTimestamp(Math.round(checkResult.checkedAt / 1000))
                 : '';
               const quotaDetails = (checkResult?.quotaLines ?? []).map(parseQuotaDetail);
+              const showStatusMessage =
+                Boolean(statusMessage) &&
+                (!checkResult ||
+                  (checkResult.status !== 'success' && checkResult.status !== 'loading'));
               return (
                 <div
                   key={file.name}
@@ -2048,7 +2188,7 @@ export function AccountPoolPage() {
                       )}
                     </div>
                   )}
-                  {statusMessage && <div className={styles.statusLine}>{statusMessage}</div>}
+                  {showStatusMessage && <div className={styles.statusLine}>{statusMessage}</div>}
                 </div>
               );
             })}

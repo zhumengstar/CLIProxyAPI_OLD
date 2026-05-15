@@ -675,6 +675,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/oauth-model-alias", s.mgmt.DeleteOAuthModelAlias)
 
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
+		mgmt.GET("/account-pool", s.mgmt.ListAccountPoolEntries)
+		mgmt.POST("/account-pool", s.mgmt.UploadAccountPoolEntries)
 		mgmt.GET("/account-pool/download", s.mgmt.DownloadAccountPoolArchive)
 		mgmt.GET("/account-pool/download-entry", s.mgmt.DownloadAccountPoolEntry)
 		mgmt.DELETE("/account-pool", s.mgmt.DeleteAccountPoolEntries)
