@@ -75,6 +75,26 @@ type accountPoolArchiveFile struct {
 	Data []byte
 }
 
+type accountPoolDBEntry struct {
+	Name      string `json:"name"`
+	Data      string `json:"data"`
+	Hash      string `json:"hash"`
+	Type      string `json:"type,omitempty"`
+	Provider  string `json:"provider,omitempty"`
+	Email     string `json:"email,omitempty"`
+	Size      int    `json:"size"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type accountPoolDBFile struct {
+	Version   int                           `json:"version"`
+	UpdatedAt string                        `json:"updated_at"`
+	Entries   map[string]accountPoolDBEntry `json:"entries"`
+}
+
+var accountPoolDBMu sync.Mutex
+
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
 		return time.Time{}, false
@@ -1118,6 +1138,10 @@ func (h *Handler) accountPoolArchivePath() string {
 	return filepath.Join(h.cfg.AuthDir, "account-pool.zip")
 }
 
+func (h *Handler) accountPoolDatabasePath() string {
+	return filepath.Join(h.cfg.AuthDir, "account-pool.db.json")
+}
+
 func (h *Handler) upsertAccountPoolArchiveFile(name string, data []byte) error {
 	return h.upsertAccountPoolArchiveFiles([]accountPoolArchiveFile{{Name: name, Data: data}})
 }
@@ -1157,6 +1181,56 @@ func (h *Handler) syncAccountPoolArchiveFromAuthDir() error {
 }
 
 func (h *Handler) readAccountPoolArchive() (map[string][]byte, error) {
+	accountPoolDBMu.Lock()
+	defer accountPoolDBMu.Unlock()
+	return h.readAccountPoolDatabaseLocked()
+}
+
+func (h *Handler) readAccountPoolDatabaseLocked() (map[string][]byte, error) {
+	if h == nil || h.cfg == nil {
+		return nil, fmt.Errorf("handler not initialized")
+	}
+	dbPath := h.accountPoolDatabasePath()
+	data, err := os.ReadFile(dbPath)
+	if err == nil {
+		var db accountPoolDBFile
+		if errUnmarshal := json.Unmarshal(data, &db); errUnmarshal != nil {
+			return nil, fmt.Errorf("invalid account pool database: %w", errUnmarshal)
+		}
+		entries := make(map[string][]byte, len(db.Entries))
+		for name, entry := range db.Entries {
+			if strings.TrimSpace(entry.Name) != "" {
+				name = entry.Name
+			}
+			name = filepath.Base(strings.TrimSpace(name))
+			if isUnsafeAuthFileName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+				continue
+			}
+			entryData := []byte(entry.Data)
+			if len(bytes.TrimSpace(entryData)) == 0 {
+				continue
+			}
+			entries[name] = append([]byte(nil), entryData...)
+		}
+		return entries, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to read account pool database: %w", err)
+	}
+
+	entries, errLegacy := h.readLegacyAccountPoolZip()
+	if errLegacy != nil {
+		return nil, errLegacy
+	}
+	if len(entries) > 0 {
+		if errWrite := h.writeAccountPoolDatabaseLocked(entries); errWrite != nil {
+			return nil, errWrite
+		}
+	}
+	return entries, nil
+}
+
+func (h *Handler) readLegacyAccountPoolZip() (map[string][]byte, error) {
 	archivePath := h.accountPoolArchivePath()
 	data, err := os.ReadFile(archivePath)
 	if err != nil {
@@ -1200,40 +1274,96 @@ func (h *Handler) readAccountPoolArchive() (map[string][]byte, error) {
 }
 
 func (h *Handler) writeAccountPoolArchive(entries map[string][]byte) error {
+	accountPoolDBMu.Lock()
+	defer accountPoolDBMu.Unlock()
+	return h.writeAccountPoolDatabaseLocked(entries)
+}
+
+func (h *Handler) writeAccountPoolDatabaseLocked(entries map[string][]byte) error {
+	if h == nil || h.cfg == nil {
+		return fmt.Errorf("handler not initialized")
+	}
 	if err := os.MkdirAll(h.cfg.AuthDir, 0o700); err != nil {
 		return fmt.Errorf("failed to create auth dir: %w", err)
 	}
 
+	now := time.Now().UTC().Format(time.RFC3339)
+	existing := accountPoolDBFile{}
+	if data, errRead := os.ReadFile(h.accountPoolDatabasePath()); errRead == nil {
+		_ = json.Unmarshal(data, &existing)
+	}
+	db := accountPoolDBFile{
+		Version:   1,
+		UpdatedAt: now,
+		Entries:   make(map[string]accountPoolDBEntry, len(entries)),
+	}
+	for name, data := range dedupeAccountPoolEntries(entries) {
+		name = filepath.Base(strings.TrimSpace(name))
+		entry := buildAccountPoolDBEntry(name, data, now)
+		if prev, ok := existing.Entries[name]; ok && prev.CreatedAt != "" {
+			entry.CreatedAt = prev.CreatedAt
+		}
+		db.Entries[name] = entry
+	}
+	payload, errMarshal := json.MarshalIndent(db, "", "  ")
+	if errMarshal != nil {
+		return fmt.Errorf("failed to encode account pool database: %w", errMarshal)
+	}
+	tmpPath := h.accountPoolDatabasePath() + ".tmp"
+	if errWrite := os.WriteFile(tmpPath, payload, 0o600); errWrite != nil {
+		return fmt.Errorf("failed to write account pool database: %w", errWrite)
+	}
+	if errRename := os.Rename(tmpPath, h.accountPoolDatabasePath()); errRename != nil {
+		return fmt.Errorf("failed to replace account pool database: %w", errRename)
+	}
+	return nil
+}
+
+func buildAccountPoolDBEntry(name string, data []byte, now string) accountPoolDBEntry {
+	trimmed := bytes.TrimSpace(data)
+	typeValue := strings.TrimSpace(gjson.GetBytes(trimmed, "type").String())
+	emailValue := strings.TrimSpace(gjson.GetBytes(trimmed, "email").String())
+	return accountPoolDBEntry{
+		Name:      name,
+		Data:      string(trimmed),
+		Hash:      hashAccountPoolContent(trimmed),
+		Type:      typeValue,
+		Provider:  typeValue,
+		Email:     emailValue,
+		Size:      len(trimmed),
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+}
+
+func buildAccountPoolZip(entries map[string][]byte) ([]byte, error) {
 	var buf bytes.Buffer
 	writer := zip.NewWriter(&buf)
 	names := make([]string, 0, len(entries))
 	for name := range entries {
+		if isUnsafeAuthFileName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		header := &zip.FileHeader{
-			Name:   name,
-			Method: zip.Deflate,
-		}
+		header := &zip.FileHeader{Name: name, Method: zip.Deflate}
 		header.SetMode(0o600)
 		part, errCreate := writer.CreateHeader(header)
 		if errCreate != nil {
 			_ = writer.Close()
-			return fmt.Errorf("failed to create account pool entry %s: %w", name, errCreate)
+			return nil, fmt.Errorf("failed to create account pool entry %s: %w", name, errCreate)
 		}
 		if _, errWrite := part.Write(entries[name]); errWrite != nil {
 			_ = writer.Close()
-			return fmt.Errorf("failed to write account pool entry %s: %w", name, errWrite)
+			return nil, fmt.Errorf("failed to write account pool entry %s: %w", name, errWrite)
 		}
 	}
 	if err := writer.Close(); err != nil {
-		return fmt.Errorf("failed to close account pool archive: %w", err)
+		return nil, fmt.Errorf("failed to close account pool archive: %w", err)
 	}
-	if err := os.WriteFile(h.accountPoolArchivePath(), buf.Bytes(), 0o600); err != nil {
-		return fmt.Errorf("failed to write account pool archive: %w", err)
-	}
-	return nil
+	return buf.Bytes(), nil
 }
 
 func dedupeAccountPoolEntries(entries map[string][]byte) map[string][]byte {
@@ -1302,19 +1432,14 @@ func (h *Handler) DownloadAccountPoolArchive(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
 		return
 	}
-	data, err := os.ReadFile(h.accountPoolArchivePath())
+	entries, err := h.readAccountPoolArchive()
 	if err != nil {
-		if os.IsNotExist(err) {
-			empty := map[string][]byte{}
-			if errWrite := h.writeAccountPoolArchive(empty); errWrite != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": errWrite.Error()})
-				return
-			}
-			data, err = os.ReadFile(h.accountPoolArchivePath())
-		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
+	data, err := buildAccountPoolZip(entries)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read account pool archive: %v", err)})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", buildAccountPoolArchiveName()))

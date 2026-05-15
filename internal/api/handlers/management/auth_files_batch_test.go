@@ -85,15 +85,12 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 		t.Fatalf("expected %d auth entries, got %d", len(files), len(auths))
 	}
 
-	archiveEntries := readTestZipEntries(t, filepath.Join(authDir, "account-pool.zip"))
-	for _, file := range files {
-		if got := string(archiveEntries[file.name]); got != file.content {
-			t.Fatalf("expected account pool archive entry %s content %q, got %q", file.name, file.content, got)
-		}
+	if _, err := os.Stat(filepath.Join(authDir, "account-pool.db.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected auth upload not to change account pool database, stat err: %v", err)
 	}
 }
 
-func TestDownloadAccountPoolArchive_PreservesDeletedFilesAndAddsCurrentFiles(t *testing.T) {
+func TestDownloadAccountPoolArchive_ExportsDatabaseEntries(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -104,12 +101,6 @@ func TestDownloadAccountPoolArchive_PreservesDeletedFilesAndAddsCurrentFiles(t *
 	deletedContent := []byte(`{"type":"codex","email":"deleted@example.com"}`)
 	if err := h.upsertAccountPoolArchiveFile(deletedName, deletedContent); err != nil {
 		t.Fatalf("failed to seed account pool archive: %v", err)
-	}
-
-	currentName := "current.json"
-	currentContent := []byte(`{"type":"claude","email":"current@example.com"}`)
-	if err := os.WriteFile(filepath.Join(authDir, currentName), currentContent, 0o600); err != nil {
-		t.Fatalf("failed to seed current auth file: %v", err)
 	}
 
 	rec := httptest.NewRecorder()
@@ -147,10 +138,7 @@ func TestDownloadAccountPoolArchive_PreservesDeletedFilesAndAddsCurrentFiles(t *
 	}
 
 	if got := string(entries[deletedName]); got != string(deletedContent) {
-		t.Fatalf("expected deleted archive entry to be preserved, got %q", got)
-	}
-	if got := string(entries[currentName]); got != string(currentContent) {
-		t.Fatalf("expected current auth file to be included, got %q", got)
+		t.Fatalf("expected account pool database entry to be exported, got %q", got)
 	}
 }
 
@@ -215,9 +203,12 @@ func TestDeleteAccountPoolEntries_RemovesOnlyArchiveEntries(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
 	}
-	entries := readTestZipEntries(t, filepath.Join(authDir, "account-pool.zip"))
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		t.Fatalf("failed to read account pool database: %v", err)
+	}
 	if _, ok := entries[removeName]; ok {
-		t.Fatalf("expected account pool archive entry %s to be removed", removeName)
+		t.Fatalf("expected account pool database entry %s to be removed", removeName)
 	}
 	if got := string(entries[keepName]); got != string(keepContent) {
 		t.Fatalf("expected kept archive entry content %q, got %q", keepContent, got)
