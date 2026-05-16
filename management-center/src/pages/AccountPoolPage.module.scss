@@ -939,34 +939,6 @@
   word-break: break-all;
 }
 
-.fileNameButton {
-  width: 100%;
-  min-width: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--text-primary);
-  cursor: pointer;
-  font: inherit;
-  font-size: 14px;
-  font-weight: 650;
-  line-height: 1.35;
-  text-align: left;
-  word-break: break-all;
-
-  &:hover {
-    color: var(--primary-color);
-    text-decoration: underline;
-    text-underline-offset: 3px;
-  }
-
-  &:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--primary-color) 35%, transparent);
-    outline-offset: 3px;
-    border-radius: 4px;
-  }
-}
-
 .metaRow {
   display: flex;
   align-items: center;
@@ -1333,40 +1305,4 @@
 .sourceEditorField textarea:disabled {
   cursor: not-allowed;
   opacity: 0.7;
-}
-
-.configViewer {
-  display: grid;
-  gap: 12px;
-}
-
-.configViewerName {
-  min-width: 0;
-  overflow: hidden;
-  padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--bg-secondary) 66%, transparent);
-  color: var(--text-primary);
-  font-size: 13px;
-  font-weight: 800;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.configViewerContent {
-  max-height: min(64vh, 620px);
-  min-height: 320px;
-  margin: 0;
-  overflow: auto;
-  padding: 14px;
-  border: 1px solid color-mix(in srgb, var(--border-color) 72%, transparent);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--bg-secondary) 78%, transparent);
-  color: var(--text-primary);
-  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
-  font-size: 12px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
 }

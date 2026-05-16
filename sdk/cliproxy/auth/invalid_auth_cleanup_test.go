@@ -115,3 +115,26 @@ func TestDeleteInvalidAuthFiles_KeepsTransientAndRuntimeAuths(t *testing.T) {
 		t.Fatalf("deleted IDs = %v, want none", got)
 	}
 }
+
+func TestDeleteInvalidAuthFiles_KeepsAccountPoolRuntimeAuths(t *testing.T) {
+	store := &deleteTrackingStore{}
+	manager := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:         "pooled-auth",
+		Provider:   "codex",
+		FileName:   "pooled.json",
+		Attributes: map[string]string{"path": "/tmp/auths/.account-pool/folder/pooled.json"},
+		LastError:  &Error{HTTPStatus: 401, Message: "invalid token"},
+	}
+
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	if deleted := manager.DeleteInvalidAuthFiles(context.Background(), time.Now()); deleted != 0 {
+		t.Fatalf("DeleteInvalidAuthFiles() = %d, want 0", deleted)
+	}
+	if got := store.deletedIDs(); len(got) != 0 {
+		t.Fatalf("deleted IDs = %v, want none", got)
+	}
+}

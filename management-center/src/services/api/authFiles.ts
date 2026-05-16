@@ -27,7 +27,6 @@ type AuthFileBatchUploadResponse = {
   uploaded?: number;
   files?: unknown;
   failed?: unknown;
-  job?: unknown;
 };
 type AuthFileBatchDeleteResponse = {
   status?: string;
@@ -35,38 +34,11 @@ type AuthFileBatchDeleteResponse = {
   files?: unknown;
   failed?: unknown;
 };
-export type AccountPoolRepairResult = {
-  repaired: boolean;
-  convertedSub2: number;
-  inferredCodex: number;
-  llmRepaired: number;
-  llmFailed: number;
-};
-export type AccountPoolCheckResultPatch = {
-  name: string;
-  content_hash?: string;
-  result: {
-    status: 'idle' | 'success' | 'error' | 'unsupported';
-    message?: string;
-    plan?: string;
-    quotaLines?: string[];
-    quotaRemainingPercent?: number;
-    statusCode?: number;
-    checkedAt?: number;
-  };
-};
-export type AccountPoolCheckResultsPatchResponse = {
-  status: string;
-  updated: number;
-  skipped: number;
-  missing?: string[];
-};
 type AuthFileBatchUploadResult = {
   status: string;
   uploaded: number;
   files: string[];
   failed: AuthFileBatchFailure[];
-  job?: AccountPoolImportJob;
 };
 type AuthFileBatchDeleteResult = {
   status: string;
@@ -120,27 +92,24 @@ export type AccountPoolUsageSummary = {
   total_tokens?: number;
   last_used_at?: string;
 };
+export type AccountPoolUsageTotals = {
+  requests: number;
+  successes?: number;
+  failures?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cached_tokens?: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+  total_tokens?: number;
+};
 export type AccountPoolUsageResponse = {
   records: AccountPoolUsageRecord[];
   summaries: AccountPoolUsageSummary[];
+  totals?: AccountPoolUsageTotals;
   total?: number;
   limit?: number;
   offset?: number;
-};
-export type AccountPoolImportJobStatus = 'pending' | 'running' | 'done' | 'failed';
-export type AccountPoolImportJob = {
-  id: string;
-  status: AccountPoolImportJobStatus;
-  total: number;
-  done: number;
-  imported: number;
-  failed: number;
-  skipped: number;
-  files: string[];
-  failures: AuthFileBatchFailure[];
-  error?: string;
-  created_at: string;
-  updated_at: string;
 };
 
 export const AUTH_FILE_INVALID_JSON_OBJECT_ERROR = 'AUTH_FILE_INVALID_JSON_OBJECT';
@@ -416,24 +385,6 @@ const parseAuthFileJsonObject = (rawText: string): Record<string, unknown> => {
 const saveAuthFileText = async (name: string, text: string) => {
   const file = new File([text], name, { type: 'application/json' });
   await authFilesApi.upload(file);
-};
-
-const normalizeAccountPoolImportJob = (value: unknown): AccountPoolImportJob => {
-  const record = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
-  return {
-    id: String(record.id ?? ''),
-    status: String(record.status ?? 'pending') as AccountPoolImportJobStatus,
-    total: Number(record.total ?? 0),
-    done: Number(record.done ?? 0),
-    imported: Number(record.imported ?? 0),
-    failed: Number(record.failed ?? 0),
-    skipped: Number(record.skipped ?? 0),
-    files: normalizeBatchFileNames(record.files),
-    failures: normalizeBatchFailures(record.failures),
-    error: typeof record.error === 'string' ? record.error : undefined,
-    created_at: String(record.created_at ?? ''),
-    updated_at: String(record.updated_at ?? ''),
-  };
 };
 
 const hashTextForAccountPool = async (value: string): Promise<string> => {
@@ -785,6 +736,7 @@ export const authFilesApi = {
     const response = await apiClient.get<{
       records?: AccountPoolUsageRecord[];
       summaries?: AccountPoolUsageSummary[];
+      totals?: AccountPoolUsageTotals;
       total?: number;
       limit?: number;
       offset?: number;
@@ -794,6 +746,7 @@ export const authFilesApi = {
     return {
       records: Array.isArray(response.records) ? response.records : [],
       summaries: Array.isArray(response.summaries) ? response.summaries : [],
+      totals: response.totals,
       total: typeof response.total === 'number' ? response.total : undefined,
       limit: typeof response.limit === 'number' ? response.limit : undefined,
       offset: typeof response.offset === 'number' ? response.offset : undefined,
@@ -832,7 +785,6 @@ export const authFilesApi = {
     }
     const formData = buildAuthFilesFormData(files);
     const config = {
-      params: { async: true },
       timeout: getDynamicAuthFilesTimeout(files.length, { perItemMs: 220 }),
     };
     let payload: AuthFileBatchUploadResponse;
@@ -850,22 +802,12 @@ export const authFilesApi = {
         config
       );
     }
-    if (payload && typeof payload === 'object' && 'job' in payload) {
-      const job = normalizeAccountPoolImportJob((payload as { job?: unknown }).job);
-      return {
-        status: job.status,
-        uploaded: job.imported,
-        files: job.files,
-        failed: job.failures,
-        job,
-      };
-    }
     return normalizeBatchUploadResponse(payload, requestedNames);
   },
 
   writeAccountPoolToAuthFiles: async (
     names: string[],
-    overwrite: boolean
+    mode: 'append' | 'overwrite'
   ): Promise<AuthFileBatchUploadResult> => {
     const requestedNames = normalizeRequestedAuthFileNames(names);
     if (requestedNames.length === 0) {
@@ -873,49 +815,14 @@ export const authFilesApi = {
     }
     const payload = await apiClient.post<AuthFileBatchUploadResponse>(
       '/account-pool/write-auth-files',
-      { names: requestedNames, overwrite },
-      { timeout: getDynamicAuthFilesTimeout(requestedNames.length, { perItemMs: 120 }) }
+      { names: requestedNames, mode },
+      {
+        timeout: getDynamicAuthFilesTimeout(requestedNames.length, {
+          perItemMs: mode === 'overwrite' ? 90 : 70,
+        }),
+      }
     );
     return normalizeBatchUploadResponse(payload, requestedNames);
-  },
-
-  getAccountPoolImport: async (id: string): Promise<AccountPoolImportJob> => {
-    const response = await apiClient.get<{ job?: unknown }>(
-      `/account-pool/import/${encodeURIComponent(id)}`
-    );
-    return normalizeAccountPoolImportJob(response.job);
-  },
-
-  repairAccountPoolEntries: async (): Promise<AccountPoolRepairResult> => {
-    const response = await apiClient.post<{
-      repaired?: boolean;
-      converted_sub2?: number;
-      inferred_codex?: number;
-      llm_repaired?: number;
-      llm_failed?: number;
-    }>('/account-pool/repair', {});
-    return {
-      repaired: Boolean(response.repaired),
-      convertedSub2:
-        typeof response.converted_sub2 === 'number' ? response.converted_sub2 : 0,
-      inferredCodex:
-        typeof response.inferred_codex === 'number' ? response.inferred_codex : 0,
-      llmRepaired: typeof response.llm_repaired === 'number' ? response.llm_repaired : 0,
-      llmFailed: typeof response.llm_failed === 'number' ? response.llm_failed : 0,
-    };
-  },
-
-  updateAccountPoolCheckResults: async (
-    results: AccountPoolCheckResultPatch[]
-  ): Promise<AccountPoolCheckResultsPatchResponse> => {
-    if (results.length === 0) {
-      return { status: 'ok', updated: 0, skipped: 0, missing: [] };
-    }
-    return apiClient.patch<AccountPoolCheckResultsPatchResponse>(
-      '/account-pool/check-results',
-      { results },
-      { timeout: REQUEST_TIMEOUT_MS }
-    );
   },
 
   updateAccountPoolFolder: (payload: {

@@ -99,6 +99,152 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	}
 }
 
+func TestDeleteAuthFile_DoesNotReturnAfterReload(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "reload-user.json"
+	filePath := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex","email":"reload@example.com"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = store
+
+	deleteRec := httptest.NewRecorder()
+	deleteCtx, _ := gin.CreateTestContext(deleteRec)
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(fileName), nil)
+	deleteCtx.Request = deleteReq
+	h.DeleteAuthFile(deleteCtx)
+
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, deleteRec.Code, deleteRec.Body.String())
+	}
+	if errLoad := manager.Load(context.Background()); errLoad != nil {
+		t.Fatalf("failed to reload auth manager: %v", errLoad)
+	}
+	if auths := manager.List(); len(auths) != 0 {
+		t.Fatalf("expected deleted auth not to return after reload, got %d", len(auths))
+	}
+}
+
+func TestListAuthFiles_HidesAccountPoolSyntheticAuths(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	realPath := filepath.Join(authDir, "real.json")
+	syntheticPath := filepath.Join(authDir, ".account-pool", "pooled.json")
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "real.json",
+		FileName: "real.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": realPath,
+		},
+	}); err != nil {
+		t.Fatalf("failed to register real auth: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "pooled.json",
+		FileName: "pooled.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": syntheticPath,
+		},
+	}); err != nil {
+		t.Fatalf("failed to register account pool auth: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(payload.Files) != 1 {
+		t.Fatalf("expected only real auth file, got %#v", payload.Files)
+	}
+	if got := payload.Files[0]["name"]; got != "real.json" {
+		t.Fatalf("expected real auth name, got %#v", got)
+	}
+}
+
+func TestDeleteAuthFileAll_RemovesSyntheticRuntimeWithoutDeletingAccountPool(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	poolName := "folder/pooled.json"
+	poolContent := []byte(`{"type":"codex","email":"pooled@example.com"}`)
+	if err := h.upsertAccountPoolArchiveFile(poolName, poolContent); err != nil {
+		t.Fatalf("failed to seed account pool: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "pooled.json",
+		FileName: "pooled.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": filepath.Join(authDir, ".account-pool", "pooled.json"),
+		},
+	}); err != nil {
+		t.Fatalf("failed to register synthetic auth: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=true", nil)
+	h.DeleteAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if auths := manager.List(); len(auths) != 0 {
+		t.Fatalf("expected synthetic runtime auth to be removed, got %d", len(auths))
+	}
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		t.Fatalf("failed to read account pool: %v", err)
+	}
+	if got := string(entries[poolName]); got != string(poolContent) {
+		t.Fatalf("expected account pool entry to remain, got %q", got)
+	}
+}
+
 func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

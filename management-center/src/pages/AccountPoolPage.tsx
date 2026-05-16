@@ -13,12 +13,7 @@ import {
   useNotificationStore,
   type AccountCheckResult,
 } from '@/stores';
-import {
-  authFilesApi,
-  type AccountPoolCheckResultPatch,
-  type AccountPoolImportJob,
-  type AccountPoolUsageSummary,
-} from '@/services/api';
+import { authFilesApi, type AccountPoolUsageSummary } from '@/services/api';
 import {
   ANTIGRAVITY_CONFIG,
   CLAUDE_CONFIG,
@@ -46,7 +41,6 @@ import styles from './AccountPoolPage.module.scss';
 
 const ACCOUNT_POOL_CHECK_CONCURRENCY_STORAGE_KEY = 'cli-proxy-account-pool-check-concurrency';
 const ACCOUNT_POOL_LOCAL_PUSH_SESSION_KEY = 'cli-proxy-account-pool-local-push-signature';
-const ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY = 'cli-proxy-account-pool-import-job';
 const MIN_ACCOUNT_POOL_CHECK_CONCURRENCY = 1;
 const DEFAULT_ACCOUNT_POOL_CHECK_CONCURRENCY = 50;
 const MIN_ACCOUNT_POOL_PAGE_SIZE = 1;
@@ -61,7 +55,6 @@ const DEFAULT_ACCOUNT_POOL_QUOTA_FILTER = 'all';
 const LOW_ACCOUNT_POOL_QUOTA_PERCENT = 20;
 const ACCOUNT_POOL_CHECK_RETRY_ATTEMPTS = 2;
 const ACCOUNT_POOL_CHECK_RETRY_DELAY_MS = 700;
-const ACCOUNT_POOL_IMPORT_ARCHIVE_EXTENSIONS = ['.zip', '.tar', '.tar.gz', '.tgz', '.gz'];
 type AccountPoolWriteAction =
   | 'overwrite-current'
   | 'append-current';
@@ -76,54 +69,6 @@ const QUOTA_CONFIGS = [
 ] as Array<QuotaConfig<unknown, unknown>>;
 
 const getFileType = (file: AuthFileItem): string => String(file.type || file.provider || 'unknown');
-
-const getUploadFilePath = (file: File): string => {
-  const relativePath =
-    typeof (file as File & { webkitRelativePath?: string }).webkitRelativePath === 'string'
-      ? (file as File & { webkitRelativePath?: string }).webkitRelativePath
-      : '';
-  return relativePath || file.name;
-};
-
-const isSupportedAccountPoolImportName = (name: string): boolean => {
-  const lowerName = name.trim().toLowerCase();
-  return lowerName.endsWith('.json') || ACCOUNT_POOL_IMPORT_ARCHIVE_EXTENSIONS.some((ext) => lowerName.endsWith(ext));
-};
-
-const isArchiveAccountPoolImportName = (name: string): boolean => {
-  const lowerName = name.trim().toLowerCase();
-  return ACCOUNT_POOL_IMPORT_ARCHIVE_EXTENSIONS.some((ext) => lowerName.endsWith(ext));
-};
-
-const filterImportableAccountPoolFiles = async (files: File[]) => {
-  const importable: File[] = [];
-  let skipped = 0;
-
-  await Promise.all(
-    files.map(async (file) => {
-      const uploadPath = getUploadFilePath(file);
-      if (!isSupportedAccountPoolImportName(uploadPath)) {
-        skipped += 1;
-        return;
-      }
-      if (isArchiveAccountPoolImportName(uploadPath)) {
-        importable.push(file);
-        return;
-      }
-      try {
-        JSON.parse(await file.text());
-        importable.push(file);
-      } catch {
-        skipped += 1;
-      }
-    })
-  );
-
-  return { importable, skipped };
-};
-
-const isAccountPoolImportDone = (job: AccountPoolImportJob): boolean =>
-  job.status === 'done' || job.status === 'failed';
 
 const normalizeFolderName = (value: unknown): string => {
   const folder = String(value || '').trim();
@@ -862,7 +807,6 @@ export function AccountPoolPage() {
   const isRunCancelled = useAccountPoolCheckStore((state) => state.isRunCancelled);
   const setCheckResult = useAccountPoolCheckStore((state) => state.setResult);
   const finishCheck = useAccountPoolCheckStore((state) => state.finishCheck);
-  const hydrateRemoteCheckResults = useAccountPoolCheckStore((state) => state.hydrateResultsFromFiles);
   const pruneCheckResults = useAccountPoolCheckStore((state) => state.pruneResults);
   const [files, setFiles] = useState<AuthFileItem[]>([]);
   const [fileContentCache, setFileContentCache] = useState<Record<string, string>>({});
@@ -871,7 +815,6 @@ export function AccountPoolPage() {
   const [loading, setLoading] = useState(true);
   const [downloading, setDownloading] = useState(false);
   const [importingPool, setImportingPool] = useState(false);
-  const [importJob, setImportJob] = useState<AccountPoolImportJob | null>(null);
   const [activeWriteAction, setActiveWriteAction] = useState<AccountPoolWriteAction | null>(null);
   const [deletingPoolEntries, setDeletingPoolEntries] = useState(false);
   const [error, setError] = useState('');
@@ -899,81 +842,8 @@ export function AccountPoolPage() {
   const [sourceEditorModel, setSourceEditorModel] = useState('');
   const [sourceEditorInfo, setSourceEditorInfo] = useState('');
   const [savingSourceInfo, setSavingSourceInfo] = useState(false);
-  const [configViewerOpen, setConfigViewerOpen] = useState(false);
-  const [configViewerName, setConfigViewerName] = useState('');
-  const [configViewerContent, setConfigViewerContent] = useState('');
-  const [configViewerLoading, setConfigViewerLoading] = useState(false);
-  const [configViewerError, setConfigViewerError] = useState('');
   const [resumedPendingCheck, setResumedPendingCheck] = useState(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
-  const importFolderInputRef = useRef<HTMLInputElement | null>(null);
-  const pendingCheckResultUpdatesRef = useRef<Map<string, AccountPoolCheckResultPatch>>(new Map());
-  const checkResultFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const flushingCheckResultsRef = useRef(false);
-
-  const flushRemoteCheckResults = useCallback(async () => {
-    if (flushingCheckResultsRef.current) return;
-    const updates = Array.from(pendingCheckResultUpdatesRef.current.values());
-    if (updates.length === 0) return;
-    pendingCheckResultUpdatesRef.current.clear();
-    flushingCheckResultsRef.current = true;
-    try {
-      await authFilesApi.updateAccountPoolCheckResults(updates);
-    } catch (err) {
-      updates.forEach((update) => {
-        pendingCheckResultUpdatesRef.current.set(update.name, update);
-      });
-      if (!checkResultFlushTimerRef.current) {
-        checkResultFlushTimerRef.current = setTimeout(() => {
-          checkResultFlushTimerRef.current = null;
-          void flushRemoteCheckResults();
-        }, 2000);
-      }
-      console.warn('failed to persist account pool check results', err);
-    } finally {
-      flushingCheckResultsRef.current = false;
-    }
-  }, []);
-
-  const scheduleRemoteCheckResultFlush = useCallback(() => {
-    if (checkResultFlushTimerRef.current) return;
-    checkResultFlushTimerRef.current = setTimeout(() => {
-      checkResultFlushTimerRef.current = null;
-      void flushRemoteCheckResults();
-    }, 300);
-  }, [flushRemoteCheckResults]);
-
-  const queueRemoteCheckResult = useCallback(
-    (file: AuthFileItem, result: AccountCheckResult, contentHash?: string) => {
-      if (!file.name || result.status === 'loading') return;
-      pendingCheckResultUpdatesRef.current.set(file.name, {
-        name: file.name,
-        content_hash: contentHash,
-        result: {
-          status: result.status,
-          message: result.message,
-          plan: result.plan,
-          quotaLines: result.quotaLines,
-          quotaRemainingPercent: result.quotaRemainingPercent,
-          statusCode: result.statusCode,
-          checkedAt: result.checkedAt,
-        },
-      });
-      scheduleRemoteCheckResultFlush();
-    },
-    [scheduleRemoteCheckResultFlush]
-  );
-
-  useEffect(
-    () => () => {
-      if (checkResultFlushTimerRef.current) {
-        clearTimeout(checkResultFlushTimerRef.current);
-        checkResultFlushTimerRef.current = null;
-      }
-      void flushRemoteCheckResults();
-    },
-    [flushRemoteCheckResults]
-  );
 
   const applyRecords = useCallback((records: AccountPoolRecord[]) => {
     const nextRecords = uniqueAccountPoolRecords(records);
@@ -982,10 +852,9 @@ export function AccountPoolPage() {
     setSelectedNames((current) =>
       current.filter((name) => nextRecords.some((record) => record.file.name === name))
     );
-    hydrateRemoteCheckResults(nextRecords.map((record) => record.file));
     pruneCheckResults(nextRecords);
     return nextRecords;
-  }, [hydrateRemoteCheckResults, pruneCheckResults]);
+  }, [pruneCheckResults]);
 
   const hydrateStoredPool = useCallback(() => {
     const storedRecords = applyRecords(readAccountPoolRecords());
@@ -1037,7 +906,9 @@ export function AccountPoolPage() {
       await pushLocalAccountPoolToServer(storedRecords);
       const mergedRecords = await refreshAccountPoolFromServer(checkConcurrency, setSyncProgress);
       applyRecords(mergedRecords);
-      setSyncProgress(null);
+      const latest = await authFilesApi.listAccountPoolEntries();
+      setFolderInfos(latest.folders || []);
+      setSyncProgress((current) => current ? { ...current, phase: 'done' } : current);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('notification.refresh_failed');
       setError(message);
@@ -1056,42 +927,6 @@ export function AccountPoolPage() {
       setFolderInfos([]);
     }
   }, []);
-
-  const pollAccountPoolImportJob = useCallback(async (jobId: string) => {
-    if (!jobId) return;
-    setImportingPool(true);
-    try {
-      for (;;) {
-        const nextJob = await authFilesApi.getAccountPoolImport(jobId);
-        setImportJob(nextJob);
-        if (isAccountPoolImportDone(nextJob)) {
-          window.localStorage.removeItem(ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY);
-          await refreshPool(false);
-          await loadFolderInfos();
-          showNotification(
-            nextJob.status === 'done'
-              ? `账号池后台导入完成：导入 ${nextJob.imported} 个，跳过 ${nextJob.skipped} 个，失败 ${nextJob.failed} 个`
-              : `账号池后台导入失败：${nextJob.error || '未知错误'}`,
-            nextJob.status === 'done' ? 'success' : 'error'
-          );
-          break;
-        }
-        await new Promise((resolve) => window.setTimeout(resolve, 1500));
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : '查询导入任务失败';
-      showNotification(message, 'error');
-    } finally {
-      setImportingPool(false);
-    }
-  }, [loadFolderInfos, refreshPool, showNotification]);
-
-  useEffect(() => {
-    const jobId = window.localStorage.getItem(ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY);
-    if (jobId) {
-      void pollAccountPoolImportJob(jobId);
-    }
-  }, [pollAccountPoolImportJob]);
 
   useEffect(() => {
     hydrateStoredPool();
@@ -1364,7 +1199,6 @@ export function AccountPoolPage() {
     return Array.from(groups.entries())
       .map(([folder, items]) => {
         const byCode = new Map<number, number>();
-        let successCount = 0;
         let checkingCount = 0;
         let unchecked = 0;
         let unsupported = 0;
@@ -1385,13 +1219,6 @@ export function AccountPoolPage() {
           }
           if (typeof result.statusCode === 'number') {
             byCode.set(result.statusCode, (byCode.get(result.statusCode) ?? 0) + 1);
-            if (result.statusCode >= 200 && result.statusCode < 300) {
-              successCount += 1;
-            }
-            return;
-          }
-          if (result.status === 'success') {
-            successCount += 1;
             return;
           }
           if (result.status === 'error') {
@@ -1406,7 +1233,6 @@ export function AccountPoolPage() {
           items,
           stats: {
             codes: Array.from(byCode.entries()).sort(([left], [right]) => left - right),
-            success: successCount,
             checking: checkingCount,
             unchecked,
             unsupported,
@@ -1414,32 +1240,23 @@ export function AccountPoolPage() {
           },
         };
       })
-      .sort((left, right) => {
-        const successDiff = right.stats.success - left.stats.success;
-        if (successDiff !== 0) return successDiff;
-        const sizeDiff = right.items.length - left.items.length;
-        if (sizeDiff !== 0) return sizeDiff;
-        return left.folder.localeCompare(right.folder);
-      });
+      .sort((left, right) => left.folder.localeCompare(right.folder));
   }, [checkResults, filteredFiles, folderInfoByName]);
-
-  const isFolderOverview = viewMode === 'folder' && !activeFolder;
-  const paginatedItemCount = isFolderOverview ? folderGroups.length : displayedFiles.length;
-  const totalPages = Math.max(1, Math.ceil(paginatedItemCount / pageSize));
+  const folderRootMode = viewMode === 'folder' && !activeFolder;
+  const pagedItemCount = folderRootMode ? folderGroups.length : displayedFiles.length;
+  const totalPages = Math.max(1, Math.ceil(pagedItemCount / pageSize));
   const currentPage = Math.min(page, totalPages);
   const pageStart = (currentPage - 1) * pageSize;
-  const pageItems = displayedFiles.slice(pageStart, pageStart + pageSize);
-  const folderPageGroups = isFolderOverview
+  const pageItems = folderRootMode ? [] : displayedFiles.slice(pageStart, pageStart + pageSize);
+  const pageFolderGroups = folderRootMode
     ? folderGroups.slice(pageStart, pageStart + pageSize)
     : folderGroups;
-  const visibleSelectionFiles = isFolderOverview
-    ? folderPageGroups.flatMap((group) => group.items)
+  const visibleSelectionItems = folderRootMode
+    ? pageFolderGroups.flatMap((group) => group.items)
     : pageItems;
-  const visibleSelectedCount = visibleSelectionFiles.filter((file) =>
-    selectedSet.has(file.name)
-  ).length;
+  const visibleSelectedCount = visibleSelectionItems.filter((file) => selectedSet.has(file.name)).length;
   const allVisibleSelected =
-    visibleSelectionFiles.length > 0 && visibleSelectedCount === visibleSelectionFiles.length;
+    visibleSelectionItems.length > 0 && visibleSelectedCount === visibleSelectionItems.length;
   const filteredSelectedCount = displayedFiles.filter((file) => selectedSet.has(file.name)).length;
   const allFilteredSelected =
     displayedFiles.length > 0 && filteredSelectedCount === displayedFiles.length;
@@ -1630,7 +1447,7 @@ export function AccountPoolPage() {
   const toggleVisible = (checked: boolean) => {
     setSelectedNames((current) => {
       const next = new Set(current);
-      visibleSelectionFiles.forEach((file) => {
+      visibleSelectionItems.forEach((file) => {
         if (checked) {
           next.add(file.name);
         } else {
@@ -1669,55 +1486,6 @@ export function AccountPoolPage() {
     });
   };
 
-  const readAccountPoolFileContent = async (name: string): Promise<string> => {
-    const cachedContent = fileContentCache[name];
-    if (cachedContent) return cachedContent;
-
-    try {
-      return await authFilesApi.downloadAccountPoolText(name);
-    } catch (accountPoolErr) {
-      try {
-        return await authFilesApi.downloadText(name);
-      } catch {
-        throw accountPoolErr;
-      }
-    }
-  };
-
-  const openConfigViewer = async (file: AuthFileItem) => {
-    setConfigViewerOpen(true);
-    setConfigViewerName(file.name);
-    setConfigViewerContent('');
-    setConfigViewerError('');
-    setConfigViewerLoading(true);
-    try {
-      const rawContent = await readAccountPoolFileContent(file.name);
-      let displayContent = rawContent;
-      try {
-        displayContent = JSON.stringify(JSON.parse(rawContent), null, 2);
-      } catch {
-        // Keep non-JSON content readable instead of failing the viewer.
-      }
-      setConfigViewerContent(displayContent);
-      setFileContentCache((current) => ({
-        ...current,
-        [file.name]: rawContent,
-      }));
-    } catch (err) {
-      setConfigViewerError(err instanceof Error ? err.message : '读取配置失败');
-    } finally {
-      setConfigViewerLoading(false);
-    }
-  };
-
-  const closeConfigViewer = () => {
-    setConfigViewerOpen(false);
-    setConfigViewerName('');
-    setConfigViewerContent('');
-    setConfigViewerError('');
-    setConfigViewerLoading(false);
-  };
-
   const downloadAccountPoolFiles = async (targets: AuthFileItem[], label: string) => {
     if (targets.length === 0) return;
     setDownloading(true);
@@ -1751,22 +1519,7 @@ export function AccountPoolPage() {
     if (uploadFiles.length === 0 || importingPool) return;
     setImportingPool(true);
     try {
-      const { importable, skipped } = await filterImportableAccountPoolFiles(uploadFiles);
-      if (importable.length === 0) {
-        showNotification(`未发现可导入文件，已剔除 ${skipped} 个文件`, 'warning');
-        return;
-      }
-      const result = await authFilesApi.uploadAccountPoolFiles(importable);
-      if (result.job?.id) {
-        setImportJob(result.job);
-        window.localStorage.setItem(ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY, result.job.id);
-        showNotification(`账号池后台导入已开始：${result.job.total} 个文件`, 'success');
-        void pollAccountPoolImportJob(result.job.id);
-        if (skipped > 0) {
-          showNotification(`已自动剔除 ${skipped} 个不可导入文件`, 'warning');
-        }
-        return;
-      }
+      const result = await authFilesApi.uploadAccountPoolFiles(uploadFiles);
       await refreshPool(false);
       await loadFolderInfos();
       showNotification(
@@ -1782,9 +1535,6 @@ export function AccountPoolPage() {
             }),
         result.failed.length > 0 ? 'warning' : 'success'
       );
-      if (skipped > 0) {
-        showNotification(`已自动剔除 ${skipped} 个不可导入文件`, 'warning');
-      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('common.unknown_error');
       showNotification(
@@ -1932,7 +1682,7 @@ export function AccountPoolPage() {
     try {
       const result = await authFilesApi.writeAccountPoolToAuthFiles(
         targets.map((file) => file.name),
-        true
+        'overwrite'
       );
       if (result.failed.length > 0) {
         showNotification(
@@ -1972,7 +1722,7 @@ export function AccountPoolPage() {
     try {
       const result = await authFilesApi.writeAccountPoolToAuthFiles(
         targets.map((file) => file.name),
-        false
+        'append'
       );
       if (result.failed.length > 0) {
         showNotification(
@@ -2035,35 +1785,7 @@ export function AccountPoolPage() {
 
   const detectAccounts = async (targets: AuthFileItem[]) => {
     if (targets.length === 0 || checking) return;
-    let checkTargets = targets;
-    const unsupportedTargets = targets.filter((file) => !resolveQuotaConfig(file));
-    if (unsupportedTargets.length > 0) {
-      try {
-        const targetNames = new Set(targets.map((file) => file.name));
-        const targetFolders = new Set(unsupportedTargets.map(getFileFolder));
-        const repairResult = await authFilesApi.repairAccountPoolEntries();
-        if (repairResult.repaired) {
-          const repairedRecords = await refreshAccountPoolFromServer(checkConcurrency);
-          applyRecords(repairedRecords);
-          checkTargets = repairedRecords
-            .map((record) => record.file)
-            .filter((file) => {
-              if (!resolveQuotaConfig(file)) return false;
-              return targetNames.has(file.name) || targetFolders.has(getFileFolder(file));
-            });
-          showNotification(
-            `已自动修复账号池：Sub2 转 CPA ${repairResult.convertedSub2} 个，补全 Codex ${repairResult.inferredCodex} 个，大模型修复 ${repairResult.llmRepaired} 个`,
-            repairResult.llmFailed > 0 ? 'warning' : 'success'
-          );
-        }
-      } catch (err) {
-        showNotification(
-          `自动修复不支持账号失败：${err instanceof Error ? err.message : t('common.unknown_error')}`,
-          'warning'
-        );
-      }
-    }
-    if (checkTargets.length === 0) return;
+    const checkTargets = targets;
 
     const runId = beginCheck(checkTargets.map((file) => file.name));
     if (!runId) {
@@ -2137,20 +1859,20 @@ export function AccountPoolPage() {
         try {
           const result = await checkOne(file);
           if (signal?.aborted || isRunCancelled(runId)) return;
-          const hash = hashByName.get(file.name);
-          setCheckResult(runId, file.name, result, hash);
-          queueRemoteCheckResult(file, result, hash);
+          setCheckResult(runId, file.name, result, hashByName.get(file.name));
         } catch (err: unknown) {
           if (isAbortError(err) || signal?.aborted || isRunCancelled(runId)) return;
-          const result: AccountCheckResult = {
-            status: 'error',
-            message: err instanceof Error ? err.message : t('common.unknown_error'),
-            statusCode: getAccountPoolCheckErrorStatus(err),
-            checkedAt: Date.now(),
-          };
-          const hash = hashByName.get(file.name);
-          setCheckResult(runId, file.name, result, hash);
-          queueRemoteCheckResult(file, result, hash);
+          setCheckResult(
+            runId,
+            file.name,
+            {
+              status: 'error',
+              message: err instanceof Error ? err.message : t('common.unknown_error'),
+              statusCode: getAccountPoolCheckErrorStatus(err),
+              checkedAt: Date.now(),
+            },
+            hashByName.get(file.name)
+          );
         }
       }
     };
@@ -2160,7 +1882,6 @@ export function AccountPoolPage() {
         Array.from({ length: Math.min(checkConcurrency, checkTargets.length) }, () => worker())
       );
       if (signal?.aborted || isRunCancelled(runId)) return;
-      await flushRemoteCheckResults();
       const summary = finishCheck(runId);
       if (!summary) return;
       showNotification(
@@ -2173,7 +1894,6 @@ export function AccountPoolPage() {
       );
     } catch {
       if (signal?.aborted || isRunCancelled(runId)) return;
-      await flushRemoteCheckResults();
       const summary = finishCheck(runId);
       if (summary) {
         showNotification(
@@ -2258,14 +1978,7 @@ export function AccountPoolPage() {
             ariaLabel={file.name}
           />
           <div className={styles.cardMain}>
-            <button
-              type="button"
-              className={styles.fileNameButton}
-              onClick={() => void openConfigViewer(file)}
-              title="查看账号配置"
-            >
-              {file.name}
-            </button>
+            <div className={styles.fileName}>{file.name}</div>
             <div className={styles.metaRow}>
               <span className={styles.typeBadge}>{type}</span>
               <span className={styles.folderBadge}>{folder}</span>
@@ -2451,14 +2164,6 @@ export function AccountPoolPage() {
             hidden
             onChange={handleImportAccountPoolFiles}
           />
-          <input
-            ref={importFolderInputRef}
-            type="file"
-            multiple
-            {...({ webkitdirectory: '', directory: '' } as Record<string, string>)}
-            hidden
-            onChange={handleImportAccountPoolFiles}
-          />
           <div className={styles.viewModeSwitch} aria-label="账号池显示模式">
             <button
               type="button"
@@ -2497,22 +2202,12 @@ export function AccountPoolPage() {
             <Button
               variant="secondary"
               size="sm"
-              title="导入 JSON、Sub2 文件、解压文件夹或压缩包，系统会自动识别类型"
+              title="导入 JSON 或压缩包，系统会自动识别类型"
               onClick={() => importInputRef.current?.click()}
               loading={importingPool}
               disabled={importingPool}
             >
               导入
-            </Button>
-            <Button
-              variant="secondary"
-              size="sm"
-              title="导入已经解压出来的文件夹，系统会自动过滤并识别 Sub2/CPA JSON"
-              onClick={() => importFolderInputRef.current?.click()}
-              loading={importingPool}
-              disabled={importingPool}
-            >
-              文件夹
             </Button>
           </div>
           <div className={styles.actionScope}>
@@ -2617,29 +2312,6 @@ export function AccountPoolPage() {
             <span>{t('account_pool.refresh_retained', { count: syncProgress.skipped, defaultValue: `本地保留 ${syncProgress.skipped}` })}</span>
             <span>{t('account_pool.sync_failed', { count: syncProgress.failed, defaultValue: `失败 ${syncProgress.failed}` })}</span>
             <span>{t('account_pool.sync_deduped', { count: syncProgress.deduped, defaultValue: `去重 ${syncProgress.deduped}` })}</span>
-          </div>
-        </div>
-      )}
-
-      {importJob && !isAccountPoolImportDone(importJob) && (
-        <div className={styles.syncProgressPanel}>
-          <div className={styles.syncProgressHeader}>
-            <strong>后台导入账号池</strong>
-            <span>
-              {importJob.done}/{importJob.total || 0}
-              {importJob.total > 0 ? ` · ${Math.round((importJob.done / importJob.total) * 100)}%` : ''}
-            </span>
-          </div>
-          <div className={styles.syncProgressTrack}>
-            <div
-              className={styles.syncProgressBar}
-              style={{ width: `${importJob.total > 0 ? Math.round((importJob.done / importJob.total) * 100) : 8}%` }}
-            />
-          </div>
-          <div className={styles.syncProgressStats}>
-            <span>已导入 {importJob.imported}</span>
-            <span>跳过 {importJob.skipped}</span>
-            <span>失败 {importJob.failed}</span>
           </div>
         </div>
       )}
@@ -2751,7 +2423,7 @@ export function AccountPoolPage() {
             <SelectionCheckbox
               checked={allVisibleSelected}
               onChange={toggleVisible}
-              disabled={visibleSelectionFiles.length === 0}
+              disabled={visibleSelectionItems.length === 0}
               label={t('account_pool.select_visible')}
             />
             <SelectionCheckbox
@@ -2799,7 +2471,7 @@ export function AccountPoolPage() {
                 title={t('account_pool.empty_title')}
                 description={t('account_pool.empty_desc')}
               />
-            ) : folderPageGroups.map((group) => {
+            ) : pageFolderGroups.map((group) => {
               const selectedCount = group.items.filter((file) => selectedSet.has(file.name)).length;
               const allSelected = group.items.length > 0 && selectedCount === group.items.length;
               const partiallySelected = selectedCount > 0 && !allSelected;
@@ -2933,7 +2605,7 @@ export function AccountPoolPage() {
           </>
         )}
 
-        {!loading && paginatedItemCount > pageSize && (
+        {!loading && pagedItemCount > pageSize && (
           <div className={styles.pagination}>
             <Button
               variant="secondary"
@@ -2947,7 +2619,7 @@ export function AccountPoolPage() {
               {t('auth_files.pagination_info', {
                 current: currentPage,
                 total: totalPages,
-                count: paginatedItemCount,
+                count: pagedItemCount,
               })}
             </div>
             <Button
@@ -3003,30 +2675,6 @@ export function AccountPoolPage() {
             rows={4}
           />
         </label>
-      </div>
-    </Modal>
-    <Modal
-      open={configViewerOpen}
-      onClose={closeConfigViewer}
-      title="账号配置"
-      width={820}
-      footer={
-        <Button variant="secondary" onClick={closeConfigViewer}>
-          关闭
-        </Button>
-      }
-    >
-      <div className={styles.configViewer}>
-        <div className={styles.configViewerName} title={configViewerName}>
-          {configViewerName}
-        </div>
-        {configViewerLoading ? (
-          <div className={styles.hint}>正在读取配置...</div>
-        ) : configViewerError ? (
-          <div className={styles.error}>{configViewerError}</div>
-        ) : (
-          <pre className={styles.configViewerContent}>{configViewerContent}</pre>
-        )}
       </div>
     </Modal>
     </>

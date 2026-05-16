@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -1191,6 +1192,249 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	return auth.Clone(), nil
 }
 
+// UpsertMany inserts or replaces auth entries with a single in-memory scheduler
+// rebuild. It is intended for management bulk operations where calling Register
+// or Update for each auth would repeatedly rebuild shared runtime state.
+func (m *Manager) UpsertMany(ctx context.Context, auths []*Auth) int {
+	if m == nil || len(auths) == 0 {
+		return 0
+	}
+
+	type hookEvent struct {
+		auth    *Auth
+		updated bool
+	}
+
+	events := make([]hookEvent, 0, len(auths))
+	persistAuths := make([]*Auth, 0, len(auths))
+	m.mu.Lock()
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if auth.ID == "" {
+			auth.ID = uuid.NewString()
+		}
+		updated := false
+		if existing, ok := m.auths[auth.ID]; ok && existing != nil {
+			updated = true
+			if !auth.indexAssigned && auth.Index == "" {
+				auth.Index = existing.Index
+				auth.indexAssigned = existing.indexAssigned
+			}
+			auth.CreatedAt = existing.CreatedAt
+			auth.Success = existing.Success
+			auth.Failed = existing.Failed
+			auth.recentRequests = existing.recentRequests
+			if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
+				if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+					auth.ModelStates = existing.ModelStates
+				}
+			}
+			if auth.LastRefreshedAt.IsZero() {
+				auth.LastRefreshedAt = existing.LastRefreshedAt
+			}
+			auth.NextRefreshAfter = existing.NextRefreshAfter
+			auth.Runtime = existing.Runtime
+		}
+		auth.EnsureIndex()
+		authClone := auth.Clone()
+		m.auths[auth.ID] = authClone
+		events = append(events, hookEvent{auth: authClone.Clone(), updated: updated})
+		persistAuths = append(persistAuths, auth.Clone())
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		cfg = &internalconfig.Config{}
+	}
+	m.rebuildAPIKeyModelAliasLocked(cfg)
+	snapshot := make([]*Auth, 0, len(m.auths))
+	for _, auth := range m.auths {
+		if auth != nil {
+			snapshot = append(snapshot, auth.Clone())
+		}
+	}
+	m.mu.Unlock()
+
+	if len(events) == 0 {
+		return 0
+	}
+	if m.scheduler != nil {
+		m.scheduler.rebuild(snapshot)
+	}
+	for _, event := range events {
+		m.queueRefreshReschedule(event.auth.ID)
+	}
+	m.persistMany(ctx, persistAuths)
+	for _, event := range events {
+		if event.updated {
+			m.hook.OnAuthUpdated(ctx, event.auth.Clone())
+		} else {
+			m.hook.OnAuthRegistered(ctx, event.auth.Clone())
+		}
+	}
+	return len(events)
+}
+
+// DeleteAuthFiles removes persisted auth files and drops their runtime entries.
+// It batches the in-memory refresh so large management deletes do not rebuild
+// schedulers or persist disabled placeholders once per file.
+func (m *Manager) DeleteAuthFiles(ctx context.Context, authIDs []string) (int, []error) {
+	if m == nil || len(authIDs) == 0 {
+		return 0, nil
+	}
+
+	type deleteCandidate struct {
+		id   string
+		path string
+	}
+
+	seen := make(map[string]struct{}, len(authIDs))
+	candidates := make([]deleteCandidate, 0, len(authIDs))
+	m.mu.RLock()
+	for _, rawID := range authIDs {
+		authID := strings.TrimSpace(rawID)
+		if authID == "" {
+			continue
+		}
+		if _, ok := seen[authID]; ok {
+			continue
+		}
+		seen[authID] = struct{}{}
+		auth := m.auths[authID]
+		path := persistentAuthPath(auth)
+		if path == "" {
+			continue
+		}
+		candidates = append(candidates, deleteCandidate{id: authID, path: path})
+	}
+	m.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	type deleteResult struct {
+		id  string
+		err error
+	}
+	workers := minInt(len(candidates), 32)
+	jobs := make(chan deleteCandidate)
+	results := make(chan deleteResult, len(candidates))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for candidate := range jobs {
+				if m.store != nil {
+					if err := m.store.Delete(ctx, candidate.path); err != nil {
+						results <- deleteResult{id: candidate.id, err: err}
+						continue
+					}
+					if candidate.id != candidate.path {
+						if err := m.store.Delete(ctx, candidate.id); err != nil {
+							results <- deleteResult{id: candidate.id, err: err}
+							continue
+						}
+					}
+				}
+				results <- deleteResult{id: candidate.id}
+			}
+		}()
+	}
+	for _, candidate := range candidates {
+		jobs <- candidate
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	deletedIDs := make([]string, 0, len(candidates))
+	failures := make([]error, 0)
+	for result := range results {
+		if result.err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", result.id, result.err))
+			continue
+		}
+		deletedIDs = append(deletedIDs, result.id)
+	}
+	if len(deletedIDs) == 0 {
+		return 0, failures
+	}
+
+	m.RemoveAuths(deletedIDs)
+
+	return len(deletedIDs), failures
+}
+
+// RemoveAuths drops auth entries from runtime state without touching backing storage.
+// Use this for watcher delete events where the file is already gone.
+func (m *Manager) RemoveAuths(authIDs []string) int {
+	if m == nil || len(authIDs) == 0 {
+		return 0
+	}
+	seen := make(map[string]struct{}, len(authIDs))
+	ids := make([]string, 0, len(authIDs))
+	for _, rawID := range authIDs {
+		authID := strings.TrimSpace(rawID)
+		if authID == "" {
+			continue
+		}
+		if _, ok := seen[authID]; ok {
+			continue
+		}
+		seen[authID] = struct{}{}
+		ids = append(ids, authID)
+	}
+	if len(ids) == 0 {
+		return 0
+	}
+
+	m.mu.Lock()
+	removed := 0
+	for _, authID := range ids {
+		if _, ok := m.auths[authID]; ok {
+			removed++
+		}
+		delete(m.auths, authID)
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		cfg = &internalconfig.Config{}
+	}
+	m.rebuildAPIKeyModelAliasLocked(cfg)
+	remaining := make([]*Auth, 0, len(m.auths))
+	for _, auth := range m.auths {
+		if auth != nil {
+			remaining = append(remaining, auth.Clone())
+		}
+	}
+	m.mu.Unlock()
+
+	if m.scheduler != nil {
+		m.scheduler.rebuild(remaining)
+	}
+	if selector, ok := m.selector.(*SessionAffinitySelector); ok && selector != nil {
+		for _, authID := range ids {
+			selector.InvalidateAuth(authID)
+		}
+	}
+	for _, authID := range ids {
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+	}
+
+	return removed
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
@@ -2348,6 +2592,7 @@ func (m *Manager) StartInvalidAuthCleanup(parent context.Context, interval time.
 	m.cleanupCancel = cancelCtx
 	m.mu.Unlock()
 
+	log.Infof("invalid auth file cleanup started (interval=%s)", interval)
 	go m.invalidAuthCleanupLoop(ctx, interval)
 }
 
@@ -2438,19 +2683,38 @@ func persistentAuthPath(auth *Auth) string {
 			return ""
 		}
 		if path := strings.TrimSpace(auth.Attributes["path"]); path != "" {
+			if isAccountPoolRuntimeAuthPath(path) {
+				return ""
+			}
 			return path
 		}
 		if path := strings.TrimSpace(auth.Attributes["source"]); path != "" && strings.HasSuffix(strings.ToLower(path), ".json") {
+			if isAccountPoolRuntimeAuthPath(path) {
+				return ""
+			}
 			return path
 		}
 	}
 	if fileName := strings.TrimSpace(auth.FileName); strings.HasSuffix(strings.ToLower(fileName), ".json") {
+		if isAccountPoolRuntimeAuthPath(fileName) {
+			return ""
+		}
 		return fileName
 	}
 	if id := strings.TrimSpace(auth.ID); strings.HasSuffix(strings.ToLower(id), ".json") {
+		if isAccountPoolRuntimeAuthPath(id) {
+			return ""
+		}
 		return id
 	}
 	return ""
+}
+
+func isAccountPoolRuntimeAuthPath(pathValue string) bool {
+	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(pathValue), "\\", "/"))
+	return strings.Contains(normalized, "/.account-pool/") ||
+		strings.HasPrefix(normalized, ".account-pool/") ||
+		strings.Contains(normalized, "/account-pool.")
 }
 
 func shouldDeleteInvalidAuthFile(auth *Auth, now time.Time) bool {
@@ -3810,6 +4074,41 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	}
 	_, err := m.store.Save(ctx, auth)
 	return err
+}
+
+func (m *Manager) persistMany(ctx context.Context, auths []*Auth) {
+	if m == nil || m.store == nil || len(auths) == 0 || shouldSkipPersist(ctx) {
+		return
+	}
+
+	workers := minInt(len(auths), 32)
+	jobs := make(chan *Auth)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for auth := range jobs {
+				if err := m.persist(ctx, auth); err != nil {
+					log.WithError(err).WithField("auth_id", auth.ID).Warn("failed to persist auth during bulk upsert")
+				}
+			}
+		}()
+	}
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return
+		case jobs <- auth:
+		}
+	}
+	close(jobs)
+	wg.Wait()
 }
 
 // StartAutoRefresh launches a background loop that evaluates auth freshness

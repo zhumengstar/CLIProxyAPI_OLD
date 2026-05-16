@@ -245,3 +245,25 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
 	}
 }
+
+func TestAuthByNameFindsAccountPoolEntryWithFolderPath(t *testing.T) {
+	t.Parallel()
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	name := "jit_103_1778919347/token_folder@example.com_1778919514.json"
+	if err := h.upsertAccountPoolArchiveFile(name, []byte(`{"type":"codex","email":"folder@example.com","access_token":"token-value"}`)); err != nil {
+		t.Fatalf("failed to seed account pool entry: %v", err)
+	}
+
+	got := h.authByIndexOrName("", name)
+	if got == nil {
+		t.Fatal("expected account pool auth for folder path")
+	}
+	if got.ID != name || got.FileName != name {
+		t.Fatalf("auth ID/FileName = %q/%q, want %q", got.ID, got.FileName, name)
+	}
+	if got.Provider != "codex" {
+		t.Fatalf("provider = %q, want codex", got.Provider)
+	}
+}

@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	maxAccountPoolUsageRecords      = 300
+	defaultAccountPoolUsagePageSize = 80
 	maxAccountPoolUsageParamsLength = 16 * 1024
 )
 
@@ -72,6 +72,18 @@ type accountPoolUsageSummary struct {
 	CacheCreationTokens int64  `json:"cache_creation_tokens,omitempty"`
 	TotalTokens         int64  `json:"total_tokens,omitempty"`
 	LastUsedAt          string `json:"last_used_at,omitempty"`
+}
+
+type accountPoolUsageTotals struct {
+	Requests            int64 `json:"requests"`
+	Successes           int64 `json:"successes"`
+	Failures            int64 `json:"failures"`
+	InputTokens         int64 `json:"input_tokens,omitempty"`
+	OutputTokens        int64 `json:"output_tokens,omitempty"`
+	CachedTokens        int64 `json:"cached_tokens,omitempty"`
+	CacheReadTokens     int64 `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int64 `json:"cache_creation_tokens,omitempty"`
+	TotalTokens         int64 `json:"total_tokens,omitempty"`
 }
 
 type accountPoolUsageRecorder struct {
@@ -153,10 +165,6 @@ func (r *accountPoolUsageRecorder) HandleUsage(ctx context.Context, record usage
 	}
 	key := accountPoolUsageSummaryKey(item)
 	r.records = append(r.records, item)
-	if overflow := len(r.records) - maxAccountPoolUsageRecords; overflow > 0 {
-		copy(r.records, r.records[overflow:])
-		r.records = r.records[:len(r.records)-overflow]
-	}
 	if r.summaries == nil {
 		r.summaries = make(map[string]*accountPoolUsageSummary)
 	}
@@ -223,8 +231,8 @@ func (r *accountPoolUsageRecorder) ListPage(limit int, offset int) ([]accountPoo
 	if r == nil {
 		return nil, 0
 	}
-	if limit <= 0 || limit > maxAccountPoolUsageRecords {
-		limit = 80
+	if limit <= 0 {
+		limit = defaultAccountPoolUsagePageSize
 	}
 	if offset < 0 {
 		offset = 0
@@ -371,6 +379,30 @@ func (r *accountPoolUsageRecorder) Summaries() []accountPoolUsageSummary {
 	return out
 }
 
+func (r *accountPoolUsageRecorder) Totals() accountPoolUsageTotals {
+	if r == nil {
+		return accountPoolUsageTotals{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var totals accountPoolUsageTotals
+	for _, item := range r.summaries {
+		if item == nil {
+			continue
+		}
+		totals.Requests += item.Requests
+		totals.Successes += item.Successes
+		totals.Failures += item.Failures
+		totals.InputTokens += item.InputTokens
+		totals.OutputTokens += item.OutputTokens
+		totals.CachedTokens += item.CachedTokens
+		totals.CacheReadTokens += item.CacheReadTokens
+		totals.CacheCreationTokens += item.CacheCreationTokens
+		totals.TotalTokens += item.TotalTokens
+	}
+	return totals
+}
+
 func accountPoolUsageSummaryKey(item accountPoolUsageRecord) string {
 	if value := strings.ToLower(strings.TrimSpace(item.ServiceEmail)); value != "" {
 		return "email:" + value
@@ -514,13 +546,12 @@ SELECT id, requested_at, request_id, request_path, session_id, newapi_user_id, u
 	provider, model, alias, service_email, auth_id, auth_index, auth_type, success, status_code,
 	latency_ms, input_tokens, output_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
 	total_tokens, request_params
-FROM (
-	SELECT * FROM account_pool_usage_records ORDER BY id DESC LIMIT ?
-) ORDER BY id ASC`, maxAccountPoolUsageRecords)
+FROM account_pool_usage_records
+ORDER BY id ASC`)
 	if err != nil {
 		return fmt.Errorf("failed to query account pool usage records: %w", err)
 	}
-	records := make([]accountPoolUsageRecord, 0, maxAccountPoolUsageRecords)
+	records := make([]accountPoolUsageRecord, 0)
 	for rows.Next() {
 		var item accountPoolUsageRecord
 		var id uint64
@@ -671,9 +702,6 @@ INSERT OR REPLACE INTO account_pool_usage_records (
 	); err != nil {
 		return fmt.Errorf("failed to insert account pool usage record: %w", err)
 	}
-	if _, err = tx.Exec(`DELETE FROM account_pool_usage_records WHERE id NOT IN (SELECT id FROM account_pool_usage_records ORDER BY id DESC LIMIT ?)`, maxAccountPoolUsageRecords); err != nil {
-		return fmt.Errorf("failed to trim account pool usage records: %w", err)
-	}
 	if _, err = tx.Exec(`
 INSERT INTO account_pool_usage_summaries (
 	key, service_email, auth_id, auth_index, auth_type, provider, model, alias, requests, successes,
@@ -798,13 +826,53 @@ func accountPoolRequestIdentity(ctx context.Context) (sessionID string, userID s
 	if !ok || ginCtx == nil || ginCtx.Request == nil {
 		return "", "", "", "", ""
 	}
-	sessionID = strings.TrimSpace(ginCtx.GetHeader("X-Session-ID"))
+	sessionID = firstNonEmptyHeader(ginCtx.Request.Header, "X-Session-ID", "Session-Id", "Session_id")
 	userID, username = parseNewAPISessionID(sessionID)
+	if username == "" && userID == "" {
+		username = inferUsernameFromPlainSessionID(sessionID)
+	}
 	if ginCtx.Request.URL != nil {
 		requestPath = strings.TrimSpace(ginCtx.Request.URL.Path)
 	}
 	requestParams = sanitizeAccountPoolUsageRequestParams(apimiddleware.CapturedRequestBody(ginCtx))
 	return sessionID, userID, username, requestPath, requestParams
+}
+
+func firstNonEmptyHeader(headers http.Header, names ...string) string {
+	for _, name := range names {
+		value := strings.TrimSpace(headers.Get(name))
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func inferUsernameFromPlainSessionID(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || strings.Contains(sessionID, ":") || looksLikeUUID(sessionID) {
+		return ""
+	}
+	return sessionID
+}
+
+func looksLikeUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for index, char := range value {
+		switch index {
+		case 8, 13, 18, 23:
+			if char != '-' {
+				return false
+			}
+		default:
+			if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func sanitizeAccountPoolUsageRequestParams(body []byte) string {
@@ -936,6 +1004,7 @@ func (h *Handler) GetAccountPoolUsageRecords(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"records":   []accountPoolUsageRecord{},
 			"summaries": accountPoolUsage.Summaries(),
+			"totals":    accountPoolUsage.Totals(),
 			"total":     0,
 			"limit":     0,
 			"offset":    0,
@@ -946,6 +1015,7 @@ func (h *Handler) GetAccountPoolUsageRecords(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"records":   records,
 		"summaries": accountPoolUsage.Summaries(),
+		"totals":    accountPoolUsage.Totals(),
 		"total":     total,
 		"limit":     limit,
 		"offset":    offset,

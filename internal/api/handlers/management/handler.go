@@ -48,8 +48,6 @@ type Handler struct {
 	mu                  sync.Mutex
 	sub2APIJobsMu       sync.Mutex
 	sub2APIJobs         map[string]*sub2APIImportJob
-	accountPoolJobsMu   sync.Mutex
-	accountPoolJobs     map[string]*accountPoolImportJob
 	attemptsMu          sync.Mutex
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
 	authManager         *coreauth.Manager
@@ -72,7 +70,6 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		cfg:                 cfg,
 		configFilePath:      configFilePath,
 		sub2APIJobs:         make(map[string]*sub2APIImportJob),
-		accountPoolJobs:     make(map[string]*accountPoolImportJob),
 		failedAttempts:      make(map[string]*attemptInfo),
 		authManager:         manager,
 		tokenStore:          sdkAuth.GetTokenStore(),

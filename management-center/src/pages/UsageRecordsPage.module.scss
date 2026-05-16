@@ -164,6 +164,45 @@
   white-space: nowrap;
 }
 
+.identityCell {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.identityMain {
+  max-width: 280px;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.identityLine {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  min-width: 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.identityLine span {
+  color: var(--text-tertiary);
+}
+
+.identityLine strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tokenStack {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, max-content));

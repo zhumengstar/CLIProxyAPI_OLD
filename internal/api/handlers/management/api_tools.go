@@ -1,7 +1,6 @@
 package management
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -342,8 +341,7 @@ func (h *Handler) refreshCodexOAuthAccessToken(ctx context.Context, auth *coreau
 				log.WithError(errSave).Warnf("failed to persist refreshed account pool auth %s", auth.FileName)
 			}
 		}
-	}
-	if h != nil && h.authManager != nil {
+	} else if h != nil && h.authManager != nil {
 		auth.LastRefreshedAt = time.Now()
 		auth.UpdatedAt = time.Now()
 		_, _ = h.authManager.Update(ctx, auth)
@@ -362,14 +360,7 @@ func (h *Handler) isAccountPoolSyntheticAuth(auth *coreauth.Auth) bool {
 	if sourcePath == "" {
 		return false
 	}
-	entryName := normalizeAccountPoolEntryName(auth.FileName)
-	if entryName == "" {
-		entryName = normalizeAccountPoolEntryName(filepath.Base(auth.FileName))
-	}
-	if entryName == "" {
-		return false
-	}
-	return filepath.Clean(sourcePath) == filepath.Clean(filepath.Join(h.cfg.AuthDir, ".account-pool", filepath.FromSlash(entryName)))
+	return filepath.Clean(sourcePath) == filepath.Clean(filepath.Join(h.cfg.AuthDir, ".account-pool", filepath.FromSlash(auth.FileName)))
 }
 
 func isCacheableOAuthRefreshFailure(err error) bool {
@@ -799,37 +790,58 @@ func (h *Handler) authByIndexOrName(authIndex string, authName string) *coreauth
 }
 
 func (h *Handler) accountPoolAuthByName(authName string) *coreauth.Auth {
-	authName = normalizeAccountPoolEntryName(strings.TrimSpace(authName))
+	authName = normalizeAccountPoolEntryName(authName)
 	if h == nil || h.cfg == nil || authName == "" || isUnsafeAccountPoolEntryName(authName) || !strings.HasSuffix(strings.ToLower(authName), ".json") {
 		return nil
 	}
-	data, err := h.readAccountPoolArchiveEntry(authName)
+	entryName := authName
+	data, err := h.readAccountPoolArchiveEntry(entryName)
 	if err != nil {
 		return nil
 	}
-	if len(bytes.TrimSpace(data)) == 0 {
-		baseName := normalizeAccountPoolEntryName(filepath.Base(authName))
-		if baseName != "" && baseName != authName {
-			data, err = h.readAccountPoolArchiveEntry(baseName)
-			if err != nil {
-				return nil
-			}
-			if len(bytes.TrimSpace(data)) != 0 {
-				authName = baseName
-			}
+	if len(data) == 0 && !strings.Contains(entryName, "/") {
+		if resolvedName, resolvedData := h.findAccountPoolAuthByBaseName(entryName); resolvedData != nil {
+			entryName = resolvedName
+			data = resolvedData
 		}
 	}
 	if len(data) == 0 {
 		return nil
 	}
-	authPath := filepath.Join(h.cfg.AuthDir, ".account-pool", filepath.FromSlash(authName))
-	auth, err := h.buildAuthFromFileData(authPath, data)
+	auth, err := h.buildAuthFromFileData(filepath.Join(h.cfg.AuthDir, ".account-pool", filepath.FromSlash(entryName)), data)
 	if err != nil {
 		return nil
 	}
-	auth.FileName = authName
-	auth.ID = authName
+	auth.FileName = entryName
+	auth.ID = entryName
 	return auth
+}
+
+func (h *Handler) findAccountPoolAuthByBaseName(baseName string) (string, []byte) {
+	baseName = filepath.Base(strings.TrimSpace(baseName))
+	if baseName == "" || isUnsafeAuthFileName(baseName) || h == nil {
+		return "", nil
+	}
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		return "", nil
+	}
+	var matchedName string
+	var matchedData []byte
+	for name, data := range entries {
+		if filepath.Base(strings.ReplaceAll(name, "\\", "/")) != baseName {
+			continue
+		}
+		if matchedName != "" {
+			return "", nil
+		}
+		matchedName = name
+		matchedData = data
+	}
+	if matchedName == "" || len(matchedData) == 0 {
+		return "", nil
+	}
+	return matchedName, append([]byte(nil), matchedData...)
 }
 
 func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {

@@ -10,6 +10,7 @@ import {
   authFilesApi,
   type AccountPoolUsageRecord,
   type AccountPoolUsageSummary,
+  type AccountPoolUsageTotals,
 } from '@/services/api';
 import { useNotificationStore } from '@/stores';
 import styles from './UsageRecordsPage.module.scss';
@@ -41,6 +42,44 @@ const getCacheTokens = (
 
 const normalizeText = (value: unknown): string => String(value ?? '').trim().toLowerCase();
 
+const normalizeUsageIdentityText = (value: unknown): string => {
+  const text = String(value ?? '').trim();
+  return text === '-' ? '' : text;
+};
+
+const parseNewAPISession = (sessionID: string): { userID: string; username: string } => {
+  const session = sessionID.trim();
+  const prefix = 'newapi-user-';
+  if (!session.toLowerCase().startsWith(prefix)) {
+    return { userID: '', username: '' };
+  }
+  const raw = session.slice(prefix.length).trim();
+  const separator = raw.indexOf('+');
+  if (separator < 0) {
+    return { userID: raw.trim(), username: '' };
+  }
+  return {
+    userID: raw.slice(0, separator).trim(),
+    username: raw.slice(separator + 1).trim(),
+  };
+};
+
+const isLikelyOpaqueSessionID = (sessionID: string): boolean =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionID) ||
+  sessionID.includes(':');
+
+const getRecordUserIdentity = (record: AccountPoolUsageRecord) => {
+  const sessionID = normalizeUsageIdentityText(record.session_id);
+  const parsed = parseNewAPISession(sessionID);
+  const explicitUsername = normalizeUsageIdentityText(record.username) || parsed.username;
+  const userID = normalizeUsageIdentityText(record.newapi_user_id) || parsed.userID;
+  return {
+    username: explicitUsername || (!userID && sessionID && !isLikelyOpaqueSessionID(sessionID) ? sessionID : ''),
+    userID,
+    sessionID,
+  };
+};
+
 const getRecordStatusCode = (record: AccountPoolUsageRecord): number =>
   record.status_code ?? (record.success ? 200 : 0);
 
@@ -60,12 +99,11 @@ const getRecordUserFilterValue = (record: AccountPoolUsageRecord): string =>
   String(record.newapi_user_id || record.username || record.session_id || '').trim();
 
 const getRecordUserFilterLabel = (record: AccountPoolUsageRecord): string => {
-  const username = String(record.username || '').trim();
-  const userId = String(record.newapi_user_id || '').trim();
+  const { username, userID: userId, sessionID } = getRecordUserIdentity(record);
   if (username && userId) return `${username} (ID ${userId})`;
   if (username) return username;
   if (userId) return `ID ${userId}`;
-  return String(record.session_id || '').trim();
+  return sessionID;
 };
 
 const clampPageSize = (value: number): number =>
@@ -76,6 +114,7 @@ export function UsageRecordsPage() {
   const showNotification = useNotificationStore((state) => state.showNotification);
   const [records, setRecords] = useState<AccountPoolUsageRecord[]>([]);
   const [summaries, setSummaries] = useState<AccountPoolUsageSummary[]>([]);
+  const [serverTotals, setServerTotals] = useState<AccountPoolUsageTotals | null>(null);
   const [totalRecords, setTotalRecords] = useState(0);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
@@ -93,10 +132,12 @@ export function UsageRecordsPage() {
       const response = await authFilesApi.getAccountPoolUsageRecords({ limit: pageSize, page });
       setRecords(response.records);
       setSummaries(response.summaries);
+      setServerTotals(response.totals ?? null);
       setTotalRecords(response.total ?? response.records.length);
     } catch (err: unknown) {
       setRecords([]);
       setSummaries([]);
+      setServerTotals(null);
       setTotalRecords(0);
       const message = err instanceof Error ? err.message : t('common.unknown_error');
       showNotification(message, 'error');
@@ -110,6 +151,7 @@ export function UsageRecordsPage() {
       await authFilesApi.clearAccountPoolUsageRecords();
       setRecords([]);
       setSummaries([]);
+      setServerTotals(null);
       setTotalRecords(0);
       showNotification('使用记录已清空', 'success');
     } catch (err: unknown) {
@@ -195,23 +237,32 @@ export function UsageRecordsPage() {
     });
   }, [modelFilter, records, search, statusFilter, userFilter]);
 
-  const totals = useMemo(
-    () =>
-      filteredRecords.reduce(
-        (acc, item) => {
-          acc.requests += 1;
-          acc.successes += item.success ? 1 : 0;
-          acc.failures += item.success ? 0 : 1;
-          acc.inputTokens += item.input_tokens ?? 0;
-          acc.outputTokens += item.output_tokens ?? 0;
-          acc.cacheTokens += getCacheTokens(item);
-          acc.tokens += item.total_tokens ?? 0;
-          return acc;
-        },
-        { requests: 0, successes: 0, failures: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0, tokens: 0 }
-      ),
-    [filteredRecords]
-  );
+  const totals = useMemo(() => {
+    if (serverTotals) {
+      return {
+        requests: serverTotals.requests ?? 0,
+        successes: serverTotals.successes ?? 0,
+        failures: serverTotals.failures ?? 0,
+        inputTokens: serverTotals.input_tokens ?? 0,
+        outputTokens: serverTotals.output_tokens ?? 0,
+        cacheTokens: getCacheTokens(serverTotals),
+        tokens: serverTotals.total_tokens ?? 0,
+      };
+    }
+    return filteredRecords.reduce(
+      (acc, item) => {
+        acc.requests += 1;
+        acc.successes += item.success ? 1 : 0;
+        acc.failures += item.success ? 0 : 1;
+        acc.inputTokens += item.input_tokens ?? 0;
+        acc.outputTokens += item.output_tokens ?? 0;
+        acc.cacheTokens += getCacheTokens(item);
+        acc.tokens += item.total_tokens ?? 0;
+        return acc;
+      },
+      { requests: 0, successes: 0, failures: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0, tokens: 0 }
+    );
+  }, [filteredRecords, serverTotals]);
 
   const totalPages = Math.max(1, Math.ceil(totalRecords / pageSize));
   const currentPage = Math.min(page, totalPages);
@@ -395,7 +446,7 @@ export function UsageRecordsPage() {
                 </thead>
                 <tbody>
                   {pageRecords.map((record) => {
-                    const userLabel = record.username || record.newapi_user_id || '-';
+                    const identity = getRecordUserIdentity(record);
                     const statusCode = getRecordStatusCode(record);
                     return (
                       <tr key={record.id}>
@@ -410,13 +461,19 @@ export function UsageRecordsPage() {
                           </button>
                         </td>
                         <td>
-                          <div className={styles.strong}>{userLabel}</div>
-                          {record.newapi_user_id ? <div className={styles.muted}>ID {record.newapi_user_id}</div> : null}
-                          {record.session_id ? (
-                            <div className={styles.muted} title={record.session_id}>
-                              {record.session_id}
+                          <div className={styles.identityCell}>
+                            <div className={styles.identityMain}>
+                              {identity.username || identity.userID || '-'}
                             </div>
-                          ) : null}
+                            <div className={styles.identityLine}>
+                              <span>用户ID</span>
+                              <strong>{identity.userID || '-'}</strong>
+                            </div>
+                            <div className={styles.identityLine} title={identity.sessionID || undefined}>
+                              <span>会话ID</span>
+                              <strong>{identity.sessionID || '-'}</strong>
+                            </div>
+                          </div>
                         </td>
                         <td>
                           <div className={styles.strong}>{record.service_email || record.auth_id || '-'}</div>
