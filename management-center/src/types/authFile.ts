@@ -32,6 +32,22 @@ export interface AuthFileItem {
   statusMessage?: string;
   lastRefresh?: string | number;
   modified?: number;
+  check_status?: string;
+  checkStatus?: string;
+  check_message?: string;
+  checkMessage?: string;
+  check_plan?: string;
+  checkPlan?: string;
+  check_quota_lines?: string[] | string;
+  checkQuotaLines?: string[] | string;
+  check_quota_remaining_percent?: number;
+  checkQuotaRemainingPercent?: number;
+  check_status_code?: number;
+  checkStatusCode?: number;
+  check_checked_at?: number | string;
+  checkCheckedAt?: number | string;
+  check_content_hash?: string;
+  checkContentHash?: string;
   success?: unknown;
   failed?: unknown;
   recent_requests?: RecentRequestBucket[];
@@ -42,4 +58,12 @@ export interface AuthFileItem {
 export interface AuthFilesResponse {
   files: AuthFileItem[];
   total?: number;
+  folders?: Array<{
+    folder: string;
+    source_model?: string;
+    source_info?: string;
+    count?: number;
+    created_at?: string;
+    updated_at?: string;
+  }>;
 }

@@ -3,12 +3,47 @@ package management
 import (
 	"context"
 	"net/http"
+	"path/filepath"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+func TestAccountPoolAuthByNameSupportsFolderEntry(t *testing.T) {
+	t.Parallel()
+
+	authDir := t.TempDir()
+	h := &Handler{
+		cfg: &config.Config{
+			AuthDir: authDir,
+		},
+	}
+	entryName := "cpa_50_20260516_104042/normal-account.json"
+	entryData := []byte(`{"type":"codex","email":"normal@example.com","refresh_token":"refresh-token"}`)
+	if err := h.upsertAccountPoolArchiveFile(entryName, entryData); err != nil {
+		t.Fatalf("upsertAccountPoolArchiveFile returned error: %v", err)
+	}
+
+	auth := h.accountPoolAuthByName(entryName)
+	if auth == nil {
+		t.Fatal("expected account pool auth for folder entry")
+	}
+	if auth.FileName != entryName {
+		t.Fatalf("FileName = %q, want %q", auth.FileName, entryName)
+	}
+	if auth.ID != entryName {
+		t.Fatalf("ID = %q, want %q", auth.ID, entryName)
+	}
+	wantPath := filepath.Join(authDir, ".account-pool", "cpa_50_20260516_104042", "normal-account.json")
+	if gotPath := auth.Attributes["path"]; gotPath != wantPath {
+		t.Fatalf("path = %q, want %q", gotPath, wantPath)
+	}
+	if !h.isAccountPoolSyntheticAuth(auth) {
+		t.Fatal("expected folder account pool auth to be synthetic")
+	}
+}
 
 func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	t.Parallel()

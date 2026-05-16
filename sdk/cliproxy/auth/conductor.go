@@ -67,6 +67,7 @@ const (
 	refreshMaxConcurrency = 16
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 5 * time.Minute
+	authCleanupInterval   = 10 * time.Minute
 	// refreshIneffectiveBackoff throttles refresh attempts when an executor returns
 	// success but the auth still evaluates as needing refresh (e.g. token expiry
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
@@ -182,6 +183,7 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+	cleanupCancel context.CancelFunc
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -2322,6 +2324,174 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.hook.OnResult(ctx, result)
 }
 
+func (m *Manager) StartInvalidAuthCleanup(parent context.Context, interval time.Duration) {
+	if m == nil {
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	if interval <= 0 {
+		interval = authCleanupInterval
+	}
+
+	m.mu.Lock()
+	cancelPrev := m.cleanupCancel
+	m.cleanupCancel = nil
+	m.mu.Unlock()
+	if cancelPrev != nil {
+		cancelPrev()
+	}
+
+	ctx, cancelCtx := context.WithCancel(parent)
+	m.mu.Lock()
+	m.cleanupCancel = cancelCtx
+	m.mu.Unlock()
+
+	go m.invalidAuthCleanupLoop(ctx, interval)
+}
+
+func (m *Manager) invalidAuthCleanupLoop(ctx context.Context, interval time.Duration) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			m.DeleteInvalidAuthFiles(ctx, time.Now())
+			timer.Reset(interval)
+		}
+	}
+}
+
+func (m *Manager) DeleteInvalidAuthFiles(ctx context.Context, now time.Time) int {
+	if m == nil {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	type deleteCandidate struct {
+		id   string
+		path string
+	}
+	candidates := make([]deleteCandidate, 0)
+
+	m.mu.RLock()
+	for _, auth := range m.auths {
+		if !shouldDeleteInvalidAuthFile(auth, now) {
+			continue
+		}
+		path := persistentAuthPath(auth)
+		if path == "" {
+			continue
+		}
+		candidates = append(candidates, deleteCandidate{id: auth.ID, path: path})
+	}
+	m.mu.RUnlock()
+
+	deleted := 0
+	for _, candidate := range candidates {
+		if err := m.deleteAuthFile(ctx, candidate.id, candidate.path); err != nil {
+			log.WithError(err).Warnf("failed to delete invalid auth file %s", candidate.id)
+			continue
+		}
+		deleted++
+	}
+	return deleted
+}
+
+func (m *Manager) deleteAuthFile(ctx context.Context, authID string, path string) error {
+	authID = strings.TrimSpace(authID)
+	path = strings.TrimSpace(path)
+	if authID == "" || path == "" {
+		return nil
+	}
+	if m.store != nil {
+		if err := m.store.Delete(ctx, path); err != nil {
+			return err
+		}
+	}
+
+	m.mu.Lock()
+	delete(m.auths, authID)
+	m.mu.Unlock()
+
+	if m.scheduler != nil {
+		m.scheduler.removeAuth(authID)
+	}
+	registry.GetGlobalRegistry().UnregisterClient(authID)
+	if selector, ok := m.selector.(*SessionAffinitySelector); ok && selector != nil {
+		selector.InvalidateAuth(authID)
+	}
+	return nil
+}
+
+func persistentAuthPath(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true") {
+			return ""
+		}
+		if path := strings.TrimSpace(auth.Attributes["path"]); path != "" {
+			return path
+		}
+		if path := strings.TrimSpace(auth.Attributes["source"]); path != "" && strings.HasSuffix(strings.ToLower(path), ".json") {
+			return path
+		}
+	}
+	if fileName := strings.TrimSpace(auth.FileName); strings.HasSuffix(strings.ToLower(fileName), ".json") {
+		return fileName
+	}
+	if id := strings.TrimSpace(auth.ID); strings.HasSuffix(strings.ToLower(id), ".json") {
+		return id
+	}
+	return ""
+}
+
+func shouldDeleteInvalidAuthFile(auth *Auth, now time.Time) bool {
+	if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		return false
+	}
+	if isPermanentAuthFailure(auth.LastError) {
+		return true
+	}
+	if auth.Quota.Exceeded {
+		return true
+	}
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if isPermanentAuthFailure(state.LastError) {
+			return true
+		}
+		if state.Quota.Exceeded {
+			return true
+		}
+		if state.Unavailable && state.NextRetryAfter.After(now) && isPermanentAuthFailure(state.LastError) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPermanentAuthFailure(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	switch err.StatusCode() {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
+		return true
+	default:
+		return false
+	}
+}
+
 func ensureModelState(auth *Auth, model string) *ModelState {
 	if auth == nil || model == "" {
 		return nil
@@ -3672,6 +3842,7 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	m.mu.Unlock()
 
 	loop.rebuild(time.Now())
+	m.StartInvalidAuthCleanup(parent, authCleanupInterval)
 	go loop.run(ctx)
 }
 
@@ -3682,9 +3853,14 @@ func (m *Manager) StopAutoRefresh() {
 	cancel := m.refreshCancel
 	m.refreshCancel = nil
 	m.refreshLoop = nil
+	cleanupCancel := m.cleanupCancel
+	m.cleanupCancel = nil
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if cleanupCancel != nil {
+		cleanupCancel()
 	}
 	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
 	if stoppable, ok := m.selector.(StoppableSelector); ok {

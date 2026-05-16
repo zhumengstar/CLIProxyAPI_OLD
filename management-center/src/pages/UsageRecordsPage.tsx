@@ -35,6 +35,10 @@ const formatMetric = (value: number | undefined): string => {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
 };
 
+const getCacheTokens = (
+  item: Pick<AccountPoolUsageRecord | AccountPoolUsageSummary, 'cached_tokens' | 'cache_read_tokens' | 'cache_creation_tokens'>
+): number => (item.cached_tokens ?? 0) + (item.cache_read_tokens ?? 0) + (item.cache_creation_tokens ?? 0);
+
 const normalizeText = (value: unknown): string => String(value ?? '').trim().toLowerCase();
 
 const getRecordStatusCode = (record: AccountPoolUsageRecord): number =>
@@ -116,10 +120,6 @@ export function UsageRecordsPage() {
 
   useEffect(() => {
     void loadRecords();
-    const timer = window.setInterval(() => {
-      void loadRecords();
-    }, 8000);
-    return () => window.clearInterval(timer);
   }, [loadRecords]);
 
   const userOptions = useMemo(() => {
@@ -202,10 +202,13 @@ export function UsageRecordsPage() {
           acc.requests += 1;
           acc.successes += item.success ? 1 : 0;
           acc.failures += item.success ? 0 : 1;
+          acc.inputTokens += item.input_tokens ?? 0;
+          acc.outputTokens += item.output_tokens ?? 0;
+          acc.cacheTokens += getCacheTokens(item);
           acc.tokens += item.total_tokens ?? 0;
           return acc;
         },
-        { requests: 0, successes: 0, failures: 0, tokens: 0 }
+        { requests: 0, successes: 0, failures: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0, tokens: 0 }
       ),
     [filteredRecords]
   );
@@ -281,6 +284,18 @@ export function UsageRecordsPage() {
           <div className={styles.statCard}>
             <span className={styles.statLabel}>失败数</span>
             <strong className={styles.statValue}>{formatMetric(totals.failures)}</strong>
+          </div>
+          <div className={styles.statCard}>
+            <span className={styles.statLabel}>输入 Token</span>
+            <strong className={styles.statValue}>{formatMetric(totals.inputTokens)}</strong>
+          </div>
+          <div className={styles.statCard}>
+            <span className={styles.statLabel}>输出 Token</span>
+            <strong className={styles.statValue}>{formatMetric(totals.outputTokens)}</strong>
+          </div>
+          <div className={styles.statCard}>
+            <span className={styles.statLabel}>缓存 Token</span>
+            <strong className={styles.statValue}>{formatMetric(totals.cacheTokens)}</strong>
           </div>
           <div className={styles.statCard}>
             <span className={styles.statLabel}>总 Token</span>
@@ -419,7 +434,14 @@ export function UsageRecordsPage() {
                             <div className={styles.muted}>{record.latency_ms} ms</div>
                           ) : null}
                         </td>
-                        <td>{record.total_tokens ?? 0}</td>
+                        <td>
+                          <div className={styles.tokenStack}>
+                            <span>输入 {formatMetric(record.input_tokens ?? 0)}</span>
+                            <span>输出 {formatMetric(record.output_tokens ?? 0)}</span>
+                            <span>缓存 {formatMetric(getCacheTokens(record))}</span>
+                            <strong>总计 {formatMetric(record.total_tokens ?? 0)}</strong>
+                          </div>
+                        </td>
                       </tr>
                     );
                   })}

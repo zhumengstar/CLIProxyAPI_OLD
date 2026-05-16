@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import type { AuthFileItem } from '@/types/authFile';
 
 export type AccountCheckStatus = 'idle' | 'loading' | 'success' | 'error' | 'unsupported';
 
@@ -41,12 +42,17 @@ interface AccountPoolCheckState {
   isRunCancelled: (runId: string) => boolean;
   setResult: (runId: string, name: string, result: AccountCheckResult, hash?: string) => void;
   finishCheck: (runId: string) => AccountCheckSummary | null;
+  hydrateResultsFromFiles: (files: AuthFileItem[]) => void;
   pruneResults: (records: AccountCheckRecordRef[]) => void;
   clearResults: () => void;
 }
 
 const ACCOUNT_POOL_CHECK_RESULTS_STORAGE_KEY = 'cli-proxy-account-pool-check-results';
 const ACCOUNT_POOL_CHECK_PENDING_STORAGE_KEY = 'cli-proxy-account-pool-check-pending';
+const MAX_STORED_CHECK_MESSAGE_LENGTH = 180;
+const MAX_STORED_CHECK_QUOTA_LINES = 4;
+const MAX_STORED_CHECK_QUOTA_LINE_LENGTH = 120;
+const CHECK_RESULTS_STORAGE_LIMITS = [3000, 1500, 800, 400, 160];
 
 const emptySummary = (): AccountCheckSummary => ({
   total: 0,
@@ -123,20 +129,90 @@ const readPersistedResults = (): Pick<AccountPoolCheckState, 'results' | 'result
   }
 };
 
+const isStorageQuotaExceeded = (err: unknown): boolean => {
+  if (!(err instanceof DOMException)) return false;
+  return (
+    err.name === 'QuotaExceededError' ||
+    err.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+    err.code === 22 ||
+    err.code === 1014
+  );
+};
+
+const compactCheckResultForStorage = (result: AccountCheckResult): AccountCheckResult => {
+  const compact: AccountCheckResult = { status: result.status };
+  if (result.message) {
+    compact.message = result.message.slice(0, MAX_STORED_CHECK_MESSAGE_LENGTH);
+  }
+  if (result.plan) compact.plan = result.plan;
+  if (typeof result.quotaRemainingPercent === 'number') {
+    compact.quotaRemainingPercent = result.quotaRemainingPercent;
+  }
+  if (typeof result.statusCode === 'number') compact.statusCode = result.statusCode;
+  if (typeof result.checkedAt === 'number') compact.checkedAt = result.checkedAt;
+  if (Array.isArray(result.quotaLines) && result.quotaLines.length > 0) {
+    compact.quotaLines = result.quotaLines
+      .slice(0, MAX_STORED_CHECK_QUOTA_LINES)
+      .map((line) => line.slice(0, MAX_STORED_CHECK_QUOTA_LINE_LENGTH));
+  }
+  return compact;
+};
+
+const buildCheckResultsStoragePayload = (
+  results: Record<string, AccountCheckResult>,
+  resultHashes: Record<string, string>,
+  maxResults?: number
+) => {
+  const entries = Object.entries(results)
+    .filter(([, result]) => result.status !== 'loading')
+    .sort((left, right) => (right[1].checkedAt ?? 0) - (left[1].checkedAt ?? 0));
+  const limitedEntries = typeof maxResults === 'number' ? entries.slice(0, maxResults) : entries;
+  const stableResults: Record<string, AccountCheckResult> = {};
+  const stableHashes: Record<string, string> = {};
+  limitedEntries.forEach(([name, result]) => {
+    stableResults[name] = compactCheckResultForStorage(result);
+    if (resultHashes[name]) stableHashes[name] = resultHashes[name];
+  });
+  return { results: stableResults, resultHashes: stableHashes };
+};
+
+const tryWriteCheckResultsPayload = (payload: {
+  results: Record<string, AccountCheckResult>;
+  resultHashes: Record<string, string>;
+}): boolean => {
+  try {
+    window.localStorage.setItem(ACCOUNT_POOL_CHECK_RESULTS_STORAGE_KEY, JSON.stringify(payload));
+    return true;
+  } catch (err) {
+    if (!isStorageQuotaExceeded(err)) return false;
+    try {
+      window.localStorage.removeItem(ACCOUNT_POOL_CHECK_RESULTS_STORAGE_KEY);
+    } catch {
+      // Ignore cleanup failures; the next smaller payload may still fit.
+    }
+    return false;
+  }
+};
+
 const writePersistedResults = (
   results: Record<string, AccountCheckResult>,
   resultHashes: Record<string, string>
 ) => {
   if (typeof window === 'undefined') return;
-  const stableResults: Record<string, AccountCheckResult> = {};
-  Object.entries(results).forEach(([name, result]) => {
-    if (result.status === 'loading') return;
-    stableResults[name] = result;
-  });
-  window.localStorage.setItem(
-    ACCOUNT_POOL_CHECK_RESULTS_STORAGE_KEY,
-    JSON.stringify({ results: stableResults, resultHashes })
-  );
+  const fullPayload = buildCheckResultsStoragePayload(results, resultHashes);
+  if (tryWriteCheckResultsPayload(fullPayload)) return;
+
+  for (const limit of CHECK_RESULTS_STORAGE_LIMITS) {
+    if (tryWriteCheckResultsPayload(buildCheckResultsStoragePayload(results, resultHashes, limit))) {
+      return;
+    }
+  }
+
+  try {
+    window.localStorage.removeItem(ACCOUNT_POOL_CHECK_RESULTS_STORAGE_KEY);
+  } catch {
+    // The page should never crash because browser storage is full.
+  }
 };
 
 type PendingAccountPoolCheck = {
@@ -169,7 +245,11 @@ const readPendingAccountPoolCheck = (): PendingAccountPoolCheck | null => {
 
 const writePendingAccountPoolCheck = (pending: PendingAccountPoolCheck) => {
   if (typeof window === 'undefined') return;
-  window.localStorage.setItem(ACCOUNT_POOL_CHECK_PENDING_STORAGE_KEY, JSON.stringify(pending));
+  try {
+    window.localStorage.setItem(ACCOUNT_POOL_CHECK_PENDING_STORAGE_KEY, JSON.stringify(pending));
+  } catch {
+    // Pending state is best-effort; quota pressure must not interrupt checks.
+  }
 };
 
 const clearPendingAccountPoolCheck = () => {
@@ -185,6 +265,71 @@ export const readPendingAccountPoolCheckNames = (): string[] => {
 };
 
 const initialPersisted = readPersistedResults();
+
+const readStringField = (file: AuthFileItem, ...keys: string[]): string => {
+  for (const key of keys) {
+    const value = (file as Record<string, unknown>)[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+};
+
+const readNumberField = (file: AuthFileItem, ...keys: string[]): number | undefined => {
+  for (const key of keys) {
+    const value = (file as Record<string, unknown>)[key];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+};
+
+const readQuotaLinesField = (file: AuthFileItem): string[] | undefined => {
+  const value =
+    (file as Record<string, unknown>).check_quota_lines ??
+    (file as Record<string, unknown>).checkQuotaLines;
+  if (Array.isArray(value)) return value.filter((line): line is string => typeof line === 'string');
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (Array.isArray(parsed)) {
+        return parsed.filter((line): line is string => typeof line === 'string');
+      }
+    } catch {
+      return value.split('\n').map((line) => line.trim()).filter(Boolean);
+    }
+  }
+  return undefined;
+};
+
+const readRemoteCheckResult = (
+  file: AuthFileItem
+): { result: AccountCheckResult; hash?: string } | null => {
+  const status = readStringField(file, 'check_status', 'checkStatus');
+  if (status !== 'success' && status !== 'error' && status !== 'unsupported' && status !== 'idle') {
+    return null;
+  }
+  const contentHash = readStringField(file, 'content_hash', 'contentHash');
+  const checkHash = readStringField(file, 'check_content_hash', 'checkContentHash');
+  if (contentHash && checkHash && contentHash !== checkHash) return null;
+
+  const result: AccountCheckResult = {
+    status,
+    message: readStringField(file, 'check_message', 'checkMessage') || undefined,
+    plan: readStringField(file, 'check_plan', 'checkPlan') || undefined,
+    quotaLines: readQuotaLinesField(file),
+    quotaRemainingPercent: readNumberField(
+      file,
+      'check_quota_remaining_percent',
+      'checkQuotaRemainingPercent'
+    ),
+    statusCode: readNumberField(file, 'check_status_code', 'checkStatusCode'),
+    checkedAt: readNumberField(file, 'check_checked_at', 'checkCheckedAt'),
+  };
+  return { result, hash: checkHash || contentHash || undefined };
+};
 
 export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get) => ({
   activeRunId: null,
@@ -323,6 +468,31 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
     return summary;
   },
 
+  hydrateResultsFromFiles: (files) => {
+    if (files.length === 0) return;
+    set((state) => {
+      const nextResults = { ...state.results };
+      const nextHashes = { ...state.resultHashes };
+      let changed = false;
+      files.forEach((file) => {
+        if (!file.name) return;
+        if (nextResults[file.name]?.status === 'loading') return;
+        const remote = readRemoteCheckResult(file);
+        if (!remote) return;
+        const existing = nextResults[file.name];
+        const existingTime = existing?.checkedAt ?? 0;
+        const remoteTime = remote.result.checkedAt ?? 0;
+        if (existing && existingTime > remoteTime) return;
+        nextResults[file.name] = remote.result;
+        if (remote.hash) nextHashes[file.name] = remote.hash;
+        changed = true;
+      });
+      if (!changed) return state;
+      writePersistedResults(nextResults, nextHashes);
+      return { results: nextResults, resultHashes: nextHashes };
+    });
+  },
+
   pruneResults: (records) => {
     const allowedHashes = new Map<string, string>();
     records.forEach((record) => {
@@ -335,12 +505,7 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
       const nextHashes: Record<string, string> = {};
       Object.entries(state.results).forEach(([name, result]) => {
         const hash = allowedHashes.get(name);
-        if (
-          hash &&
-          (!state.resultHashes[name] ||
-            state.resultHashes[name] === hash ||
-            (state.checking && result.status === 'loading'))
-        ) {
+        if (hash) {
           next[name] = result;
         }
       });

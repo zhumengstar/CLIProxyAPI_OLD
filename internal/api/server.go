@@ -372,6 +372,9 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.HEAD("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/assets/*filepath", s.serveManagementAsset)
+	s.engine.HEAD("/assets/*filepath", s.serveManagementAsset)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -679,7 +682,13 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/account-pool/list", s.mgmt.ListAccountPoolEntries)
 		mgmt.POST("/account-pool", s.mgmt.UploadAccountPoolEntries)
 		mgmt.POST("/account-pool/upload", s.mgmt.UploadAccountPoolEntries)
+		mgmt.GET("/account-pool/import/:id", s.mgmt.GetAccountPoolImport)
+		mgmt.POST("/account-pool/repair", s.mgmt.RepairAccountPoolEntries)
+		mgmt.POST("/account-pool/write-auth-files", s.mgmt.WriteAccountPoolEntriesToAuthFiles)
+		mgmt.PATCH("/account-pool/folder", s.mgmt.PatchAccountPoolFolder)
+		mgmt.PATCH("/account-pool/check-results", s.mgmt.PatchAccountPoolCheckResults)
 		mgmt.GET("/account-pool/download", s.mgmt.DownloadAccountPoolArchive)
+		mgmt.POST("/account-pool/download", s.mgmt.DownloadAccountPoolArchive)
 		mgmt.GET("/account-pool/download-entry", s.mgmt.DownloadAccountPoolEntry)
 		mgmt.DELETE("/account-pool", s.mgmt.DeleteAccountPoolEntries)
 		mgmt.DELETE("/account-pool/delete", s.mgmt.DeleteAccountPoolEntries)
@@ -732,12 +741,19 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		return
 	}
 
-	if _, err := os.Stat(filePath); err != nil {
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
 		if os.IsNotExist(err) {
 			// Synchronously ensure management.html is available with a detached context.
 			// Control panel bootstrap should not be canceled by client disconnects.
 			if !managementasset.EnsureLatestManagementHTML(context.Background(), managementasset.StaticDir(s.configFilePath), cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository) {
 				c.AbortWithStatus(http.StatusNotFound)
+				return
+			}
+			fileInfo, err = os.Stat(filePath)
+			if err != nil {
+				log.WithError(err).Error("failed to stat management control panel asset after sync")
+				c.AbortWithStatus(http.StatusInternalServerError)
 				return
 			}
 		} else {
@@ -747,9 +763,35 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
-	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-	c.Header("Pragma", "no-cache")
-	c.Header("Expires", "0")
+	etag := fmt.Sprintf(`"management-%x-%x"`, fileInfo.ModTime().UnixNano(), fileInfo.Size())
+	c.Header("Cache-Control", "private, max-age=60, must-revalidate")
+	c.Header("ETag", etag)
+	c.Header("Vary", "Accept-Encoding")
+	c.File(filePath)
+}
+
+func (s *Server) serveManagementAsset(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	assetPath := strings.TrimPrefix(c.Param("filepath"), "/")
+	cleaned := filepath.Clean(assetPath)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	filePath := filepath.Join(managementasset.StaticDir(s.configFilePath), "assets", cleaned)
+	if info, err := os.Stat(filePath); err != nil || info.IsDir() {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Header("Vary", "Accept-Encoding")
 	c.File(filePath)
 }
 

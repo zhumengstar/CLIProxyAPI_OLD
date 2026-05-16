@@ -125,7 +125,7 @@ routing:
   # X-Session-ID, Session_id (Codex), X-Amp-Thread-Id (Amp CLI),
   # X-Client-Request-Id (PI), conversation_id, or first few messages hash.
   # Automatic failover is always enabled when bound auth becomes unavailable.
-  session-affinity: false # default: false
+  session-affinity: true # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
 

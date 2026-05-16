@@ -25,8 +25,8 @@ export type AccountPoolSyncProgress = {
 
 export const ACCOUNT_POOL_STORAGE_KEY = 'cli-proxy-account-pool';
 export const ACCOUNT_POOL_UPDATED_EVENT = 'cli-proxy-account-pool-updated';
-const ACCOUNT_POOL_SYNC_DEBOUNCE_MS = 400;
-const ACCOUNT_POOL_SYNC_CONCURRENCY = 5;
+const ACCOUNT_POOL_REFRESH_DEBOUNCE_MS = 400;
+const ACCOUNT_POOL_REFRESH_CONCURRENCY = 5;
 const ACCOUNT_POOL_DYNAMIC_TIMEOUT_MAX_MS = 10 * 60 * 1000;
 
 const getAccountPoolDynamicTimeout = (count: number, perItemMs = 140): number => {
@@ -55,6 +55,11 @@ const ACCOUNT_POOL_FILE_STORAGE_KEYS = [
   'runtime_only',
   'runtimeOnly',
   'source',
+  'folder',
+  'source_model',
+  'sourceModel',
+  'source_info',
+  'sourceInfo',
   'size',
   'modified',
   'modtime',
@@ -72,10 +77,26 @@ const ACCOUNT_POOL_FILE_STORAGE_KEYS = [
   'note',
   'content_hash',
   'contentHash',
+  'check_status',
+  'checkStatus',
+  'check_message',
+  'checkMessage',
+  'check_plan',
+  'checkPlan',
+  'check_quota_lines',
+  'checkQuotaLines',
+  'check_quota_remaining_percent',
+  'checkQuotaRemainingPercent',
+  'check_status_code',
+  'checkStatusCode',
+  'check_checked_at',
+  'checkCheckedAt',
+  'check_content_hash',
+  'checkContentHash',
   'id_token',
 ] as const;
 
-let syncTimer: ReturnType<typeof setTimeout> | null = null;
+let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 let syncInFlight: Promise<AccountPoolRecord[]> | null = null;
 let latestSyncProgress: AccountPoolSyncProgress | null = null;
 const syncProgressListeners = new Set<(progress: AccountPoolSyncProgress) => void>();
@@ -87,7 +108,7 @@ export const isRuntimeOnlyAuthPoolFile = (file: AuthFileItem): boolean => {
   return false;
 };
 
-const normalizeJsonForDedupe = (rawText: string): string => {
+export const normalizeAccountPoolJsonForHash = (rawText: string): string => {
   const normalize = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(normalize);
     if (!value || typeof value !== 'object') return value;
@@ -169,6 +190,15 @@ export const writeAccountPoolRecords = (records: AccountPoolRecord[]) => {
       auth_index: record.file['auth_index'] ?? record.file.authIndex ?? record.file.name,
       email: record.file.email,
       content_hash: record.file['content_hash'] ?? record.file.contentHash,
+      check_status: record.file.check_status ?? record.file.checkStatus,
+      check_message: record.file.check_message ?? record.file.checkMessage,
+      check_plan: record.file.check_plan ?? record.file.checkPlan,
+      check_quota_lines: record.file.check_quota_lines ?? record.file.checkQuotaLines,
+      check_quota_remaining_percent:
+        record.file.check_quota_remaining_percent ?? record.file.checkQuotaRemainingPercent,
+      check_status_code: record.file.check_status_code ?? record.file.checkStatusCode,
+      check_checked_at: record.file.check_checked_at ?? record.file.checkCheckedAt,
+      check_content_hash: record.file.check_content_hash ?? record.file.checkContentHash,
     },
     hash: record.hash,
     savedAt: record.savedAt,
@@ -196,14 +226,16 @@ export const writeAccountPoolRecords = (records: AccountPoolRecord[]) => {
 };
 
 export const uniqueAccountPoolRecords = (records: AccountPoolRecord[]): AccountPoolRecord[] => {
-  const byHash = new Map<string, AccountPoolRecord>();
+  const byName = new Map<string, AccountPoolRecord>();
   records.forEach((record) => {
-    const existing = byHash.get(record.hash);
+    const key = record.file.name.trim();
+    if (!key) return;
+    const existing = byName.get(key);
     if (!existing || record.savedAt > existing.savedAt) {
-      byHash.set(record.hash, record);
+      byName.set(key, record);
     }
   });
-  return Array.from(byHash.values()).sort((left, right) =>
+  return Array.from(byName.values()).sort((left, right) =>
     left.file.name.localeCompare(right.file.name)
   );
 };
@@ -291,7 +323,7 @@ const buildAccountPoolFilesFromArchive = async (): Promise<AuthFileItem[]> => {
         email,
         size: file.text.length,
         source: 'account_pool_archive',
-        content_hash: await hashText(normalizeJsonForDedupe(file.text)),
+        content_hash: await hashText(normalizeAccountPoolJsonForHash(file.text)),
       } as AuthFileItem;
     })
   );
@@ -301,17 +333,12 @@ const readAuthFileField = (file: AuthFileItem, key: string): unknown =>
   (file as Record<string, unknown>)[key];
 
 const buildAuthFileFingerprint = (file: AuthFileItem): string => {
+  const contentHash = readAuthFileContentHash(file);
+  if (contentHash) return `${file.name}|${contentHash}`;
+
   const parts = [
     file.name,
-    readAuthFileField(file, 'content_hash'),
-    readAuthFileField(file, 'contentHash'),
     readAuthFileField(file, 'size'),
-    readAuthFileField(file, 'modified'),
-    readAuthFileField(file, 'modtime'),
-    readAuthFileField(file, 'updated_at'),
-    readAuthFileField(file, 'last_refresh'),
-    readAuthFileField(file, 'disabled'),
-    readAuthFileField(file, 'status'),
   ];
   return parts.map((part) => String(part ?? '')).join('|');
 };
@@ -321,8 +348,43 @@ const readAuthFileContentHash = (file: AuthFileItem): string => {
   return typeof value === 'string' ? value.trim() : '';
 };
 
-export const syncAccountPoolFromAuthFiles = async (
-  concurrency = ACCOUNT_POOL_SYNC_CONCURRENCY,
+const mergeAccountPoolFileMetadata = (
+  existing: AuthFileItem | undefined,
+  incoming: AuthFileItem
+): AuthFileItem => {
+  if (!existing) return incoming;
+
+  const merged: AuthFileItem = {
+    ...existing,
+    ...incoming,
+  };
+  const preserveKeys = [
+    'folder',
+    'source_folder',
+    'source_model',
+    'sourceModel',
+    'source_info',
+    'sourceInfo',
+  ];
+  preserveKeys.forEach((key) => {
+    const incomingValue = (incoming as Record<string, unknown>)[key];
+    const existingValue = (existing as Record<string, unknown>)[key];
+    if (
+      (incomingValue === undefined ||
+        incomingValue === null ||
+        (typeof incomingValue === 'string' && !incomingValue.trim())) &&
+      existingValue !== undefined &&
+      existingValue !== null &&
+      (typeof existingValue !== 'string' || existingValue.trim())
+    ) {
+      (merged as Record<string, unknown>)[key] = existingValue;
+    }
+  });
+  return merged;
+};
+
+export const refreshAccountPoolFromServer = async (
+  concurrency = ACCOUNT_POOL_REFRESH_CONCURRENCY,
   onProgress?: (progress: AccountPoolSyncProgress) => void
 ): Promise<AccountPoolRecord[]> => {
   if (onProgress) {
@@ -397,20 +459,26 @@ export const syncAccountPoolFromAuthFiles = async (
     progress.total = importedFiles.length;
     reportProgress(true);
     const recordsByName = new Map<string, AccountPoolRecord>();
-    storedRecords.forEach((record) => {
-      recordsByName.set(record.file.name, record);
-    });
+    const refreshedNames = new Set<string>();
+    const storedByName = new Map(storedRecords.map((record) => [record.file.name, record]));
 
     await runWithConcurrency(
       importedFiles,
       syncConcurrency,
       async (file) => {
+        refreshedNames.add(file.name);
         const sourceFingerprint = buildAuthFileFingerprint(file);
-        const existing = recordsByName.get(file.name);
-        if (existing?.hash && existing.sourceFingerprint === sourceFingerprint) {
+        const existing = storedByName.get(file.name);
+        const serverContentHash = readAuthFileContentHash(file);
+        if (
+          existing?.hash &&
+          (existing.sourceFingerprint === sourceFingerprint ||
+            (serverContentHash && existing.hash === serverContentHash))
+        ) {
           recordsByName.set(file.name, {
             ...existing,
-            file,
+            file: mergeAccountPoolFileMetadata(existing.file, file),
+            sourceFingerprint,
           });
           progress.unchanged += 1;
           progress.processed += 1;
@@ -418,10 +486,9 @@ export const syncAccountPoolFromAuthFiles = async (
           return;
         }
 
-        const serverContentHash = readAuthFileContentHash(file);
         if (serverContentHash) {
           recordsByName.set(file.name, {
-            file,
+            file: mergeAccountPoolFileMetadata(existing?.file, file),
             hash: serverContentHash,
             savedAt: existing?.savedAt || Date.now(),
             sourceFingerprint,
@@ -442,7 +509,7 @@ export const syncAccountPoolFromAuthFiles = async (
             { responseType: 'blob', timeout: getAccountPoolDynamicTimeout(importedFiles.length, 80) }
           );
           const rawText = await (responseText.data as Blob).text();
-          const hash = await hashText(normalizeJsonForDedupe(rawText));
+          const hash = await hashText(normalizeAccountPoolJsonForHash(rawText));
           recordsByName.set(file.name, {
             file,
             hash,
@@ -455,6 +522,13 @@ export const syncAccountPoolFromAuthFiles = async (
             progress.added += 1;
           }
         } catch {
+          if (existing) {
+            recordsByName.set(file.name, {
+              ...existing,
+              file: mergeAccountPoolFileMetadata(existing.file, file),
+              sourceFingerprint,
+            });
+          }
           // Keep the existing pool intact even when a source auth file can no longer be read.
           progress.failed += 1;
         }
@@ -465,13 +539,21 @@ export const syncAccountPoolFromAuthFiles = async (
 
     progress.phase = 'saving';
     reportProgress(true);
-    const mergedRecords = uniqueAccountPoolRecords(Array.from(recordsByName.values()));
-    progress.deduped = Math.max(0, importedFiles.length - mergedRecords.length);
+    const retainedStoredRecords = storedRecords.filter((record) => !refreshedNames.has(record.file.name));
+    const mergeCandidates = [
+      ...Array.from(recordsByName.values()),
+      ...retainedStoredRecords,
+    ];
+    const mergedRecords = uniqueAccountPoolRecords(mergeCandidates);
+    progress.skipped = retainedStoredRecords.length;
+    progress.deduped = Math.max(0, mergeCandidates.length - mergedRecords.length);
     writeAccountPoolRecords(mergedRecords);
     emitAccountPoolUpdated(mergedRecords);
     progress.phase = 'done';
-    progress.processed = progress.total;
+    progress.total = mergedRecords.length;
+    progress.processed = mergedRecords.length;
     reportProgress(true);
+    latestSyncProgress = null;
     return mergedRecords;
   })();
 
@@ -485,15 +567,15 @@ export const syncAccountPoolFromAuthFiles = async (
   }
 };
 
-export const scheduleAccountPoolSync = () => {
+export const scheduleAccountPoolRefresh = () => {
   if (typeof window === 'undefined') return;
-  if (syncTimer) {
-    clearTimeout(syncTimer);
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
   }
-  syncTimer = setTimeout(() => {
-    syncTimer = null;
-    void syncAccountPoolFromAuthFiles().catch(() => {
-      // Background sync is best-effort.
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    void refreshAccountPoolFromServer().catch(() => {
+      // Background refresh is best-effort.
     });
-  }, ACCOUNT_POOL_SYNC_DEBOUNCE_MS);
+  }, ACCOUNT_POOL_REFRESH_DEBOUNCE_MS);
 };

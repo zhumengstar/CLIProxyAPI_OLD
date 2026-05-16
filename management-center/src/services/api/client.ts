@@ -215,6 +215,10 @@ class ApiClient {
     return this.instance.get(url, config);
   }
 
+  async postRaw(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<AxiosResponse> {
+    return this.instance.post(url, data, config);
+  }
+
   /**
    * 发送 FormData
    */

@@ -15,8 +15,37 @@ const statusLabel = (status: string) => {
   return status || '未开始';
 };
 
+const mergeSelectedJsonFiles = async (files: FileList): Promise<{ source: string; names: string[] }> => {
+  const selectedFiles = Array.from(files);
+  if (selectedFiles.length === 0) return { source: '', names: [] };
+
+  if (selectedFiles.length === 1) {
+    return {
+      source: await selectedFiles[0].text(),
+      names: selectedFiles.map((file) => file.name),
+    };
+  }
+
+  const parsedDocuments = await Promise.all(
+    selectedFiles.map(async (file) => {
+      const text = await file.text();
+      try {
+        return JSON.parse(text) as unknown;
+      } catch (err) {
+        throw new Error(`${file.name} 不是有效 JSON`);
+      }
+    })
+  );
+
+  return {
+    source: JSON.stringify(parsedDocuments, null, 2),
+    names: selectedFiles.map((file) => file.name),
+  };
+};
+
 export function Sub2APIImportPage() {
   const [source, setSource] = useState('');
+  const [selectedFileNames, setSelectedFileNames] = useState<string[]>([]);
   const [job, setJob] = useState<Sub2APIImportJob | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
@@ -26,6 +55,12 @@ export function Sub2APIImportPage() {
     if (!job || job.total <= 0) return 0;
     return Math.max(0, Math.min(100, Math.round((job.done / job.total) * 100)));
   }, [job]);
+
+  const selectedFileLabel = useMemo(() => {
+    if (selectedFileNames.length === 0) return '未选择文件';
+    if (selectedFileNames.length === 1) return selectedFileNames[0];
+    return `已选择 ${selectedFileNames.length} 个 JSON 文件`;
+  }, [selectedFileNames]);
 
   useEffect(() => {
     return () => {
@@ -60,13 +95,17 @@ export function Sub2APIImportPage() {
   }, [job]);
 
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
     setError('');
     try {
-      setSource(await file.text());
+      const next = await mergeSelectedJsonFiles(files);
+      setSource(next.source);
+      setSelectedFileNames(next.names);
     } catch (err) {
       setError(err instanceof Error ? err.message : '读取文件失败');
+    } finally {
+      event.target.value = '';
     }
   };
 
@@ -98,7 +137,7 @@ export function Sub2APIImportPage() {
         <div>
           <h1 className={styles.pageTitle}>Sub2 转 CPA</h1>
           <p className={styles.description}>
-            粘贴或选择 Sub2Api 导出的 JSON，后台会异步转换为 CPA 认证文件并自动写入认证文件目录，账号池会跟随现有同步流程读取这些账号。
+            粘贴或选择一个或多个 Sub2Api 导出的 JSON，后台会异步转换为 CPA 账号文件并导入账号池，不会写入认证文件目录。
           </p>
         </div>
       </div>
@@ -110,7 +149,10 @@ export function Sub2APIImportPage() {
             className={styles.textarea}
             spellCheck={false}
             value={source}
-            onChange={(event) => setSource(event.target.value)}
+            onChange={(event) => {
+              setSource(event.target.value);
+              setSelectedFileNames([]);
+            }}
             placeholder='粘贴 {"exported_at": "...", "accounts": [...]}'
           />
           <div className={styles.actions}>
@@ -120,11 +162,13 @@ export function Sub2APIImportPage() {
                 className={styles.fileInput}
                 type="file"
                 accept=".json,application/json"
+                multiple
                 onChange={(event) => void handleFileChange(event)}
               />
+              <span className={styles.fileName}>{selectedFileLabel}</span>
             </label>
             <Button onClick={() => void startImport()} loading={submitting} disabled={!source.trim()}>
-              异步导入到认证文件
+              异步导入到账号池
             </Button>
           </div>
         </Card>
@@ -158,12 +202,12 @@ export function Sub2APIImportPage() {
             {error && <div className={`${styles.message} ${styles.error}`}>{error}</div>}
             {job?.error && <div className={`${styles.message} ${styles.error}`}>{job.error}</div>}
             {job?.status === 'done' && (
-              <div className={styles.message}>导入完成。请到认证文件或账号池页面刷新查看。</div>
+              <div className={styles.message}>导入完成。请到账号池页面刷新查看。</div>
             )}
 
             {job?.files && job.files.length > 0 && (
               <div>
-                <h2 className={styles.sectionTitle}>已写入文件</h2>
+                <h2 className={styles.sectionTitle}>已导入账号池</h2>
                 <ul className={styles.list}>
                   {job.files.slice(0, 80).map((file) => (
                     <li key={file}>{file}</li>

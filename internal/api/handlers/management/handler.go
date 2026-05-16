@@ -3,7 +3,9 @@
 package management
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
@@ -26,11 +28,18 @@ type attemptInfo struct {
 	lastActivity time.Time // track last activity for cleanup
 }
 
+type tokenRefreshFailure struct {
+	message   string
+	expiresAt time.Time
+}
+
 // attemptCleanupInterval controls how often stale IP entries are purged
 const attemptCleanupInterval = 1 * time.Hour
 
 // attemptMaxIdleTime controls how long an IP can be idle before cleanup
 const attemptMaxIdleTime = 2 * time.Hour
+
+const tokenRefreshFailureTTL = 30 * time.Minute
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
@@ -39,6 +48,8 @@ type Handler struct {
 	mu                  sync.Mutex
 	sub2APIJobsMu       sync.Mutex
 	sub2APIJobs         map[string]*sub2APIImportJob
+	accountPoolJobsMu   sync.Mutex
+	accountPoolJobs     map[string]*accountPoolImportJob
 	attemptsMu          sync.Mutex
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
 	authManager         *coreauth.Manager
@@ -48,6 +59,8 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	tokenFailuresMu     sync.Mutex
+	tokenFailures       map[string]tokenRefreshFailure
 }
 
 // NewHandler creates a new management handler instance.
@@ -59,11 +72,16 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		cfg:                 cfg,
 		configFilePath:      configFilePath,
 		sub2APIJobs:         make(map[string]*sub2APIImportJob),
+		accountPoolJobs:     make(map[string]*accountPoolImportJob),
 		failedAttempts:      make(map[string]*attemptInfo),
 		authManager:         manager,
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+		tokenFailures:       make(map[string]tokenRefreshFailure),
+	}
+	if cfg != nil && strings.TrimSpace(cfg.AuthDir) != "" {
+		accountPoolUsage.Configure(filepath.Join(cfg.AuthDir, "account-pool-usage.sqlite"))
 	}
 	h.startAttemptCleanup()
 	return h
@@ -138,6 +156,62 @@ func (h *Handler) SetLogDirectory(dir string) {
 		}
 	}
 	h.logDir = dir
+}
+
+func tokenFailureCacheKey(provider string, refreshToken string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	refreshToken = strings.TrimSpace(refreshToken)
+	if provider == "" || refreshToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(refreshToken))
+	return provider + ":" + hex.EncodeToString(sum[:])
+}
+
+func (h *Handler) cachedTokenRefreshFailure(key string) (string, bool) {
+	if h == nil || key == "" {
+		return "", false
+	}
+	now := time.Now()
+	h.tokenFailuresMu.Lock()
+	defer h.tokenFailuresMu.Unlock()
+	if h.tokenFailures == nil {
+		h.tokenFailures = make(map[string]tokenRefreshFailure)
+		return "", false
+	}
+	entry, ok := h.tokenFailures[key]
+	if !ok {
+		return "", false
+	}
+	if now.After(entry.expiresAt) {
+		delete(h.tokenFailures, key)
+		return "", false
+	}
+	return entry.message, true
+}
+
+func (h *Handler) rememberTokenRefreshFailure(key string, err error) {
+	if h == nil || key == "" || err == nil {
+		return
+	}
+	h.tokenFailuresMu.Lock()
+	defer h.tokenFailuresMu.Unlock()
+	if h.tokenFailures == nil {
+		h.tokenFailures = make(map[string]tokenRefreshFailure)
+	}
+	h.tokenFailures[key] = tokenRefreshFailure{
+		message:   err.Error(),
+		expiresAt: time.Now().Add(tokenRefreshFailureTTL),
+	}
+}
+
+func (h *Handler) forgetTokenRefreshFailure(key string) {
+	if h == nil || key == "" {
+		return
+	}
+	h.tokenFailuresMu.Lock()
+	defer h.tokenFailuresMu.Unlock()
+	delete(h.tokenFailures, key)
 }
 
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.

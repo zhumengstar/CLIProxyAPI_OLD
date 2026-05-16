@@ -502,7 +502,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			if auth == nil || auth.ID != cached.authID {
 				continue
 			}
-			if auth.Disabled || auth.Status == StatusDisabled {
+			blocked, reason, _ := isAuthBlockedForModel(auth, model, time.Now())
+			if auth.Disabled || auth.Status == StatusDisabled || (blocked && reason == blockReasonCooldown) {
 				break
 			}
 			_, _ = s.cache.GetAndRefresh(cacheKey)

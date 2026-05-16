@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,7 +23,7 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
-const defaultAPICallTimeout = 60 * time.Second
+const defaultAPICallTimeout = 5 * time.Minute
 
 const (
 	geminiOAuthClientID     = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
@@ -295,15 +296,23 @@ func (h *Handler) refreshCodexOAuthAccessToken(ctx context.Context, auth *coreau
 	if refreshToken == "" {
 		return tokenValueForAuth(auth), nil
 	}
+	cacheKey := tokenFailureCacheKey("codex", refreshToken)
+	if message, ok := h.cachedTokenRefreshFailure(cacheKey); ok {
+		return "", fmt.Errorf("cached codex oauth token refresh failure: %s", message)
+	}
 
 	svc := codexauth.NewCodexAuthWithProxyURL(h.cfg, auth.ProxyURL)
 	tokenData, errRefresh := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if errRefresh != nil {
+		if isCacheableOAuthRefreshFailure(errRefresh) {
+			h.rememberTokenRefreshFailure(cacheKey, errRefresh)
+		}
 		return "", errRefresh
 	}
 	if tokenData == nil || strings.TrimSpace(tokenData.AccessToken) == "" {
 		return "", fmt.Errorf("codex oauth token refresh returned empty access_token")
 	}
+	h.forgetTokenRefreshFailure(cacheKey)
 
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -327,12 +336,56 @@ func (h *Handler) refreshCodexOAuthAccessToken(ctx context.Context, auth *coreau
 	auth.Metadata["type"] = "codex"
 	auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
 
+	if h.isAccountPoolSyntheticAuth(auth) {
+		if data, errMarshal := json.MarshalIndent(auth.Metadata, "", "  "); errMarshal == nil {
+			if errSave := h.upsertAccountPoolArchiveFile(auth.FileName, data); errSave != nil {
+				log.WithError(errSave).Warnf("failed to persist refreshed account pool auth %s", auth.FileName)
+			}
+		}
+	}
 	if h != nil && h.authManager != nil {
 		auth.LastRefreshedAt = time.Now()
 		auth.UpdatedAt = time.Now()
 		_, _ = h.authManager.Update(ctx, auth)
 	}
 	return strings.TrimSpace(tokenData.AccessToken), nil
+}
+
+func (h *Handler) isAccountPoolSyntheticAuth(auth *coreauth.Auth) bool {
+	if h == nil || h.cfg == nil || auth == nil {
+		return false
+	}
+	sourcePath := strings.TrimSpace(authAttribute(auth, "path"))
+	if sourcePath == "" {
+		sourcePath = strings.TrimSpace(authAttribute(auth, "source"))
+	}
+	if sourcePath == "" {
+		return false
+	}
+	entryName := normalizeAccountPoolEntryName(auth.FileName)
+	if entryName == "" {
+		entryName = normalizeAccountPoolEntryName(filepath.Base(auth.FileName))
+	}
+	if entryName == "" {
+		return false
+	}
+	return filepath.Clean(sourcePath) == filepath.Clean(filepath.Join(h.cfg.AuthDir, ".account-pool", filepath.FromSlash(entryName)))
+}
+
+func isCacheableOAuthRefreshFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	raw := strings.ToLower(err.Error())
+	if strings.Contains(raw, "context canceled") || strings.Contains(raw, "context deadline exceeded") {
+		return false
+	}
+	return strings.Contains(raw, "status 400") ||
+		strings.Contains(raw, "status 401") ||
+		strings.Contains(raw, "status 403") ||
+		strings.Contains(raw, "invalid_grant") ||
+		strings.Contains(raw, "refresh_token_reused") ||
+		strings.Contains(raw, "connection refused")
 }
 
 func codexTokenNeedsRefresh(metadata map[string]any) bool {
@@ -746,19 +799,31 @@ func (h *Handler) authByIndexOrName(authIndex string, authName string) *coreauth
 }
 
 func (h *Handler) accountPoolAuthByName(authName string) *coreauth.Auth {
-	authName = filepath.Base(strings.TrimSpace(authName))
-	if h == nil || h.cfg == nil || authName == "" || isUnsafeAuthFileName(authName) || !strings.HasSuffix(strings.ToLower(authName), ".json") {
+	authName = normalizeAccountPoolEntryName(strings.TrimSpace(authName))
+	if h == nil || h.cfg == nil || authName == "" || isUnsafeAccountPoolEntryName(authName) || !strings.HasSuffix(strings.ToLower(authName), ".json") {
 		return nil
 	}
-	entries, err := h.readAccountPoolArchive()
+	data, err := h.readAccountPoolArchiveEntry(authName)
 	if err != nil {
 		return nil
 	}
-	data, ok := entries[authName]
-	if !ok {
+	if len(bytes.TrimSpace(data)) == 0 {
+		baseName := normalizeAccountPoolEntryName(filepath.Base(authName))
+		if baseName != "" && baseName != authName {
+			data, err = h.readAccountPoolArchiveEntry(baseName)
+			if err != nil {
+				return nil
+			}
+			if len(bytes.TrimSpace(data)) != 0 {
+				authName = baseName
+			}
+		}
+	}
+	if len(data) == 0 {
 		return nil
 	}
-	auth, err := h.buildAuthFromFileData(filepath.Join(h.cfg.AuthDir, ".account-pool", authName), data)
+	authPath := filepath.Join(h.cfg.AuthDir, ".account-pool", filepath.FromSlash(authName))
+	auth, err := h.buildAuthFromFileData(authPath, data)
 	if err != nil {
 		return nil
 	}

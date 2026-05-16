@@ -273,7 +273,10 @@ export function Modal({
   const modalClass = `modal ${isClosing ? 'modal-closing' : 'modal-entering'}${className ? ` ${className}` : ''}`;
 
   const modalContent = (
-    <div className={overlayClass}>
+    <div
+      className={overlayClass}
+      onClick={closeDisabled ? undefined : handleClose}
+    >
       <div
         ref={modalRef}
         className={modalClass}
@@ -282,6 +285,7 @@ export function Modal({
         aria-modal="true"
         aria-labelledby={title ? titleId : undefined}
         tabIndex={-1}
+        onClick={(event) => event.stopPropagation()}
       >
         <button
           ref={closeButtonRef}

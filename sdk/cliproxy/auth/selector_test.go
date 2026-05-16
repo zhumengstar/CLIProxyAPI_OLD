@@ -752,6 +752,49 @@ func TestSessionAffinitySelector_RetriesSessionAuthTwiceThenPicksHighestPriority
 	}
 }
 
+func TestSessionAffinitySelector_SkipsCachedQuotaExceededAuth(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &FillFirstSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	now := time.Now()
+	model := "claude-3"
+	low := &Auth{ID: "low"}
+	high := &Auth{ID: "high", Attributes: map[string]string{"priority": "10"}}
+	headers := make(http.Header)
+	headers.Set("X-Session-ID", "quota-session")
+	opts := cliproxyexecutor.Options{Headers: headers}
+
+	first, err := selector.Pick(context.Background(), "claude", model, opts, []*Auth{low, high})
+	if err != nil {
+		t.Fatalf("Pick() initial error = %v", err)
+	}
+	if first.ID != "high" {
+		t.Fatalf("initial Pick() = %q, want high", first.ID)
+	}
+
+	high.ModelStates = map[string]*ModelState{
+		model: {
+			Status:         StatusActive,
+			Unavailable:    true,
+			NextRetryAfter: now.Add(time.Hour),
+			Quota:          QuotaState{Exceeded: true, NextRecoverAt: now.Add(time.Hour)},
+		},
+	}
+
+	next, err := selector.Pick(context.Background(), "claude", model, opts, []*Auth{low, high})
+	if err != nil {
+		t.Fatalf("Pick() after quota exceeded error = %v", err)
+	}
+	if next.ID != "low" {
+		t.Fatalf("Pick() after quota exceeded = %q, want low", next.ID)
+	}
+}
+
 func TestSessionAffinitySelector_SuccessResetsFailureCount(t *testing.T) {
 	t.Parallel()
 

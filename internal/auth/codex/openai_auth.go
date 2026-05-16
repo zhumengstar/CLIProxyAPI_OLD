@@ -308,7 +308,12 @@ func isNonRetryableRefreshErr(err error) bool {
 		return false
 	}
 	raw := strings.ToLower(err.Error())
-	return strings.Contains(raw, "refresh_token_reused")
+	return strings.Contains(raw, "refresh_token_reused") ||
+		strings.Contains(raw, "invalid_grant") ||
+		strings.Contains(raw, "status 400") ||
+		strings.Contains(raw, "status 401") ||
+		strings.Contains(raw, "status 403") ||
+		strings.Contains(raw, "connection refused")
 }
 
 // UpdateTokenStorage updates an existing CodexTokenStorage with new token data.

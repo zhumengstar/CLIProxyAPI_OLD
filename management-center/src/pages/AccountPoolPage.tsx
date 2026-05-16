@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Input } from '@/components/ui/Input';
+import { Modal } from '@/components/ui/Modal';
 import { Select } from '@/components/ui/Select';
 import { SelectionCheckbox } from '@/components/ui/SelectionCheckbox';
 import {
@@ -12,7 +13,12 @@ import {
   useNotificationStore,
   type AccountCheckResult,
 } from '@/stores';
-import { authFilesApi, type AccountPoolUsageSummary } from '@/services/api';
+import {
+  authFilesApi,
+  type AccountPoolCheckResultPatch,
+  type AccountPoolImportJob,
+  type AccountPoolUsageSummary,
+} from '@/services/api';
 import {
   ANTIGRAVITY_CONFIG,
   CLAUDE_CONFIG,
@@ -21,7 +27,7 @@ import {
   KIMI_CONFIG,
   type QuotaConfig,
 } from '@/components/quota';
-import type { AuthFileItem } from '@/types/authFile';
+import type { AuthFileItem, AuthFilesResponse } from '@/types/authFile';
 import { downloadBlob } from '@/utils/download';
 import { formatUnixTimestamp } from '@/utils/format';
 import { getStatusFromError, normalizePlanType } from '@/utils/quota';
@@ -31,7 +37,7 @@ import {
   buildAccountPoolFileContentCache,
   deleteAccountPoolRecordsByName,
   readAccountPoolRecords,
-  syncAccountPoolFromAuthFiles,
+  refreshAccountPoolFromServer,
   uniqueAccountPoolRecords,
   type AccountPoolSyncProgress,
   type AccountPoolRecord,
@@ -39,24 +45,28 @@ import {
 import styles from './AccountPoolPage.module.scss';
 
 const ACCOUNT_POOL_CHECK_CONCURRENCY_STORAGE_KEY = 'cli-proxy-account-pool-check-concurrency';
+const ACCOUNT_POOL_LOCAL_PUSH_SESSION_KEY = 'cli-proxy-account-pool-local-push-signature';
+const ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY = 'cli-proxy-account-pool-import-job';
 const MIN_ACCOUNT_POOL_CHECK_CONCURRENCY = 1;
-const DEFAULT_ACCOUNT_POOL_CHECK_CONCURRENCY = 5;
+const DEFAULT_ACCOUNT_POOL_CHECK_CONCURRENCY = 50;
 const MIN_ACCOUNT_POOL_PAGE_SIZE = 1;
 const MAX_ACCOUNT_POOL_PAGE_SIZE = 200;
 const DEFAULT_ACCOUNT_POOL_PAGE_SIZE = 100;
 const DEFAULT_ACCOUNT_POOL_SORT_MODE = 'quota_desc';
+const DEFAULT_ACCOUNT_POOL_VIEW_MODE = 'folder';
+const DEFAULT_ACCOUNT_POOL_FOLDER_FILTER = 'all';
 const DEFAULT_ACCOUNT_POOL_PLAN_FILTER = 'all';
 const DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER = 'all';
 const DEFAULT_ACCOUNT_POOL_QUOTA_FILTER = 'all';
 const LOW_ACCOUNT_POOL_QUOTA_PERCENT = 20;
 const ACCOUNT_POOL_CHECK_RETRY_ATTEMPTS = 2;
 const ACCOUNT_POOL_CHECK_RETRY_DELAY_MS = 700;
-type AccountPoolStatusCodeStats = {
-  codes: Array<[number, number]>;
-  unchecked: number;
-  unsupported: number;
-  unknownError: number;
-};
+const ACCOUNT_POOL_IMPORT_ARCHIVE_EXTENSIONS = ['.zip', '.tar', '.tar.gz', '.tgz', '.gz'];
+type AccountPoolWriteAction =
+  | 'overwrite-current'
+  | 'append-current';
+type AccountPoolViewMode = 'list' | 'folder';
+type AccountPoolFolderInfo = NonNullable<AuthFilesResponse['folders']>[number];
 const QUOTA_CONFIGS = [
   CLAUDE_CONFIG,
   ANTIGRAVITY_CONFIG,
@@ -66,6 +76,63 @@ const QUOTA_CONFIGS = [
 ] as Array<QuotaConfig<unknown, unknown>>;
 
 const getFileType = (file: AuthFileItem): string => String(file.type || file.provider || 'unknown');
+
+const getUploadFilePath = (file: File): string => {
+  const relativePath =
+    typeof (file as File & { webkitRelativePath?: string }).webkitRelativePath === 'string'
+      ? (file as File & { webkitRelativePath?: string }).webkitRelativePath
+      : '';
+  return relativePath || file.name;
+};
+
+const isSupportedAccountPoolImportName = (name: string): boolean => {
+  const lowerName = name.trim().toLowerCase();
+  return lowerName.endsWith('.json') || ACCOUNT_POOL_IMPORT_ARCHIVE_EXTENSIONS.some((ext) => lowerName.endsWith(ext));
+};
+
+const isArchiveAccountPoolImportName = (name: string): boolean => {
+  const lowerName = name.trim().toLowerCase();
+  return ACCOUNT_POOL_IMPORT_ARCHIVE_EXTENSIONS.some((ext) => lowerName.endsWith(ext));
+};
+
+const filterImportableAccountPoolFiles = async (files: File[]) => {
+  const importable: File[] = [];
+  let skipped = 0;
+
+  await Promise.all(
+    files.map(async (file) => {
+      const uploadPath = getUploadFilePath(file);
+      if (!isSupportedAccountPoolImportName(uploadPath)) {
+        skipped += 1;
+        return;
+      }
+      if (isArchiveAccountPoolImportName(uploadPath)) {
+        importable.push(file);
+        return;
+      }
+      try {
+        JSON.parse(await file.text());
+        importable.push(file);
+      } catch {
+        skipped += 1;
+      }
+    })
+  );
+
+  return { importable, skipped };
+};
+
+const isAccountPoolImportDone = (job: AccountPoolImportJob): boolean =>
+  job.status === 'done' || job.status === 'failed';
+
+const normalizeFolderName = (value: unknown): string => {
+  const folder = String(value || '').trim();
+  return !folder || folder === '直接上传' ? '默认文件夹' : folder;
+};
+
+const getFileFolder = (file: AuthFileItem): string => {
+  return normalizeFolderName(file.folder || file['source_folder']);
+};
 
 const getFileModifiedLabel = (file: AuthFileItem): string => {
   const value = file.modified ?? file['modtime'] ?? file['updated_at'];
@@ -504,8 +571,19 @@ const getQuotaSummary = (
 
 const matchesCheckStatusFilter = (status: string | undefined, filter: string): boolean => {
   if (filter === DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER) return true;
-  if (filter === 'unchecked') return !status || status === 'loading';
+  if (filter.startsWith('code:')) return true;
+  if (filter === 'checking') return status === 'loading';
+  if (filter === 'unchecked') return !status || status === 'idle';
   return status === filter;
+};
+
+const matchesStatusCodeFilter = (
+  statusCode: number | undefined,
+  filter: string
+): boolean => {
+  if (filter === DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER || !filter.startsWith('code:')) return true;
+  const code = Number(filter.slice('code:'.length));
+  return Number.isFinite(code) && statusCode === code;
 };
 
 const matchesQuotaFilter = (
@@ -636,6 +714,13 @@ const readStoredCheckConcurrency = (): number => {
   return clampAccountPoolCheckConcurrency(parsed);
 };
 
+const readAccountPoolRemoteHash = (file: AuthFileItem): string => {
+  const value =
+    (file as Record<string, unknown>).content_hash ??
+    (file as Record<string, unknown>).contentHash;
+  return typeof value === 'string' ? value.trim() : '';
+};
+
 const resolveQuotaConfig = (file: AuthFileItem): QuotaConfig<unknown, unknown> | null =>
   QUOTA_CONFIGS.find((config) => config.filterFn(file)) ?? null;
 
@@ -702,15 +787,44 @@ const getAccountPoolCheckErrorStatus = (err: unknown): number | undefined => {
 
 const isRetryableAccountPoolCheckError = (err: unknown): boolean => {
   const status = getAccountPoolCheckErrorStatus(err);
+  if (status === 400 || status === 401 || status === 403 || status === 404) return false;
   if (status === 408 || status === 409 || status === 425 || status === 429) return true;
   if (typeof status === 'number' && status >= 500) return true;
   const message = err instanceof Error ? err.message.toLowerCase() : '';
+  if (
+    message.includes('auth token refresh failed') ||
+    message.includes('could not parse your authentication token') ||
+    message.includes('invalid token') ||
+    message.includes('unauthorized')
+  ) {
+    return false;
+  }
   return (
     message.includes('timeout') ||
     message.includes('network') ||
-    message.includes('request failed') ||
-    message.includes('token refresh failed')
+    message.includes('request failed')
   );
+};
+
+const fetchQuotaForAccountPool = async (
+  config: QuotaConfig<unknown, unknown>,
+  file: AuthFileItem,
+  t: ReturnType<typeof useTranslation>['t'],
+  parentSignal?: AbortSignal
+): Promise<unknown> => {
+  if (parentSignal?.aborted) {
+    throw new DOMException('Account pool check aborted', 'AbortError');
+  }
+
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort();
+  parentSignal?.addEventListener('abort', abortFromParent, { once: true });
+
+  try {
+    return await config.fetchQuota(file, t, controller.signal);
+  } finally {
+    parentSignal?.removeEventListener('abort', abortFromParent);
+  }
 };
 
 const compareOptionalTime = (
@@ -748,6 +862,7 @@ export function AccountPoolPage() {
   const isRunCancelled = useAccountPoolCheckStore((state) => state.isRunCancelled);
   const setCheckResult = useAccountPoolCheckStore((state) => state.setResult);
   const finishCheck = useAccountPoolCheckStore((state) => state.finishCheck);
+  const hydrateRemoteCheckResults = useAccountPoolCheckStore((state) => state.hydrateResultsFromFiles);
   const pruneCheckResults = useAccountPoolCheckStore((state) => state.pruneResults);
   const [files, setFiles] = useState<AuthFileItem[]>([]);
   const [fileContentCache, setFileContentCache] = useState<Record<string, string>>({});
@@ -755,18 +870,22 @@ export function AccountPoolPage() {
   const [hashByName, setHashByName] = useState<Map<string, string>>(() => new Map());
   const [loading, setLoading] = useState(true);
   const [downloading, setDownloading] = useState(false);
-  const [downloadingArchive, setDownloadingArchive] = useState(false);
   const [importingPool, setImportingPool] = useState(false);
-  const [overwritingPassed, setOverwritingPassed] = useState(false);
+  const [importJob, setImportJob] = useState<AccountPoolImportJob | null>(null);
+  const [activeWriteAction, setActiveWriteAction] = useState<AccountPoolWriteAction | null>(null);
   const [deletingPoolEntries, setDeletingPoolEntries] = useState(false);
   const [error, setError] = useState('');
   const [syncProgress, setSyncProgress] = useState<AccountPoolSyncProgress | null>(null);
   const [search, setSearch] = useState('');
-  const [typeFilter, setTypeFilter] = useState('all');
   const [planFilter, setPlanFilter] = useState(DEFAULT_ACCOUNT_POOL_PLAN_FILTER);
   const [checkStatusFilter, setCheckStatusFilter] = useState(DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER);
+  const [quickStatusFilter, setQuickStatusFilter] = useState(DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER);
   const [quotaFilter, setQuotaFilter] = useState(DEFAULT_ACCOUNT_POOL_QUOTA_FILTER);
   const [sortMode, setSortMode] = useState(DEFAULT_ACCOUNT_POOL_SORT_MODE);
+  const [viewMode, setViewMode] = useState<AccountPoolViewMode>(DEFAULT_ACCOUNT_POOL_VIEW_MODE);
+  const [folderFilter, setFolderFilter] = useState(DEFAULT_ACCOUNT_POOL_FOLDER_FILTER);
+  const [sourceModelFilter, setSourceModelFilter] = useState(DEFAULT_ACCOUNT_POOL_FOLDER_FILTER);
+  const [activeFolder, setActiveFolder] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(DEFAULT_ACCOUNT_POOL_PAGE_SIZE);
   const [pageSizeInput, setPageSizeInput] = useState(String(DEFAULT_ACCOUNT_POOL_PAGE_SIZE));
@@ -774,12 +893,87 @@ export function AccountPoolPage() {
   const [checkConcurrencyInput, setCheckConcurrencyInput] = useState(String(checkConcurrency));
   const [selectedNames, setSelectedNames] = useState<string[]>([]);
   const [usageSummaries, setUsageSummaries] = useState<AccountPoolUsageSummary[]>([]);
-  const [checkViewSnapshot, setCheckViewSnapshot] = useState<string[] | null>(null);
-  const [statusStatsSnapshot, setStatusStatsSnapshot] = useState<AccountPoolStatusCodeStats | null>(
-    null
-  );
+  const [folderInfos, setFolderInfos] = useState<AccountPoolFolderInfo[]>([]);
+  const [sourceEditorOpen, setSourceEditorOpen] = useState(false);
+  const [sourceEditorFolder, setSourceEditorFolder] = useState('');
+  const [sourceEditorModel, setSourceEditorModel] = useState('');
+  const [sourceEditorInfo, setSourceEditorInfo] = useState('');
+  const [savingSourceInfo, setSavingSourceInfo] = useState(false);
+  const [configViewerOpen, setConfigViewerOpen] = useState(false);
+  const [configViewerName, setConfigViewerName] = useState('');
+  const [configViewerContent, setConfigViewerContent] = useState('');
+  const [configViewerLoading, setConfigViewerLoading] = useState(false);
+  const [configViewerError, setConfigViewerError] = useState('');
   const [resumedPendingCheck, setResumedPendingCheck] = useState(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const importFolderInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingCheckResultUpdatesRef = useRef<Map<string, AccountPoolCheckResultPatch>>(new Map());
+  const checkResultFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flushingCheckResultsRef = useRef(false);
+
+  const flushRemoteCheckResults = useCallback(async () => {
+    if (flushingCheckResultsRef.current) return;
+    const updates = Array.from(pendingCheckResultUpdatesRef.current.values());
+    if (updates.length === 0) return;
+    pendingCheckResultUpdatesRef.current.clear();
+    flushingCheckResultsRef.current = true;
+    try {
+      await authFilesApi.updateAccountPoolCheckResults(updates);
+    } catch (err) {
+      updates.forEach((update) => {
+        pendingCheckResultUpdatesRef.current.set(update.name, update);
+      });
+      if (!checkResultFlushTimerRef.current) {
+        checkResultFlushTimerRef.current = setTimeout(() => {
+          checkResultFlushTimerRef.current = null;
+          void flushRemoteCheckResults();
+        }, 2000);
+      }
+      console.warn('failed to persist account pool check results', err);
+    } finally {
+      flushingCheckResultsRef.current = false;
+    }
+  }, []);
+
+  const scheduleRemoteCheckResultFlush = useCallback(() => {
+    if (checkResultFlushTimerRef.current) return;
+    checkResultFlushTimerRef.current = setTimeout(() => {
+      checkResultFlushTimerRef.current = null;
+      void flushRemoteCheckResults();
+    }, 300);
+  }, [flushRemoteCheckResults]);
+
+  const queueRemoteCheckResult = useCallback(
+    (file: AuthFileItem, result: AccountCheckResult, contentHash?: string) => {
+      if (!file.name || result.status === 'loading') return;
+      pendingCheckResultUpdatesRef.current.set(file.name, {
+        name: file.name,
+        content_hash: contentHash,
+        result: {
+          status: result.status,
+          message: result.message,
+          plan: result.plan,
+          quotaLines: result.quotaLines,
+          quotaRemainingPercent: result.quotaRemainingPercent,
+          statusCode: result.statusCode,
+          checkedAt: result.checkedAt,
+        },
+      });
+      scheduleRemoteCheckResultFlush();
+    },
+    [scheduleRemoteCheckResultFlush]
+  );
+
+  useEffect(
+    () => () => {
+      if (checkResultFlushTimerRef.current) {
+        clearTimeout(checkResultFlushTimerRef.current);
+        checkResultFlushTimerRef.current = null;
+      }
+      void flushRemoteCheckResults();
+    },
+    [flushRemoteCheckResults]
+  );
 
   const applyRecords = useCallback((records: AccountPoolRecord[]) => {
     const nextRecords = uniqueAccountPoolRecords(records);
@@ -788,9 +982,10 @@ export function AccountPoolPage() {
     setSelectedNames((current) =>
       current.filter((name) => nextRecords.some((record) => record.file.name === name))
     );
+    hydrateRemoteCheckResults(nextRecords.map((record) => record.file));
     pruneCheckResults(nextRecords);
     return nextRecords;
-  }, [pruneCheckResults]);
+  }, [hydrateRemoteCheckResults, pruneCheckResults]);
 
   const hydrateStoredPool = useCallback(() => {
     const storedRecords = applyRecords(readAccountPoolRecords());
@@ -798,17 +993,51 @@ export function AccountPoolPage() {
     return storedRecords;
   }, [applyRecords]);
 
-  const syncFiles = useCallback(async (showLoading = true) => {
+  const pushLocalAccountPoolToServer = useCallback(async (records: AccountPoolRecord[]) => {
+    if (typeof window === 'undefined') return;
+    const localRecordsWithContent = uniqueAccountPoolRecords(records).filter(
+      (record) => record.content && record.file.name
+    );
+    if (localRecordsWithContent.length === 0) return;
+
+    const remoteResponse = await authFilesApi.listAccountPoolEntries();
+    const remoteHashes = new Set(
+      (remoteResponse.files || [])
+        .map(readAccountPoolRemoteHash)
+        .filter(Boolean)
+    );
+    const remoteNames = new Set((remoteResponse.files || []).map((file) => file.name).filter(Boolean));
+    const recordsWithContent = localRecordsWithContent.filter(
+      (record) => !remoteHashes.has(record.hash) && !remoteNames.has(record.file.name)
+    );
+    if (recordsWithContent.length === 0) return;
+
+    const signature = recordsWithContent.map((record) => `${record.file.name}:${record.hash}`).join('|');
+    if (window.sessionStorage.getItem(ACCOUNT_POOL_LOCAL_PUSH_SESSION_KEY) === signature) return;
+
+    const blob = createZipBlob(
+      recordsWithContent.map((record) => ({
+        name: record.file.name,
+        text: record.content ?? '',
+      }))
+    );
+    const file = new File([blob], 'account-pool-local-cache.zip', { type: 'application/zip' });
+    await authFilesApi.uploadAccountPoolFiles([file]);
+    window.sessionStorage.setItem(ACCOUNT_POOL_LOCAL_PUSH_SESSION_KEY, signature);
+  }, []);
+
+  const refreshPool = useCallback(async (showLoading = true) => {
     if (showLoading) {
       setLoading(true);
     }
     setError('');
     setSyncProgress(null);
-    hydrateStoredPool();
+    const storedRecords = hydrateStoredPool();
     try {
-      const mergedRecords = await syncAccountPoolFromAuthFiles(checkConcurrency, setSyncProgress);
+      await pushLocalAccountPoolToServer(storedRecords);
+      const mergedRecords = await refreshAccountPoolFromServer(checkConcurrency, setSyncProgress);
       applyRecords(mergedRecords);
-      setSyncProgress((current) => current ? { ...current, phase: 'done' } : current);
+      setSyncProgress(null);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('notification.refresh_failed');
       setError(message);
@@ -817,11 +1046,55 @@ export function AccountPoolPage() {
         setLoading(false);
       }
     }
-  }, [applyRecords, checkConcurrency, hydrateStoredPool, t]);
+  }, [applyRecords, checkConcurrency, hydrateStoredPool, pushLocalAccountPoolToServer, t]);
+
+  const loadFolderInfos = useCallback(async () => {
+    try {
+      const response = await authFilesApi.listAccountPoolEntries();
+      setFolderInfos(response.folders || []);
+    } catch {
+      setFolderInfos([]);
+    }
+  }, []);
+
+  const pollAccountPoolImportJob = useCallback(async (jobId: string) => {
+    if (!jobId) return;
+    setImportingPool(true);
+    try {
+      for (;;) {
+        const nextJob = await authFilesApi.getAccountPoolImport(jobId);
+        setImportJob(nextJob);
+        if (isAccountPoolImportDone(nextJob)) {
+          window.localStorage.removeItem(ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY);
+          await refreshPool(false);
+          await loadFolderInfos();
+          showNotification(
+            nextJob.status === 'done'
+              ? `账号池后台导入完成：导入 ${nextJob.imported} 个，跳过 ${nextJob.skipped} 个，失败 ${nextJob.failed} 个`
+              : `账号池后台导入失败：${nextJob.error || '未知错误'}`,
+            nextJob.status === 'done' ? 'success' : 'error'
+          );
+          break;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '查询导入任务失败';
+      showNotification(message, 'error');
+    } finally {
+      setImportingPool(false);
+    }
+  }, [loadFolderInfos, refreshPool, showNotification]);
+
+  useEffect(() => {
+    const jobId = window.localStorage.getItem(ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY);
+    if (jobId) {
+      void pollAccountPoolImportJob(jobId);
+    }
+  }, [pollAccountPoolImportJob]);
 
   useEffect(() => {
     hydrateStoredPool();
-    void syncFiles(false);
 
     const handleAccountPoolUpdated = (event: Event) => {
       const records = (event as CustomEvent<AccountPoolRecord[]>).detail;
@@ -832,33 +1105,25 @@ export function AccountPoolPage() {
 
     window.addEventListener(ACCOUNT_POOL_UPDATED_EVENT, handleAccountPoolUpdated);
     return () => window.removeEventListener(ACCOUNT_POOL_UPDATED_EVENT, handleAccountPoolUpdated);
-  }, [applyRecords, hydrateStoredPool, syncFiles]);
+  }, [applyRecords, hydrateStoredPool]);
 
   const loadUsageSummaries = useCallback(async () => {
     try {
-      const response = await authFilesApi.getAccountPoolUsageRecords(80);
+      const response = await authFilesApi.getAccountPoolUsageRecords({ summaryOnly: true });
       setUsageSummaries(response.summaries);
     } catch {
-      setUsageSummaries([]);
+      // Keep the last known per-account usage stats unless the account is explicitly deleted.
     }
   }, []);
 
   useEffect(() => {
     void loadUsageSummaries();
-    const timer = window.setInterval(() => {
-      void loadUsageSummaries();
-    }, 8000);
-    return () => window.clearInterval(timer);
   }, [loadUsageSummaries]);
 
+  useEffect(() => {
+    void loadFolderInfos();
+  }, [loadFolderInfos]);
 
-  const typeOptions = useMemo(() => {
-    const types = Array.from(new Set(files.map(getFileType))).sort((a, b) => a.localeCompare(b));
-    return [
-      { value: 'all', label: t('account_pool.type_all') },
-      ...types.map((type) => ({ value: type, label: type })),
-    ];
-  }, [files, t]);
 
   const sortOptions = useMemo(
     () => [
@@ -890,6 +1155,7 @@ export function AccountPoolPage() {
   const checkStatusOptions = useMemo(
     () => [
       { value: 'all', label: t('account_pool.check_status_all', { defaultValue: '全部状态' }) },
+      { value: 'checking', label: t('account_pool.check_status_checking', { defaultValue: '检测中' }) },
       { value: 'success', label: t('account_pool.check_status_success', { defaultValue: '通过' }) },
       { value: 'error', label: t('account_pool.check_status_error', { defaultValue: '失败' }) },
       { value: 'unsupported', label: t('account_pool.check_status_unsupported', { defaultValue: '不支持' }) },
@@ -907,6 +1173,35 @@ export function AccountPoolPage() {
       { value: 'without_quota', label: t('account_pool.quota_without', { defaultValue: '无额度' }) },
     ],
     [t]
+  );
+
+  const folderOptions = useMemo(() => {
+    const folders = Array.from(new Set(files.map(getFileFolder))).sort((a, b) => a.localeCompare(b));
+    return [
+      { value: DEFAULT_ACCOUNT_POOL_FOLDER_FILTER, label: '全部文件夹' },
+      ...folders.map((folder) => ({ value: folder, label: folder })),
+    ];
+  }, [files]);
+
+  const sourceModelOptions = useMemo(() => {
+    const modelByFolder = new Map(folderInfos.map((item) => [item.folder, item.source_model || '']));
+    const models = Array.from(
+      new Set(
+        files
+          .map((file) => modelByFolder.get(getFileFolder(file)) || String(file.type || file.provider || ''))
+          .map((value) => value.trim())
+          .filter(Boolean)
+      )
+    ).sort((a, b) => a.localeCompare(b));
+    return [
+      { value: DEFAULT_ACCOUNT_POOL_FOLDER_FILTER, label: '全部来源模型' },
+      ...models.map((model) => ({ value: model, label: model })),
+    ];
+  }, [files, folderInfos]);
+
+  const folderInfoByName = useMemo(
+    () => new Map(folderInfos.map((item) => [normalizeFolderName(item.folder), item])),
+    [folderInfos]
   );
 
   const usageSummaryByEmail = useMemo(() => {
@@ -956,17 +1251,23 @@ export function AccountPoolPage() {
     [fileContentCache, usageSummaryByAuthID, usageSummaryByEmail]
   );
 
-  const filteredFiles = useMemo(() => {
+  const filterAndSortFiles = useCallback((sourceFiles: AuthFileItem[]) => {
     const term = search.trim().toLowerCase();
-    return files
+    return sourceFiles
       .filter((file) => {
         const checkResult = checkResults[file.name];
-        if (typeFilter !== 'all' && getFileType(file) !== typeFilter) return false;
+        const folder = getFileFolder(file);
+        const folderInfo = folderInfoByName.get(folder);
+        const sourceModel = folderInfo?.source_model || getFileType(file);
+        if (folderFilter !== DEFAULT_ACCOUNT_POOL_FOLDER_FILTER && folder !== folderFilter) return false;
+        if (sourceModelFilter !== DEFAULT_ACCOUNT_POOL_FOLDER_FILTER && sourceModel !== sourceModelFilter) return false;
         if (!matchesPlanFilter(file, fileContentCache, checkResult?.plan, planFilter)) return false;
         if (!matchesCheckStatusFilter(checkResult?.status, checkStatusFilter)) return false;
+        if (!matchesCheckStatusFilter(checkResult?.status, quickStatusFilter)) return false;
+        if (!matchesStatusCodeFilter(checkResult?.statusCode, quickStatusFilter)) return false;
         if (!matchesQuotaFilter(checkResult, quotaFilter)) return false;
         if (!term) return true;
-        return [file.name, getFileType(file), file.statusMessage, file.status]
+        return [file.name, getFileType(file), folder, sourceModel, folderInfo?.source_info, file.statusMessage, file.status]
           .some((value) => String(value ?? '').toLowerCase().includes(term));
       })
       .sort((left, right) => {
@@ -1030,34 +1331,115 @@ export function AccountPoolPage() {
     checkResults,
     checkStatusFilter,
     fileContentCache,
-    files,
+    folderFilter,
+    folderInfoByName,
     planFilter,
     quotaFilter,
+    quickStatusFilter,
     savedAtByName,
     search,
     sortMode,
-    typeFilter,
+    sourceModelFilter,
     compareUsageMetric,
   ]);
 
-  const displayedFiles = useMemo(() => {
-    if (!checking || !checkViewSnapshot || checkViewSnapshot.length === 0) {
-      return filteredFiles;
-    }
-    const order = new Map(checkViewSnapshot.map((name, index) => [name, index]));
-    return filteredFiles
-      .filter((file) => order.has(file.name))
-      .slice()
-      .sort((left, right) => (order.get(left.name) ?? 0) - (order.get(right.name) ?? 0));
-  }, [checkViewSnapshot, checking, filteredFiles]);
+  const filteredFiles = useMemo(() => filterAndSortFiles(files), [files, filterAndSortFiles]);
+  const displayedFiles = useMemo(
+    () =>
+      viewMode === 'folder' && activeFolder
+        ? filteredFiles.filter((file) => getFileFolder(file) === activeFolder)
+        : filteredFiles,
+    [activeFolder, filteredFiles, viewMode]
+  );
 
   const selectedSet = useMemo(() => new Set(selectedNames), [selectedNames]);
-  const totalPages = Math.max(1, Math.ceil(displayedFiles.length / pageSize));
+  const folderGroups = useMemo(() => {
+    const groups = new Map<string, AuthFileItem[]>();
+    filteredFiles.forEach((file) => {
+      const folder = getFileFolder(file);
+      const items = groups.get(folder) || [];
+      items.push(file);
+      groups.set(folder, items);
+    });
+    return Array.from(groups.entries())
+      .map(([folder, items]) => {
+        const byCode = new Map<number, number>();
+        let successCount = 0;
+        let checkingCount = 0;
+        let unchecked = 0;
+        let unsupported = 0;
+        let unknownError = 0;
+        items.forEach((file) => {
+          const result = checkResults[file.name];
+          if (result?.status === 'loading') {
+            checkingCount += 1;
+            return;
+          }
+          if (!result || result.status === 'idle') {
+            unchecked += 1;
+            return;
+          }
+          if (result.status === 'unsupported') {
+            unsupported += 1;
+            return;
+          }
+          if (typeof result.statusCode === 'number') {
+            byCode.set(result.statusCode, (byCode.get(result.statusCode) ?? 0) + 1);
+            if (result.statusCode >= 200 && result.statusCode < 300) {
+              successCount += 1;
+            }
+            return;
+          }
+          if (result.status === 'success') {
+            successCount += 1;
+            return;
+          }
+          if (result.status === 'error') {
+            unknownError += 1;
+          } else {
+            unchecked += 1;
+          }
+        });
+        return {
+          folder,
+          info: folderInfoByName.get(folder),
+          items,
+          stats: {
+            codes: Array.from(byCode.entries()).sort(([left], [right]) => left - right),
+            success: successCount,
+            checking: checkingCount,
+            unchecked,
+            unsupported,
+            unknownError,
+          },
+        };
+      })
+      .sort((left, right) => {
+        const successDiff = right.stats.success - left.stats.success;
+        if (successDiff !== 0) return successDiff;
+        const sizeDiff = right.items.length - left.items.length;
+        if (sizeDiff !== 0) return sizeDiff;
+        return left.folder.localeCompare(right.folder);
+      });
+  }, [checkResults, filteredFiles, folderInfoByName]);
+
+  const isFolderOverview = viewMode === 'folder' && !activeFolder;
+  const paginatedItemCount = isFolderOverview ? folderGroups.length : displayedFiles.length;
+  const totalPages = Math.max(1, Math.ceil(paginatedItemCount / pageSize));
   const currentPage = Math.min(page, totalPages);
   const pageStart = (currentPage - 1) * pageSize;
   const pageItems = displayedFiles.slice(pageStart, pageStart + pageSize);
-  const visibleSelectedCount = pageItems.filter((file) => selectedSet.has(file.name)).length;
-  const allVisibleSelected = pageItems.length > 0 && visibleSelectedCount === pageItems.length;
+  const folderPageGroups = isFolderOverview
+    ? folderGroups.slice(pageStart, pageStart + pageSize)
+    : folderGroups;
+  const visibleSelectionFiles = isFolderOverview
+    ? folderPageGroups.flatMap((group) => group.items)
+    : pageItems;
+  const visibleSelectedCount = visibleSelectionFiles.filter((file) =>
+    selectedSet.has(file.name)
+  ).length;
+  const allVisibleSelected =
+    visibleSelectionFiles.length > 0 && visibleSelectedCount === visibleSelectionFiles.length;
   const filteredSelectedCount = displayedFiles.filter((file) => selectedSet.has(file.name)).length;
   const allFilteredSelected =
     displayedFiles.length > 0 && filteredSelectedCount === displayedFiles.length;
@@ -1066,19 +1448,38 @@ export function AccountPoolPage() {
     () => files.filter((file) => selectedSet.has(file.name)),
     [files, selectedSet]
   );
-  const passedFiles = useMemo(
-    () => files.filter((file) => checkResults[file.name]?.status === 'success'),
-    [checkResults, files]
+  const currentActionFiles = useMemo(
+    () => (selectedFiles.length > 0 ? selectedFiles : displayedFiles),
+    [displayedFiles, selectedFiles]
   );
+  const currentActionLabel = selectedFiles.length > 0 ? '选中' : '筛选';
+  const currentActionCount = currentActionFiles.length;
+  const currentActionDescription =
+    selectedFiles.length > 0
+      ? `当前手动选中的 ${currentActionCount} 个账号`
+      : `当前筛选结果中的 ${currentActionCount} 个账号`;
+  const statusStatsSourceFiles = useMemo(
+    () =>
+      viewMode === 'folder' && activeFolder
+        ? files.filter((file) => getFileFolder(file) === activeFolder)
+        : files,
+    [activeFolder, files, viewMode]
+  );
+
   const statusCodeStats = useMemo(() => {
     const byCode = new Map<number, number>();
+    let checkingCount = 0;
     let unchecked = 0;
     let unsupported = 0;
     let unknownError = 0;
 
-    for (const file of files) {
+    for (const file of statusStatsSourceFiles) {
       const result = checkResults[file.name];
-      if (!result || result.status === 'loading') {
+      if (result?.status === 'loading') {
+        checkingCount += 1;
+        continue;
+      }
+      if (!result || result.status === 'idle') {
         unchecked += 1;
         continue;
       }
@@ -1099,25 +1500,32 @@ export function AccountPoolPage() {
 
     return {
       codes: Array.from(byCode.entries()).sort(([left], [right]) => left - right),
+      checking: checkingCount,
       unchecked,
       unsupported,
       unknownError,
     };
-  }, [checkResults, files]);
+  }, [checkResults, statusStatsSourceFiles]);
 
-  const displayedStatusCodeStats =
-    checking && statusStatsSnapshot ? statusStatsSnapshot : statusCodeStats;
+  const displayedStatusCodeStats = statusCodeStats;
+  const applyStatusFilter = (filter: string) => {
+    setCheckStatusFilter(DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER);
+    setQuickStatusFilter((current) =>
+      current === filter ? DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER : filter
+    );
+    setPage(1);
+  };
   const syncProgressPercent = syncProgress?.total
     ? Math.round((syncProgress.processed / syncProgress.total) * 100)
     : 0;
   const syncPhaseLabel = syncProgress
     ? syncProgress.phase === 'listing'
-      ? t('account_pool.sync_phase_listing', { defaultValue: '读取账号池' })
+      ? t('account_pool.refresh_phase_listing', { defaultValue: '读取账号池' })
       : syncProgress.phase === 'saving'
-        ? t('account_pool.sync_phase_saving', { defaultValue: '保存账号池' })
+        ? t('account_pool.refresh_phase_saving', { defaultValue: '保存账号池' })
         : syncProgress.phase === 'done'
-          ? t('account_pool.sync_phase_done', { defaultValue: '同步完成' })
-          : t('account_pool.sync_phase_syncing', { defaultValue: '同步中' })
+          ? t('account_pool.refresh_phase_done', { defaultValue: '刷新完成' })
+          : t('account_pool.refresh_phase_syncing', { defaultValue: '刷新中' })
     : '';
 
   useEffect(() => {
@@ -1128,14 +1536,13 @@ export function AccountPoolPage() {
 
   useEffect(() => {
     setPage(1);
-  }, [checkStatusFilter, planFilter, quotaFilter, search, sortMode, typeFilter]);
+  }, [checkStatusFilter, folderFilter, planFilter, quickStatusFilter, quotaFilter, search, sortMode, sourceModelFilter]);
 
   useEffect(() => {
-    if (!checking) {
-      setCheckViewSnapshot(null);
-      setStatusStatsSnapshot(null);
+    if (viewMode !== 'folder') {
+      setActiveFolder(null);
     }
-  }, [checking]);
+  }, [viewMode]);
 
   const commitPageSizeInput = (rawValue: string) => {
     const trimmed = rawValue.trim();
@@ -1223,7 +1630,7 @@ export function AccountPoolPage() {
   const toggleVisible = (checked: boolean) => {
     setSelectedNames((current) => {
       const next = new Set(current);
-      pageItems.forEach((file) => {
+      visibleSelectionFiles.forEach((file) => {
         if (checked) {
           next.add(file.name);
         } else {
@@ -1238,6 +1645,20 @@ export function AccountPoolPage() {
     setSelectedNames((current) => {
       const next = new Set(current);
       displayedFiles.forEach((file) => {
+        if (checked) {
+          next.add(file.name);
+        } else {
+          next.delete(file.name);
+        }
+      });
+      return Array.from(next);
+    });
+  };
+
+  const toggleFolder = (items: AuthFileItem[], checked: boolean) => {
+    setSelectedNames((current) => {
+      const next = new Set(current);
+      items.forEach((file) => {
         if (checked) {
           next.add(file.name);
         } else {
@@ -1263,20 +1684,53 @@ export function AccountPoolPage() {
     }
   };
 
-  const handleDownloadSelected = async () => {
-    if (selectedFiles.length === 0) return;
+  const openConfigViewer = async (file: AuthFileItem) => {
+    setConfigViewerOpen(true);
+    setConfigViewerName(file.name);
+    setConfigViewerContent('');
+    setConfigViewerError('');
+    setConfigViewerLoading(true);
+    try {
+      const rawContent = await readAccountPoolFileContent(file.name);
+      let displayContent = rawContent;
+      try {
+        displayContent = JSON.stringify(JSON.parse(rawContent), null, 2);
+      } catch {
+        // Keep non-JSON content readable instead of failing the viewer.
+      }
+      setConfigViewerContent(displayContent);
+      setFileContentCache((current) => ({
+        ...current,
+        [file.name]: rawContent,
+      }));
+    } catch (err) {
+      setConfigViewerError(err instanceof Error ? err.message : '读取配置失败');
+    } finally {
+      setConfigViewerLoading(false);
+    }
+  };
+
+  const closeConfigViewer = () => {
+    setConfigViewerOpen(false);
+    setConfigViewerName('');
+    setConfigViewerContent('');
+    setConfigViewerError('');
+    setConfigViewerLoading(false);
+  };
+
+  const downloadAccountPoolFiles = async (targets: AuthFileItem[], label: string) => {
+    if (targets.length === 0) return;
     setDownloading(true);
     try {
-      const zipFiles = await Promise.all(
-        selectedFiles.map(async (file) => ({
-          name: file.name,
-          text: await readAccountPoolFileContent(file.name),
-        }))
+      const zipBlob = await authFilesApi.downloadAccountPoolArchiveForNames(
+        targets.map((file) => file.name)
       );
-      const zipBlob = createZipBlob(zipFiles);
       downloadBlob({ filename: buildDownloadFileName(), blob: zipBlob });
       showNotification(
-        t('account_pool.download_success', { count: selectedFiles.length }),
+        t('account_pool.download_success', {
+          count: targets.length,
+          defaultValue: `已下载${label} ${targets.length} 个账号`,
+        }),
         'success'
       );
     } catch (err: unknown) {
@@ -1287,18 +1741,8 @@ export function AccountPoolPage() {
     }
   };
 
-  const handleDownloadServerArchive = async () => {
-    setDownloadingArchive(true);
-    try {
-      const blob = await authFilesApi.downloadAccountPoolArchive();
-      downloadBlob({ filename: buildDownloadFileName(), blob });
-      showNotification(t('account_pool.download_archive_success'), 'success');
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : t('common.unknown_error');
-      showNotification(t('account_pool.download_failed', { message }), 'error');
-    } finally {
-      setDownloadingArchive(false);
-    }
+  const handleDownloadCurrent = async () => {
+    await downloadAccountPoolFiles(currentActionFiles, currentActionLabel);
   };
 
   const handleImportAccountPoolFiles = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1307,8 +1751,24 @@ export function AccountPoolPage() {
     if (uploadFiles.length === 0 || importingPool) return;
     setImportingPool(true);
     try {
-      const result = await authFilesApi.uploadAccountPoolFiles(uploadFiles);
-      await syncFiles(false);
+      const { importable, skipped } = await filterImportableAccountPoolFiles(uploadFiles);
+      if (importable.length === 0) {
+        showNotification(`未发现可导入文件，已剔除 ${skipped} 个文件`, 'warning');
+        return;
+      }
+      const result = await authFilesApi.uploadAccountPoolFiles(importable);
+      if (result.job?.id) {
+        setImportJob(result.job);
+        window.localStorage.setItem(ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY, result.job.id);
+        showNotification(`账号池后台导入已开始：${result.job.total} 个文件`, 'success');
+        void pollAccountPoolImportJob(result.job.id);
+        if (skipped > 0) {
+          showNotification(`已自动剔除 ${skipped} 个不可导入文件`, 'warning');
+        }
+        return;
+      }
+      await refreshPool(false);
+      await loadFolderInfos();
       showNotification(
         result.failed.length > 0
           ? t('account_pool.import_partial', {
@@ -1322,6 +1782,9 @@ export function AccountPoolPage() {
             }),
         result.failed.length > 0 ? 'warning' : 'success'
       );
+      if (skipped > 0) {
+        showNotification(`已自动剔除 ${skipped} 个不可导入文件`, 'warning');
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('common.unknown_error');
       showNotification(
@@ -1333,6 +1796,69 @@ export function AccountPoolPage() {
       );
     } finally {
       setImportingPool(false);
+    }
+  };
+
+  const editFolderSourceInfo = (folder: string) => {
+    const current = folderInfoByName.get(folder);
+    setSourceEditorFolder(folder);
+    setSourceEditorModel(current?.source_model || '');
+    setSourceEditorInfo(current?.source_info || '');
+    setSourceEditorOpen(true);
+  };
+
+  const closeSourceEditor = () => {
+    if (savingSourceInfo) return;
+    setSourceEditorOpen(false);
+  };
+
+  const saveFolderSourceInfo = async () => {
+    if (!sourceEditorFolder || savingSourceInfo) return;
+    setSavingSourceInfo(true);
+    const folder = sourceEditorFolder;
+    const sourceModel = sourceEditorModel.trim();
+    const sourceInfo = sourceEditorInfo.trim();
+    try {
+      await authFilesApi.updateAccountPoolFolder({
+        folder,
+        source_model: sourceModel,
+        source_info: sourceInfo,
+      });
+      setFolderInfos((current) => {
+        const now = new Date().toISOString();
+        const existing = current.find((item) => item.folder === folder);
+        if (existing) {
+          return current.map((item) =>
+            item.folder === folder
+              ? {
+                  ...item,
+                  source_model: sourceModel,
+                  source_info: sourceInfo,
+                  updated_at: now,
+                }
+              : item
+          );
+        }
+        const count = files.filter((file) => getFileFolder(file) === folder).length;
+        return [
+          ...current,
+          {
+            folder,
+            source_model: sourceModel,
+            source_info: sourceInfo,
+            count,
+            created_at: now,
+            updated_at: now,
+          },
+        ];
+      });
+      setSourceEditorOpen(false);
+      showNotification('来源信息已保存', 'success');
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : t('common.unknown_error');
+      showNotification(`保存来源信息失败：${message}`, 'error');
+    } finally {
+      setSavingSourceInfo(false);
     }
   };
 
@@ -1350,6 +1876,24 @@ export function AccountPoolPage() {
 
       const nextRecords = deleteAccountPoolRecordsByName(names);
       applyRecords(nextRecords);
+      const deletedNames = new Set(names);
+      const deletedEmails = new Set(
+        targets
+          .map((file) => getAccountPoolEmail(file, fileContentCache))
+          .filter(Boolean)
+      );
+      setUsageSummaries((current) =>
+        current.filter((summary) => {
+          const authID = String(summary.auth_id || '').trim();
+          const authIndex = String(summary.auth_index || '').trim();
+          const email = String(summary.service_email || '').trim().toLowerCase();
+          return !(
+            deletedNames.has(authID) ||
+            deletedNames.has(authIndex) ||
+            (email && deletedEmails.has(email))
+          );
+        })
+      );
       showNotification(
         backendDeleteFailed
           ? t('account_pool.delete_local_success_backend_failed', {
@@ -1382,57 +1926,57 @@ export function AccountPoolPage() {
     });
   };
 
-  const overwriteAccountFiles = async (targets: AuthFileItem[], mode: 'passed' | 'filtered') => {
-    if (targets.length === 0 || overwritingPassed) return;
-    setOverwritingPassed(true);
+  const overwriteAccountFiles = async (targets: AuthFileItem[]) => {
+    if (targets.length === 0 || activeWriteAction) return;
+    setActiveWriteAction('overwrite-current');
     try {
-      const uploadFiles = await Promise.all(
-        targets.map(async (file) => {
-          const content = await readAccountPoolFileContent(file.name);
-          return new File([content], file.name, { type: 'application/json' });
-        })
+      const result = await authFilesApi.writeAccountPoolToAuthFiles(
+        targets.map((file) => file.name),
+        true
       );
-      await authFilesApi.deleteAll(
-        Math.max(files.length, targets.length),
-        files.map((file) => file.name)
-      );
-      const result = await authFilesApi.uploadFiles(uploadFiles);
       if (result.failed.length > 0) {
         showNotification(
-          t(`account_pool.overwrite_${mode}_partial`, {
+          t('account_pool.overwrite_current_partial', {
             success: result.uploaded,
             failed: result.failed.length,
+            defaultValue: `覆盖部分完成：成功 ${result.uploaded}，失败 ${result.failed.length}`,
           }),
           'warning'
         );
         return;
       }
       showNotification(
-        t(`account_pool.overwrite_${mode}_success`, { count: result.uploaded }),
+        t('account_pool.overwrite_current_success', {
+          count: result.uploaded,
+          defaultValue: `已覆盖 ${result.uploaded} 个账号到认证文件`,
+        }),
         'success'
       );
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('common.unknown_error');
-      showNotification(t(`account_pool.overwrite_${mode}_failed`, { message }), 'error');
+      showNotification(
+        t('account_pool.overwrite_current_failed', {
+          message,
+          defaultValue: `覆盖失败：${message}`,
+        }),
+        'error'
+      );
     } finally {
-      setOverwritingPassed(false);
+      setActiveWriteAction(null);
     }
   };
 
-  const appendAccountFiles = async (targets: AuthFileItem[], mode: 'passed' | 'filtered') => {
-    if (targets.length === 0 || overwritingPassed) return;
-    setOverwritingPassed(true);
+  const appendAccountFiles = async (targets: AuthFileItem[]) => {
+    if (targets.length === 0 || activeWriteAction) return;
+    setActiveWriteAction('append-current');
     try {
-      const uploadFiles = await Promise.all(
-        targets.map(async (file) => {
-          const content = await readAccountPoolFileContent(file.name);
-          return new File([content], file.name, { type: 'application/json' });
-        })
+      const result = await authFilesApi.writeAccountPoolToAuthFiles(
+        targets.map((file) => file.name),
+        false
       );
-      const result = await authFilesApi.uploadFiles(uploadFiles);
       if (result.failed.length > 0) {
         showNotification(
-          t(`account_pool.append_${mode}_partial`, {
+          t('account_pool.append_current_partial', {
             success: result.uploaded,
             failed: result.failed.length,
             defaultValue: `追加部分完成：成功 ${result.uploaded}，失败 ${result.failed.length}`,
@@ -1442,7 +1986,7 @@ export function AccountPoolPage() {
         return;
       }
       showNotification(
-        t(`account_pool.append_${mode}_success`, {
+        t('account_pool.append_current_success', {
           count: result.uploaded,
           defaultValue: `已追加 ${result.uploaded} 个账号到认证文件`,
         }),
@@ -1451,89 +1995,78 @@ export function AccountPoolPage() {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('common.unknown_error');
       showNotification(
-        t(`account_pool.append_${mode}_failed`, {
+        t('account_pool.append_current_failed', {
           message,
           defaultValue: `追加失败：${message}`,
         }),
         'error'
       );
     } finally {
-      setOverwritingPassed(false);
+      setActiveWriteAction(null);
     }
   };
 
-  const handleOverwritePassed = () => {
-    if (passedFiles.length === 0) return;
+  const handleOverwriteCurrent = () => {
+    if (currentActionFiles.length === 0) return;
     showConfirmation({
-      title: t('account_pool.overwrite_passed_title'),
-      message: t('account_pool.overwrite_passed_confirm', { count: passedFiles.length }),
-      confirmText: t('common.confirm'),
-      variant: 'danger',
-      onConfirm: () => void overwriteAccountFiles(passedFiles, 'passed'),
-    });
-  };
-
-  const handleOverwriteFiltered = () => {
-    if (displayedFiles.length === 0) return;
-    showConfirmation({
-      title: t('account_pool.overwrite_filtered_title', {
-        defaultValue: '覆盖筛选结果',
-      }),
-      message: t('account_pool.overwrite_filtered_confirm', {
-        count: displayedFiles.length,
-        defaultValue: `确认先删除当前所有认证文件，再写入 ${displayedFiles.length} 个筛选结果中的账号 JSON？账号池缓存不会被删除。`,
+      title: '覆盖到认证文件',
+      message: t('account_pool.overwrite_current_confirm', {
+        count: currentActionFiles.length,
+        defaultValue: `确认先删除当前所有认证文件，再写入${currentActionDescription}？账号池缓存不会被删除。`,
       }),
       confirmText: t('common.confirm'),
       variant: 'danger',
-      onConfirm: () => void overwriteAccountFiles(displayedFiles, 'filtered'),
+      onConfirm: () => void overwriteAccountFiles(currentActionFiles),
     });
   };
 
-  const handleAppendPassed = () => {
-    if (passedFiles.length === 0) return;
+  const handleAppendCurrent = () => {
+    if (currentActionFiles.length === 0) return;
     showConfirmation({
-      title: t('account_pool.append_passed_title', { defaultValue: '追加通过账号' }),
-      message: t('account_pool.append_passed_confirm', {
-        count: passedFiles.length,
-        defaultValue: `确认将 ${passedFiles.length} 个检测通过的账号 JSON 追加到认证文件？现有认证文件不会删除。`,
+      title: '追加到认证文件',
+      message: t('account_pool.append_current_confirm', {
+        count: currentActionFiles.length,
+        defaultValue: `确认将${currentActionDescription}追加到认证文件？现有认证文件不会删除。`,
       }),
       confirmText: t('common.confirm'),
-      onConfirm: () => void appendAccountFiles(passedFiles, 'passed'),
-    });
-  };
-
-  const handleAppendFiltered = () => {
-    if (displayedFiles.length === 0) return;
-    showConfirmation({
-      title: t('account_pool.append_filtered_title', { defaultValue: '追加筛选结果' }),
-      message: t('account_pool.append_filtered_confirm', {
-        count: displayedFiles.length,
-        defaultValue: `确认将 ${displayedFiles.length} 个筛选结果账号 JSON 追加到认证文件？现有认证文件不会删除。`,
-      }),
-      confirmText: t('common.confirm'),
-      onConfirm: () => void appendAccountFiles(displayedFiles, 'filtered'),
+      onConfirm: () => void appendAccountFiles(currentActionFiles),
     });
   };
 
   const detectAccounts = async (targets: AuthFileItem[]) => {
     if (targets.length === 0 || checking) return;
-    const checkTargets = targets;
-    void syncAccountPoolFromAuthFiles(checkConcurrency)
-      .then((freshRecords) => {
-        if (!useAccountPoolCheckStore.getState().checking) {
-          applyRecords(freshRecords);
+    let checkTargets = targets;
+    const unsupportedTargets = targets.filter((file) => !resolveQuotaConfig(file));
+    if (unsupportedTargets.length > 0) {
+      try {
+        const targetNames = new Set(targets.map((file) => file.name));
+        const targetFolders = new Set(unsupportedTargets.map(getFileFolder));
+        const repairResult = await authFilesApi.repairAccountPoolEntries();
+        if (repairResult.repaired) {
+          const repairedRecords = await refreshAccountPoolFromServer(checkConcurrency);
+          applyRecords(repairedRecords);
+          checkTargets = repairedRecords
+            .map((record) => record.file)
+            .filter((file) => {
+              if (!resolveQuotaConfig(file)) return false;
+              return targetNames.has(file.name) || targetFolders.has(getFileFolder(file));
+            });
+          showNotification(
+            `已自动修复账号池：Sub2 转 CPA ${repairResult.convertedSub2} 个，补全 Codex ${repairResult.inferredCodex} 个，大模型修复 ${repairResult.llmRepaired} 个`,
+            repairResult.llmFailed > 0 ? 'warning' : 'success'
+          );
         }
-      })
-      .catch(() => {
-        // Background sync is best-effort; detection should start immediately.
-      });
+      } catch (err) {
+        showNotification(
+          `自动修复不支持账号失败：${err instanceof Error ? err.message : t('common.unknown_error')}`,
+          'warning'
+        );
+      }
+    }
+    if (checkTargets.length === 0) return;
 
-    setCheckViewSnapshot(checkTargets.map((file) => file.name));
-    setStatusStatsSnapshot(statusCodeStats);
     const runId = beginCheck(checkTargets.map((file) => file.name));
     if (!runId) {
-      setCheckViewSnapshot(null);
-      setStatusStatsSnapshot(null);
       return;
     }
     const signal = getRunSignal(runId);
@@ -1557,7 +2090,7 @@ export function AccountPoolPage() {
           throw new DOMException('Account pool check aborted', 'AbortError');
         }
         try {
-          const quota = await config.fetchQuota(file, t, signal);
+          const quota = await fetchQuotaForAccountPool(config, file, t, signal);
           const quotaSummary = getQuotaSummary(quota, t);
           return {
             status: 'success',
@@ -1604,20 +2137,20 @@ export function AccountPoolPage() {
         try {
           const result = await checkOne(file);
           if (signal?.aborted || isRunCancelled(runId)) return;
-          setCheckResult(runId, file.name, result, hashByName.get(file.name));
+          const hash = hashByName.get(file.name);
+          setCheckResult(runId, file.name, result, hash);
+          queueRemoteCheckResult(file, result, hash);
         } catch (err: unknown) {
           if (isAbortError(err) || signal?.aborted || isRunCancelled(runId)) return;
-          setCheckResult(
-            runId,
-            file.name,
-            {
-              status: 'error',
-              message: err instanceof Error ? err.message : t('common.unknown_error'),
-              statusCode: getAccountPoolCheckErrorStatus(err),
-              checkedAt: Date.now(),
-            },
-            hashByName.get(file.name)
-          );
+          const result: AccountCheckResult = {
+            status: 'error',
+            message: err instanceof Error ? err.message : t('common.unknown_error'),
+            statusCode: getAccountPoolCheckErrorStatus(err),
+            checkedAt: Date.now(),
+          };
+          const hash = hashByName.get(file.name);
+          setCheckResult(runId, file.name, result, hash);
+          queueRemoteCheckResult(file, result, hash);
         }
       }
     };
@@ -1627,6 +2160,7 @@ export function AccountPoolPage() {
         Array.from({ length: Math.min(checkConcurrency, checkTargets.length) }, () => worker())
       );
       if (signal?.aborted || isRunCancelled(runId)) return;
+      await flushRemoteCheckResults();
       const summary = finishCheck(runId);
       if (!summary) return;
       showNotification(
@@ -1639,6 +2173,7 @@ export function AccountPoolPage() {
       );
     } catch {
       if (signal?.aborted || isRunCancelled(runId)) return;
+      await flushRemoteCheckResults();
       const summary = finishCheck(runId);
       if (summary) {
         showNotification(
@@ -1671,7 +2206,10 @@ export function AccountPoolPage() {
       }),
       'info'
     );
-    void detectAccounts(targets);
+    const resumeTimer = window.setTimeout(() => {
+      void detectAccounts(targets);
+    }, 2500);
+    return () => window.clearTimeout(resumeTimer);
   }, [checking, files, loading, resumedPendingCheck, showNotification, t]);
 
   const interruptCheck = () => {
@@ -1687,7 +2225,146 @@ export function AccountPoolPage() {
     );
   };
 
+  const renderPoolCard = (file: AuthFileItem) => {
+    const checked = selectedSet.has(file.name);
+    const type = getFileType(file);
+    const folder = getFileFolder(file);
+    const modifiedLabel = getFileModifiedLabel(file);
+    const statusMessage = String(file.statusMessage || file['status_message'] || '');
+    const checkResult = checkResults[file.name];
+    const usageSummary = getAccountUsageSummary(
+      file,
+      fileContentCache,
+      usageSummaryByEmail,
+      usageSummaryByAuthID
+    );
+    const planLabel = getPlanLabel(checkResult?.plan);
+    const checkedAtLabel = checkResult?.checkedAt
+      ? formatUnixTimestamp(Math.round(checkResult.checkedAt / 1000))
+      : '';
+    const quotaDetails = (checkResult?.quotaLines ?? []).map(parseQuotaDetail);
+    const showStatusMessage =
+      Boolean(statusMessage) &&
+      (!checkResult || (checkResult.status !== 'success' && checkResult.status !== 'loading'));
+    return (
+      <div
+        key={file.name}
+        className={`${styles.poolCard} ${checked ? styles.poolCardSelected : ''}`}
+      >
+        <div className={styles.cardTop}>
+          <SelectionCheckbox
+            checked={checked}
+            onChange={(value) => toggleOne(file.name, value)}
+            ariaLabel={file.name}
+          />
+          <div className={styles.cardMain}>
+            <button
+              type="button"
+              className={styles.fileNameButton}
+              onClick={() => void openConfigViewer(file)}
+              title="查看账号配置"
+            >
+              {file.name}
+            </button>
+            <div className={styles.metaRow}>
+              <span className={styles.typeBadge}>{type}</span>
+              <span className={styles.folderBadge}>{folder}</span>
+              {planLabel && <span className={styles.planBadge}>{planLabel}</span>}
+              {modifiedLabel && <span className={styles.muted}>{modifiedLabel}</span>}
+            </div>
+            <div className={styles.usageMetricRow}>
+              <div className={styles.usageMetric}>
+                <span className={styles.usageMetricLabel}>
+                  {t('account_pool.usage_requests', { defaultValue: '请求' })}
+                </span>
+                <strong className={styles.usageMetricValue}>{formatUsageMetric(usageSummary?.requests)}</strong>
+              </div>
+              <div className={styles.usageMetric}>
+                <span className={styles.usageMetricLabel}>
+                  {t('account_pool.usage_successes', { defaultValue: '成功' })}
+                </span>
+                <strong className={styles.usageMetricValue}>{formatUsageMetric(usageSummary?.successes)}</strong>
+              </div>
+              <div className={styles.usageMetric}>
+                <span className={styles.usageMetricLabel}>
+                  {t('account_pool.usage_total_tokens', { defaultValue: 'Token' })}
+                </span>
+                <strong className={styles.usageMetricValue}>{formatUsageMetric(usageSummary?.total_tokens)}</strong>
+              </div>
+              <div className={styles.usageMetric}>
+                <span className={styles.usageMetricLabel}>
+                  {t('account_pool.usage_failures', { defaultValue: '失败' })}
+                </span>
+                <strong className={styles.usageMetricValue}>{formatUsageMetric(usageSummary?.failures)}</strong>
+              </div>
+            </div>
+          </div>
+        </div>
+        {checkResult && (
+          <div
+            className={`${styles.checkLine} ${
+              checkResult.status === 'success'
+                ? styles.checkSuccess
+                : checkResult.status === 'loading'
+                  ? styles.checkLoading
+                  : checkResult.status === 'unsupported'
+                    ? styles.checkUnsupported
+                    : styles.checkError
+            }`}
+          >
+            <div className={styles.checkHeader}>
+              <span className={styles.checkStatusPill}>
+                {checkResult.status === 'loading' ? t('account_pool.checking') : checkResult.message}
+              </span>
+              {planLabel && <span className={styles.checkPlanPill}>{planLabel}</span>}
+              {checkedAtLabel && <span className={styles.checkTime}>{checkedAtLabel}</span>}
+            </div>
+            {quotaDetails.length > 0 && (
+              <div className={styles.quotaPanel}>
+                {quotaDetails.map((quota) => {
+                  const percent =
+                    typeof quota.percent === 'number'
+                      ? Math.max(0, Math.min(100, quota.percent))
+                      : null;
+                  const empty = percent !== null && percent <= 0;
+                  const low =
+                    percent !== null && percent > 0 && percent <= LOW_ACCOUNT_POOL_QUOTA_PERCENT;
+                  return (
+                    <div
+                      className={empty ? styles.quotaItemEmpty : styles.quotaItem}
+                      key={`${quota.label}-${quota.reset}`}
+                    >
+                      <div className={styles.quotaItemTop}>
+                        <span className={styles.quotaName}>{quota.label}</span>
+                        <span className={empty ? styles.quotaEmptyValue : low ? styles.quotaLowValue : styles.quotaValue}>
+                          {quota.remaining}
+                        </span>
+                      </div>
+                      {percent !== null && (
+                        <div className={styles.quotaTrack}>
+                          <span
+                            className={empty ? styles.quotaFillEmpty : low ? styles.quotaFillLow : styles.quotaFill}
+                            style={{ width: `${percent}%` }}
+                          />
+                        </div>
+                      )}
+                      {quota.reset && (
+                        <div className={styles.quotaReset}>{formatQuotaResetMeta(t, quota.reset)}</div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+        {showStatusMessage && <div className={styles.statusLine}>{statusMessage}</div>}
+      </div>
+    );
+  };
+
   return (
+    <>
     <div className={styles.container}>
       <div className={styles.pageHeader}>
         <div className={styles.headerIntro}>
@@ -1699,171 +2376,220 @@ export function AccountPoolPage() {
           aria-label={t('account_pool.status_stats', { defaultValue: '状态码统计' })}
         >
           {displayedStatusCodeStats.codes.map(([code, count]) => (
-            <span
-              className={getStatusCodePillClassName(code, styles)}
+            <button
+              type="button"
+              className={`${getStatusCodePillClassName(code, styles)} ${
+                quickStatusFilter === `code:${code}` ? styles.statPillActive : ''
+              }`}
               key={code}
               title={`${code}：${getStatusCodeDescription(code)}`}
+              onClick={() => applyStatusFilter(`code:${code}`)}
             >
               {code}
               <strong>{count}</strong>
-            </span>
+            </button>
           ))}
           {displayedStatusCodeStats.unknownError > 0 && (
-            <span
-              className={`${styles.statPill} ${styles.statPillError}`}
+            <button
+              type="button"
+              className={`${styles.statPill} ${styles.statPillError} ${
+                quickStatusFilter === 'error' ? styles.statPillActive : ''
+              }`}
               title="未知错误：检测过程抛出了错误，但没有拿到明确的 HTTP 状态码。"
+              onClick={() => applyStatusFilter('error')}
             >
               {t('account_pool.stat_unknown_error', { defaultValue: '未知错误' })}
               <strong>{displayedStatusCodeStats.unknownError}</strong>
-            </span>
+            </button>
           )}
           {displayedStatusCodeStats.unsupported > 0 && (
-            <span className={styles.statPill} title="不支持：该认证文件类型暂未接入额度检测逻辑。">
+            <button
+              type="button"
+              className={`${styles.statPill} ${
+                quickStatusFilter === 'unsupported' ? styles.statPillActive : ''
+              }`}
+              title="不支持：该认证文件类型暂未接入额度检测逻辑。"
+              onClick={() => applyStatusFilter('unsupported')}
+            >
               {t('account_pool.stat_unsupported', { defaultValue: '不支持' })}
               <strong>{displayedStatusCodeStats.unsupported}</strong>
-            </span>
+            </button>
+          )}
+          {displayedStatusCodeStats.checking > 0 && (
+            <button
+              type="button"
+              className={`${styles.statPill} ${
+                quickStatusFilter === 'checking' ? styles.statPillActive : ''
+              }`}
+              title="检测中：该账号已经进入后台检测队列，正在等待或执行检测。"
+              onClick={() => applyStatusFilter('checking')}
+            >
+              {t('account_pool.stat_checking', { defaultValue: '检测中' })}
+              <strong>{displayedStatusCodeStats.checking}</strong>
+            </button>
           )}
           {displayedStatusCodeStats.unchecked > 0 && (
-            <span className={styles.statPill} title="未检测：该账号还没有执行过检测，或当前正在等待检测结果。">
+            <button
+              type="button"
+              className={`${styles.statPill} ${
+                quickStatusFilter === 'unchecked' ? styles.statPillActive : ''
+              }`}
+              title="未检测：该账号还没有执行过检测。"
+              onClick={() => applyStatusFilter('unchecked')}
+            >
               {t('account_pool.stat_unchecked', { defaultValue: '未检测' })}
               <strong>{displayedStatusCodeStats.unchecked}</strong>
-            </span>
+            </button>
           )}
         </div>
         <div className={styles.headerActions}>
-          <Button variant="secondary" size="sm" onClick={() => void syncFiles()} loading={loading}>
-            {t('account_pool.sync')}
-          </Button>
           <input
             ref={importInputRef}
             type="file"
-            accept=".json,.zip,application/json,application/zip"
+            accept=".json,.zip,.tar,.gz,.tgz,.tar.gz,application/json,application/zip,application/gzip"
             multiple
             hidden
             onChange={handleImportAccountPoolFiles}
           />
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => importInputRef.current?.click()}
-            loading={importingPool}
-            disabled={importingPool}
-          >
-            {t('account_pool.import', { defaultValue: '导入账号池' })}
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => void detectAccounts(selectedFiles)}
-            loading={checking && selectedFiles.length > 0}
-            disabled={checking || selectedFiles.length === 0}
-          >
-            {t('account_pool.check_selected', { count: selectedFiles.length })}
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => void detectAccounts(displayedFiles)}
-            loading={checking && selectedFiles.length === 0 && displayedFiles.length < files.length}
-            disabled={checking || displayedFiles.length === 0}
-          >
-            {t('account_pool.check_filtered', {
-              count: displayedFiles.length,
-              defaultValue: `检测筛选 (${displayedFiles.length})`,
-            })}
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => void detectAccounts(files)}
-            loading={checking && selectedFiles.length === 0 && displayedFiles.length === files.length}
-            disabled={checking || files.length === 0}
-          >
-            {t('account_pool.check_all')}
-          </Button>
-          {checking && (
+          <input
+            ref={importFolderInputRef}
+            type="file"
+            multiple
+            {...({ webkitdirectory: '', directory: '' } as Record<string, string>)}
+            hidden
+            onChange={handleImportAccountPoolFiles}
+          />
+          <div className={styles.viewModeSwitch} aria-label="账号池显示模式">
+            <button
+              type="button"
+              className={viewMode === 'list' ? styles.viewModeActive : ''}
+              onClick={() => {
+                setViewMode('list');
+                setActiveFolder(null);
+                setPage(1);
+              }}
+            >
+              列表模式
+            </button>
+            <button
+              type="button"
+              className={viewMode === 'folder' ? styles.viewModeActive : ''}
+              onClick={() => {
+                setViewMode('folder');
+                setActiveFolder(null);
+                setPage(1);
+              }}
+            >
+              文件夹模式
+            </button>
+          </div>
+          <div className={styles.actionGroup}>
+            <span className={styles.actionGroupLabel}>来源</span>
+            <Button
+              variant="secondary"
+              size="sm"
+              title="重新加载账号池"
+              onClick={() => void refreshPool()}
+              loading={loading}
+            >
+              刷新
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              title="导入 JSON、Sub2 文件、解压文件夹或压缩包，系统会自动识别类型"
+              onClick={() => importInputRef.current?.click()}
+              loading={importingPool}
+              disabled={importingPool}
+            >
+              导入
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              title="导入已经解压出来的文件夹，系统会自动过滤并识别 Sub2/CPA JSON"
+              onClick={() => importFolderInputRef.current?.click()}
+              loading={importingPool}
+              disabled={importingPool}
+            >
+              文件夹
+            </Button>
+          </div>
+          <div className={styles.actionScope}>
+            <span>当前范围</span>
+            <strong>{currentActionCount}</strong>
+            <em>{currentActionLabel}</em>
+          </div>
+          <div className={styles.actionGroup}>
+            <span className={styles.actionGroupLabel}>处理</span>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => void detectAccounts(currentActionFiles)}
+              loading={checking && currentActionFiles.length > 0}
+              disabled={checking || currentActionFiles.length === 0}
+              title={`检测${currentActionDescription}`}
+            >
+              检测
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => void detectAccounts(files)}
+              loading={checking && currentActionFiles.length === files.length}
+              disabled={checking || files.length === 0}
+              title="检测账号池中的全部账号"
+            >
+              检测全部
+            </Button>
+            {checking && (
+              <Button variant="danger" size="sm" title="中断当前后台检测任务" onClick={interruptCheck}>
+                中断
+              </Button>
+            )}
+            <Button
+              size="sm"
+              onClick={() => void handleDownloadCurrent()}
+              loading={downloading}
+              disabled={currentActionFiles.length === 0 || downloading}
+              title={`下载${currentActionDescription}`}
+            >
+              下载
+            </Button>
+          </div>
+          <div className={styles.actionGroupDanger}>
+            <span className={styles.actionGroupLabel}>写回</span>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={handleAppendCurrent}
+              loading={activeWriteAction === 'append-current'}
+              disabled={Boolean(activeWriteAction) || currentActionFiles.length === 0}
+              title={`追加${currentActionDescription}到认证文件`}
+            >
+              追加
+            </Button>
             <Button
               variant="danger"
               size="sm"
-              onClick={interruptCheck}
+              onClick={handleOverwriteCurrent}
+              loading={activeWriteAction === 'overwrite-current'}
+              disabled={Boolean(activeWriteAction) || currentActionFiles.length === 0}
+              title={`用${currentActionDescription}覆盖认证文件`}
             >
-              {t('account_pool.interrupt_check', { defaultValue: '中断检测' })}
+              覆盖
             </Button>
-          )}
-          <Button
-            size="sm"
-            onClick={handleDownloadSelected}
-            loading={downloading}
-            disabled={selectedFiles.length === 0 || downloading}
-          >
-            {t('account_pool.download_selected', { count: selectedFiles.length })}
-          </Button>
-          <Button
-            variant="danger"
-            size="sm"
-            onClick={() => confirmDeletePoolEntries(selectedFiles)}
-            loading={deletingPoolEntries}
-            disabled={deletingPoolEntries || selectedFiles.length === 0}
-          >
-            {t('account_pool.delete_selected', {
-              count: selectedFiles.length,
-              defaultValue: `删除选中 (${selectedFiles.length})`,
-            })}
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => void handleDownloadServerArchive()}
-            loading={downloadingArchive}
-            disabled={downloadingArchive}
-          >
-            {t('account_pool.download_archive')}
-          </Button>
-          <Button
-            variant="danger"
-            size="sm"
-            onClick={handleOverwritePassed}
-            loading={overwritingPassed}
-            disabled={overwritingPassed || passedFiles.length === 0}
-          >
-            {t('account_pool.overwrite_passed', { count: passedFiles.length })}
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={handleAppendPassed}
-            loading={overwritingPassed}
-            disabled={overwritingPassed || passedFiles.length === 0}
-          >
-            {t('account_pool.append_passed', {
-              count: passedFiles.length,
-              defaultValue: `追加通过 (${passedFiles.length})`,
-            })}
-          </Button>
-          <Button
-            variant="danger"
-            size="sm"
-            onClick={handleOverwriteFiltered}
-            loading={overwritingPassed}
-            disabled={overwritingPassed || displayedFiles.length === 0}
-          >
-            {t('account_pool.overwrite_filtered', {
-              count: displayedFiles.length,
-              defaultValue: `覆盖筛选 (${displayedFiles.length})`,
-            })}
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={handleAppendFiltered}
-            loading={overwritingPassed}
-            disabled={overwritingPassed || displayedFiles.length === 0}
-          >
-            {t('account_pool.append_filtered', {
-              count: displayedFiles.length,
-              defaultValue: `追加筛选 (${displayedFiles.length})`,
-            })}
-          </Button>
+            <Button
+              variant="danger"
+              size="sm"
+              onClick={() => confirmDeletePoolEntries(selectedFiles)}
+              loading={deletingPoolEntries}
+              disabled={deletingPoolEntries || selectedFiles.length === 0}
+              title="只删除手动选中的账号池账号，不影响认证文件"
+            >
+              删除 ({selectedFiles.length})
+            </Button>
+          </div>
         </div>
       </div>
 
@@ -1888,9 +2614,32 @@ export function AccountPoolPage() {
             <span>{t('account_pool.sync_added', { count: syncProgress.added, defaultValue: `新增 ${syncProgress.added}` })}</span>
             <span>{t('account_pool.sync_updated', { count: syncProgress.updated, defaultValue: `更新 ${syncProgress.updated}` })}</span>
             <span>{t('account_pool.sync_unchanged', { count: syncProgress.unchanged, defaultValue: `未变 ${syncProgress.unchanged}` })}</span>
-            <span>{t('account_pool.sync_skipped', { count: syncProgress.skipped, defaultValue: `跳过 ${syncProgress.skipped}` })}</span>
+            <span>{t('account_pool.refresh_retained', { count: syncProgress.skipped, defaultValue: `本地保留 ${syncProgress.skipped}` })}</span>
             <span>{t('account_pool.sync_failed', { count: syncProgress.failed, defaultValue: `失败 ${syncProgress.failed}` })}</span>
             <span>{t('account_pool.sync_deduped', { count: syncProgress.deduped, defaultValue: `去重 ${syncProgress.deduped}` })}</span>
+          </div>
+        </div>
+      )}
+
+      {importJob && !isAccountPoolImportDone(importJob) && (
+        <div className={styles.syncProgressPanel}>
+          <div className={styles.syncProgressHeader}>
+            <strong>后台导入账号池</strong>
+            <span>
+              {importJob.done}/{importJob.total || 0}
+              {importJob.total > 0 ? ` · ${Math.round((importJob.done / importJob.total) * 100)}%` : ''}
+            </span>
+          </div>
+          <div className={styles.syncProgressTrack}>
+            <div
+              className={styles.syncProgressBar}
+              style={{ width: `${importJob.total > 0 ? Math.round((importJob.done / importJob.total) * 100) : 8}%` }}
+            />
+          </div>
+          <div className={styles.syncProgressStats}>
+            <span>已导入 {importJob.imported}</span>
+            <span>跳过 {importJob.skipped}</span>
+            <span>失败 {importJob.failed}</span>
           </div>
         </div>
       )}
@@ -1905,13 +2654,23 @@ export function AccountPoolPage() {
                 onChange={(event) => setSearch(event.target.value)}
                 placeholder={t('account_pool.search_placeholder')}
               />
+              {viewMode === 'list' && (
+                <Select
+                  className={styles.folderSelect}
+                  fullWidth={false}
+                  value={folderFilter}
+                  options={folderOptions}
+                  onChange={setFolderFilter}
+                  ariaLabel="来源文件夹"
+                />
+              )}
               <Select
-                className={styles.typeSelect}
+                className={styles.folderSelect}
                 fullWidth={false}
-                value={typeFilter}
-                options={typeOptions}
-                onChange={setTypeFilter}
-                ariaLabel={t('account_pool.type_filter')}
+                value={sourceModelFilter}
+                options={sourceModelOptions}
+                onChange={setSourceModelFilter}
+                ariaLabel="来源模型"
               />
               <Select
                 className={styles.planSelect}
@@ -1926,7 +2685,10 @@ export function AccountPoolPage() {
                 fullWidth={false}
                 value={checkStatusFilter}
                 options={checkStatusOptions}
-                onChange={setCheckStatusFilter}
+                onChange={(value) => {
+                  setCheckStatusFilter(value);
+                  setQuickStatusFilter(DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER);
+                }}
                 ariaLabel={t('account_pool.check_status_filter', { defaultValue: '检测状态' })}
               />
               <Select
@@ -1947,11 +2709,8 @@ export function AccountPoolPage() {
               />
             </div>
             <div className={styles.toolbarMeta}>
-              <span className={styles.stats}>
-                {t('account_pool.stats', { visible: displayedFiles.length, total: files.length })}
-              </span>
               <label className={styles.pageSizeControl}>
-                <span>{t('auth_files.page_size_label')}</span>
+                <span>每页</span>
                 <input
                   className={styles.pageSizeInput}
                   type="number"
@@ -1969,7 +2728,7 @@ export function AccountPoolPage() {
                 />
               </label>
               <label className={styles.pageSizeControl}>
-                <span>{t('account_pool.check_concurrency')}</span>
+                <span>并发</span>
                 <input
                   className={styles.checkConcurrencyInput}
                   type="number"
@@ -1992,7 +2751,7 @@ export function AccountPoolPage() {
             <SelectionCheckbox
               checked={allVisibleSelected}
               onChange={toggleVisible}
-              disabled={pageItems.length === 0}
+              disabled={visibleSelectionFiles.length === 0}
               label={t('account_pool.select_visible')}
             />
             <SelectionCheckbox
@@ -2028,174 +2787,153 @@ export function AccountPoolPage() {
 
         {loading ? (
           <div className={styles.hint}>{t('common.loading')}</div>
-        ) : displayedFiles.length === 0 ? (
+        ) : displayedFiles.length === 0 && (viewMode !== 'folder' || activeFolder) ? (
           <EmptyState
             title={t('account_pool.empty_title')}
             description={t('account_pool.empty_desc')}
           />
-        ) : (
-          <div className={styles.poolGrid}>
-            {pageItems.map((file) => {
-              const checked = selectedSet.has(file.name);
-              const type = getFileType(file);
-              const modifiedLabel = getFileModifiedLabel(file);
-              const statusMessage = String(file.statusMessage || file['status_message'] || '');
-              const checkResult = checkResults[file.name];
-              const usageSummary = getAccountUsageSummary(
-                file,
-                fileContentCache,
-                usageSummaryByEmail,
-                usageSummaryByAuthID
-              );
-              const planLabel = getPlanLabel(checkResult?.plan);
-              const checkedAtLabel = checkResult?.checkedAt
-                ? formatUnixTimestamp(Math.round(checkResult.checkedAt / 1000))
-                : '';
-              const quotaDetails = (checkResult?.quotaLines ?? []).map(parseQuotaDetail);
-              const showStatusMessage =
-                Boolean(statusMessage) &&
-                (!checkResult ||
-                  (checkResult.status !== 'success' && checkResult.status !== 'loading'));
+        ) : viewMode === 'folder' && !activeFolder ? (
+          <div className={styles.folderGroups}>
+            {folderGroups.length === 0 ? (
+              <EmptyState
+                title={t('account_pool.empty_title')}
+                description={t('account_pool.empty_desc')}
+              />
+            ) : folderPageGroups.map((group) => {
+              const selectedCount = group.items.filter((file) => selectedSet.has(file.name)).length;
+              const allSelected = group.items.length > 0 && selectedCount === group.items.length;
+              const partiallySelected = selectedCount > 0 && !allSelected;
               return (
-                <div
-                  key={file.name}
-                  className={`${styles.poolCard} ${checked ? styles.poolCardSelected : ''}`}
+                <section
+                  className={`${styles.folderGroup} ${
+                    selectedCount > 0 ? styles.folderGroupSelected : ''
+                  }`}
+                  key={group.folder}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => {
+                    setActiveFolder(group.folder);
+                    setPage(1);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      setActiveFolder(group.folder);
+                      setPage(1);
+                    }
+                  }}
                 >
-                  <div className={styles.cardTop}>
+                  <div className={styles.folderSelectControl} onClick={(event) => event.stopPropagation()}>
                     <SelectionCheckbox
-                      checked={checked}
-                      onChange={(value) => toggleOne(file.name, value)}
-                      ariaLabel={file.name}
+                      checked={allSelected}
+                      onChange={(checked) => toggleFolder(group.items, checked)}
+                      ariaLabel={`选择 ${group.folder}`}
+                      label={partiallySelected ? `已选 ${selectedCount}` : undefined}
                     />
-                    <div className={styles.cardMain}>
-                      <div className={styles.fileName}>{file.name}</div>
-                      <div className={styles.metaRow}>
-                        <span className={styles.typeBadge}>{type}</span>
-                        {planLabel && <span className={styles.planBadge}>{planLabel}</span>}
-                        {modifiedLabel && <span className={styles.muted}>{modifiedLabel}</span>}
-                      </div>
-                      <div className={styles.usageMetricRow}>
-                        <div className={styles.usageMetric}>
-                          <span className={styles.usageMetricLabel}>
-                            {t('account_pool.usage_requests', { defaultValue: '请求' })}
-                          </span>
-                          <strong className={styles.usageMetricValue}>
-                            {formatUsageMetric(usageSummary?.requests)}
-                          </strong>
-                        </div>
-                        <div className={styles.usageMetric}>
-                          <span className={styles.usageMetricLabel}>
-                            {t('account_pool.usage_successes', { defaultValue: '成功' })}
-                          </span>
-                          <strong className={styles.usageMetricValue}>
-                            {formatUsageMetric(usageSummary?.successes)}
-                          </strong>
-                        </div>
-                        <div className={styles.usageMetric}>
-                          <span className={styles.usageMetricLabel}>
-                            {t('account_pool.usage_total_tokens', { defaultValue: 'Token' })}
-                          </span>
-                          <strong className={styles.usageMetricValue}>
-                            {formatUsageMetric(usageSummary?.total_tokens)}
-                          </strong>
-                        </div>
-                        <div className={styles.usageMetric}>
-                          <span className={styles.usageMetricLabel}>
-                            {t('account_pool.usage_failures', { defaultValue: '失败' })}
-                          </span>
-                          <strong className={styles.usageMetricValue}>
-                            {formatUsageMetric(usageSummary?.failures)}
-                          </strong>
-                        </div>
-                      </div>
-                    </div>
                   </div>
-                  {checkResult && (
-                    <div
-                      className={`${styles.checkLine} ${
-                        checkResult.status === 'success'
-                          ? styles.checkSuccess
-                          : checkResult.status === 'loading'
-                            ? styles.checkLoading
-                            : checkResult.status === 'unsupported'
-                              ? styles.checkUnsupported
-                              : styles.checkError
-                      }`}
-                    >
-                      <div className={styles.checkHeader}>
-                        <span className={styles.checkStatusPill}>
-                          {checkResult.status === 'loading'
-                            ? t('account_pool.checking')
-                            : checkResult.message}
-                        </span>
-                        {planLabel && <span className={styles.checkPlanPill}>{planLabel}</span>}
-                        {checkedAtLabel && <span className={styles.checkTime}>{checkedAtLabel}</span>}
-                      </div>
-                      {quotaDetails.length > 0 && (
-                        <div className={styles.quotaPanel}>
-                          {quotaDetails.map((quota) => {
-                            const percent =
-                              typeof quota.percent === 'number'
-                                ? Math.max(0, Math.min(100, quota.percent))
-                                : null;
-                            const empty = percent !== null && percent <= 0;
-                            const low =
-                              percent !== null &&
-                              percent > 0 &&
-                              percent <= LOW_ACCOUNT_POOL_QUOTA_PERCENT;
-                            return (
-                              <div
-                                className={empty ? styles.quotaItemEmpty : styles.quotaItem}
-                                key={`${quota.label}-${quota.reset}`}
-                              >
-                                <div className={styles.quotaItemTop}>
-                                  <span className={styles.quotaName}>{quota.label}</span>
-                                  <span
-                                    className={
-                                      empty
-                                        ? styles.quotaEmptyValue
-                                        : low
-                                          ? styles.quotaLowValue
-                                          : styles.quotaValue
-                                    }
-                                  >
-                                    {quota.remaining}
-                                  </span>
-                                </div>
-                                {percent !== null && (
-                                  <div className={styles.quotaTrack}>
-                                    <span
-                                      className={
-                                        empty
-                                          ? styles.quotaFillEmpty
-                                          : low
-                                            ? styles.quotaFillLow
-                                            : styles.quotaFill
-                                      }
-                                      style={{ width: `${percent}%` }}
-                                    />
-                                  </div>
-                                )}
-                                {quota.reset && (
-                                  <div className={styles.quotaReset}>
-                                    {formatQuotaResetMeta(t, quota.reset)}
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
+                  <div className={styles.folderVisual}>
+                    <div className={styles.folderIcon} aria-hidden="true">
+                      <span className={styles.folderIconTab} />
+                      <span className={styles.folderIconBody}>
+                        <span className={styles.folderZipRail} />
+                      </span>
                     </div>
-                  )}
-                  {showStatusMessage && <div className={styles.statusLine}>{statusMessage}</div>}
-                </div>
+                    <div className={styles.folderCountBadge}>{group.items.length} 个账号</div>
+                  </div>
+                  <div className={styles.folderHeader}>
+                    <h3 title={group.folder}>{group.folder}</h3>
+                    <p>
+                      {group.info?.source_model || '未设置来源模型'}
+                      {group.info?.source_info ? ` · ${group.info.source_info}` : ''}
+                    </p>
+                  </div>
+                  <div className={styles.folderStatusGrid}>
+                    {group.stats.codes.slice(0, 4).map(([code, count]) => (
+                      <span
+                        className={`${styles.folderStatusPill} ${
+                          code >= 200 && code < 300
+                            ? styles.folderStatusSuccess
+                            : code >= 400
+                              ? styles.folderStatusError
+                              : ''
+                        }`}
+                        key={code}
+                        title={`${code}：${getStatusCodeDescription(code)}`}
+                      >
+                        {code}
+                        <strong>{count}</strong>
+                      </span>
+                    ))}
+                    {group.stats.checking > 0 && (
+                      <span className={`${styles.folderStatusPill} ${styles.folderStatusChecking}`}>
+                        检测中
+                        <strong>{group.stats.checking}</strong>
+                      </span>
+                    )}
+                    {group.stats.unchecked > 0 && (
+                      <span className={styles.folderStatusPill}>
+                        未检测
+                        <strong>{group.stats.unchecked}</strong>
+                      </span>
+                    )}
+                    {group.stats.unsupported > 0 && (
+                      <span className={styles.folderStatusPill}>
+                        不支持
+                        <strong>{group.stats.unsupported}</strong>
+                      </span>
+                    )}
+                    {group.stats.unknownError > 0 && (
+                      <span className={`${styles.folderStatusPill} ${styles.folderStatusError}`}>
+                        错误
+                        <strong>{group.stats.unknownError}</strong>
+                      </span>
+                    )}
+                  </div>
+                  <div className={styles.folderHeaderActions}>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        editFolderSourceInfo(group.folder);
+                      }}
+                    >
+                      设置来源
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setActiveFolder(group.folder);
+                        setPage(1);
+                      }}
+                    >
+                      进入
+                    </Button>
+                  </div>
+                </section>
               );
             })}
           </div>
+        ) : (
+          <>
+            {viewMode === 'folder' && activeFolder && (
+              <div className={styles.folderBreadcrumb}>
+                <Button variant="secondary" size="sm" onClick={() => setActiveFolder(null)}>
+                  返回文件夹
+                </Button>
+                <span>{activeFolder}</span>
+                <strong>{displayedFiles.length} 个账号</strong>
+              </div>
+            )}
+            <div className={styles.poolGrid}>
+              {pageItems.map(renderPoolCard)}
+            </div>
+          </>
         )}
 
-        {!loading && displayedFiles.length > pageSize && (
+        {!loading && paginatedItemCount > pageSize && (
           <div className={styles.pagination}>
             <Button
               variant="secondary"
@@ -2209,7 +2947,7 @@ export function AccountPoolPage() {
               {t('auth_files.pagination_info', {
                 current: currentPage,
                 total: totalPages,
-                count: displayedFiles.length,
+                count: paginatedItemCount,
               })}
             </div>
             <Button
@@ -2224,5 +2962,73 @@ export function AccountPoolPage() {
         )}
       </Card>
     </div>
+    <Modal
+      open={sourceEditorOpen}
+      onClose={closeSourceEditor}
+      title="设置来源"
+      width={560}
+      closeDisabled={savingSourceInfo}
+      footer={
+        <>
+          <Button variant="secondary" onClick={closeSourceEditor} disabled={savingSourceInfo}>
+            取消
+          </Button>
+          <Button onClick={() => void saveFolderSourceInfo()} loading={savingSourceInfo}>
+            保存
+          </Button>
+        </>
+      }
+    >
+      <div className={styles.sourceEditor}>
+        <div className={styles.sourceEditorFolder}>
+          <span>文件夹</span>
+          <strong title={sourceEditorFolder}>{sourceEditorFolder}</strong>
+        </div>
+        <label className={styles.sourceEditorField}>
+          <span>来源模型</span>
+          <input
+            value={sourceEditorModel}
+            onChange={(event) => setSourceEditorModel(event.target.value)}
+            placeholder="例如 Claude、Codex、Gemini 或自定义模型来源"
+            disabled={savingSourceInfo}
+          />
+        </label>
+        <label className={styles.sourceEditorField}>
+          <span>来源信息</span>
+          <textarea
+            value={sourceEditorInfo}
+            onChange={(event) => setSourceEditorInfo(event.target.value)}
+            placeholder="可填写批次、渠道、备注或其他来源说明"
+            disabled={savingSourceInfo}
+            rows={4}
+          />
+        </label>
+      </div>
+    </Modal>
+    <Modal
+      open={configViewerOpen}
+      onClose={closeConfigViewer}
+      title="账号配置"
+      width={820}
+      footer={
+        <Button variant="secondary" onClick={closeConfigViewer}>
+          关闭
+        </Button>
+      }
+    >
+      <div className={styles.configViewer}>
+        <div className={styles.configViewerName} title={configViewerName}>
+          {configViewerName}
+        </div>
+        {configViewerLoading ? (
+          <div className={styles.hint}>正在读取配置...</div>
+        ) : configViewerError ? (
+          <div className={styles.error}>{configViewerError}</div>
+        ) : (
+          <pre className={styles.configViewerContent}>{configViewerContent}</pre>
+        )}
+      </div>
+    </Modal>
+    </>
   );
 }

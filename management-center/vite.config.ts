@@ -1,6 +1,5 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import { viteSingleFile } from 'vite-plugin-singlefile';
 import path from 'path';
 import { execSync } from 'child_process';
 import fs from 'fs';
@@ -37,12 +36,7 @@ function getVersion(): string {
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [
-    react(),
-    viteSingleFile({
-      removeViteModuleLoader: true
-    })
-  ],
+  plugins: [react()],
   define: {
     __APP_VERSION__: JSON.stringify(getVersion())
   },
@@ -65,13 +59,8 @@ export default defineConfig({
   build: {
     target: 'es2020',
     outDir: 'dist',
-    assetsInlineLimit: 100000000,
-    chunkSizeWarningLimit: 100000000,
-    cssCodeSplit: false,
-    rolldownOptions: {
-      output: {
-        codeSplitting: false
-      }
-    }
+    assetsInlineLimit: 4096,
+    chunkSizeWarningLimit: 1200,
+    cssCodeSplit: true,
   }
 });

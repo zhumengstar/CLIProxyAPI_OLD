@@ -1,26 +1,76 @@
+import { lazy, type ComponentType } from 'react';
 import { Navigate, useRoutes, type Location } from 'react-router-dom';
-import { DashboardPage } from '@/pages/DashboardPage';
-import { AiProvidersPage } from '@/pages/AiProvidersPage';
-import { AiProvidersAmpcodeEditPage } from '@/pages/AiProvidersAmpcodeEditPage';
-import { AiProvidersClaudeEditLayout } from '@/pages/AiProvidersClaudeEditLayout';
-import { AiProvidersClaudeEditPage } from '@/pages/AiProvidersClaudeEditPage';
-import { AiProvidersClaudeModelsPage } from '@/pages/AiProvidersClaudeModelsPage';
-import { AiProvidersCodexEditPage } from '@/pages/AiProvidersCodexEditPage';
-import { AiProvidersGeminiEditPage } from '@/pages/AiProvidersGeminiEditPage';
-import { AiProvidersOpenAIEditLayout } from '@/pages/AiProvidersOpenAIEditLayout';
-import { AiProvidersOpenAIEditPage } from '@/pages/AiProvidersOpenAIEditPage';
-import { AiProvidersOpenAIModelsPage } from '@/pages/AiProvidersOpenAIModelsPage';
-import { AiProvidersVertexEditPage } from '@/pages/AiProvidersVertexEditPage';
-import { AuthFilesPage } from '@/pages/AuthFilesPage';
-import { AuthFilesOAuthExcludedEditPage } from '@/pages/AuthFilesOAuthExcludedEditPage';
-import { AuthFilesOAuthModelAliasEditPage } from '@/pages/AuthFilesOAuthModelAliasEditPage';
-import { OAuthPage } from '@/pages/OAuthPage';
-import { QuotaPage } from '@/pages/QuotaPage';
-import { ConfigPage } from '@/pages/ConfigPage';
-import { SystemPage } from '@/pages/SystemPage';
-import { AccountPoolPage } from '@/pages/AccountPoolPage';
-import { UsageRecordsPage } from '@/pages/UsageRecordsPage';
-import { Sub2APIImportPage } from '@/pages/Sub2APIImportPage';
+
+const lazyNamed = <TModule, TName extends keyof TModule>(
+  loader: () => Promise<TModule>,
+  name: TName
+) =>
+  lazy(async () => {
+    const mod = await loader();
+    return { default: mod[name] as ComponentType };
+  });
+
+const DashboardPage = lazyNamed(() => import('@/pages/DashboardPage'), 'DashboardPage');
+const AiProvidersPage = lazyNamed(() => import('@/pages/AiProvidersPage'), 'AiProvidersPage');
+const AiProvidersAmpcodeEditPage = lazyNamed(
+  () => import('@/pages/AiProvidersAmpcodeEditPage'),
+  'AiProvidersAmpcodeEditPage'
+);
+const AiProvidersClaudeEditLayout = lazyNamed(
+  () => import('@/pages/AiProvidersClaudeEditLayout'),
+  'AiProvidersClaudeEditLayout'
+);
+const AiProvidersClaudeEditPage = lazyNamed(
+  () => import('@/pages/AiProvidersClaudeEditPage'),
+  'AiProvidersClaudeEditPage'
+);
+const AiProvidersClaudeModelsPage = lazyNamed(
+  () => import('@/pages/AiProvidersClaudeModelsPage'),
+  'AiProvidersClaudeModelsPage'
+);
+const AiProvidersCodexEditPage = lazyNamed(
+  () => import('@/pages/AiProvidersCodexEditPage'),
+  'AiProvidersCodexEditPage'
+);
+const AiProvidersGeminiEditPage = lazyNamed(
+  () => import('@/pages/AiProvidersGeminiEditPage'),
+  'AiProvidersGeminiEditPage'
+);
+const AiProvidersOpenAIEditLayout = lazyNamed(
+  () => import('@/pages/AiProvidersOpenAIEditLayout'),
+  'AiProvidersOpenAIEditLayout'
+);
+const AiProvidersOpenAIEditPage = lazyNamed(
+  () => import('@/pages/AiProvidersOpenAIEditPage'),
+  'AiProvidersOpenAIEditPage'
+);
+const AiProvidersOpenAIModelsPage = lazyNamed(
+  () => import('@/pages/AiProvidersOpenAIModelsPage'),
+  'AiProvidersOpenAIModelsPage'
+);
+const AiProvidersVertexEditPage = lazyNamed(
+  () => import('@/pages/AiProvidersVertexEditPage'),
+  'AiProvidersVertexEditPage'
+);
+const AuthFilesPage = lazyNamed(() => import('@/pages/AuthFilesPage'), 'AuthFilesPage');
+const AuthFilesOAuthExcludedEditPage = lazyNamed(
+  () => import('@/pages/AuthFilesOAuthExcludedEditPage'),
+  'AuthFilesOAuthExcludedEditPage'
+);
+const AuthFilesOAuthModelAliasEditPage = lazyNamed(
+  () => import('@/pages/AuthFilesOAuthModelAliasEditPage'),
+  'AuthFilesOAuthModelAliasEditPage'
+);
+const OAuthPage = lazyNamed(() => import('@/pages/OAuthPage'), 'OAuthPage');
+const QuotaPage = lazyNamed(() => import('@/pages/QuotaPage'), 'QuotaPage');
+const ConfigPage = lazyNamed(() => import('@/pages/ConfigPage'), 'ConfigPage');
+const SystemPage = lazyNamed(() => import('@/pages/SystemPage'), 'SystemPage');
+const AccountPoolPage = lazyNamed(() => import('@/pages/AccountPoolPage'), 'AccountPoolPage');
+const UsageRecordsPage = lazyNamed(() => import('@/pages/UsageRecordsPage'), 'UsageRecordsPage');
+const Sub2APIImportPage = lazyNamed(
+  () => import('@/pages/Sub2APIImportPage'),
+  'Sub2APIImportPage'
+);
 
 const mainRoutes = [
   { path: '/', element: <DashboardPage /> },

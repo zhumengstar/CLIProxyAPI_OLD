@@ -83,6 +83,14 @@
   max-width: 260px;
 }
 
+.fileName {
+  max-width: 260px;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .statusPanel {
   display: grid;
   gap: 12px;

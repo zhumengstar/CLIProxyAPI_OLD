@@ -1,6 +1,7 @@
 import {
   ReactNode,
   SVGProps,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -676,7 +677,20 @@ export function MainLayout() {
         <div className="content" ref={contentRef}>
           <main className="main-content">
             <PageTransition
-              render={(location) => <MainRoutes location={location} />}
+              render={(location) => (
+                <Suspense
+                  fallback={
+                    <div className="route-loading-shell" aria-label={t('common.loading')}>
+                      <div className="route-loading-card">
+                        <span className="route-loading-spinner" aria-hidden="true" />
+                        <span>{t('common.loading')}</span>
+                      </div>
+                    </div>
+                  }
+                >
+                  <MainRoutes location={location} />
+                </Suspense>
+              )}
               getRouteOrder={getRouteOrder}
               getTransitionVariant={getTransitionVariant}
               scrollContainerRef={contentRef}

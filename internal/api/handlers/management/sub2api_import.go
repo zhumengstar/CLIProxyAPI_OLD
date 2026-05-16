@@ -149,6 +149,7 @@ func cloneSub2APIJob(job *sub2APIImportJob) *sub2APIImportJob {
 }
 
 func (h *Handler) runSub2APIImport(ctx context.Context, jobID string, source string) {
+	_ = ctx
 	docs, err := parseSub2APIDocuments(source)
 	if err != nil {
 		h.updateSub2APIJob(jobID, func(job *sub2APIImportJob) {
@@ -173,30 +174,27 @@ func (h *Handler) runSub2APIImport(ctx context.Context, jobID string, source str
 
 	stamp := time.Now().Unix()
 	for index, item := range accounts {
-		cpa, warnings := sub2APIAccountToCPA(item.account, item.exportedAt)
-		nameSeed := firstSub2APINonEmpty(cpa.Phone, cpa.Email, cpa.AccountID, item.account.Name, fmt.Sprintf("account_%d", index+1))
-		fileName := fmt.Sprintf("token_%s_%d.json", safeSub2APIFilePart(nameSeed), stamp+int64(index))
-		data, errMarshal := json.MarshalIndent(cpa, "", "  ")
-		if errMarshal != nil {
+		file, warnings, errBuild := sub2APIAccountToAccountPoolArchiveFile(item.account, item.exportedAt, "", index, stamp)
+		if errBuild != nil {
 			h.updateSub2APIJob(jobID, func(job *sub2APIImportJob) {
 				job.Done++
 				job.Failed++
-				job.Warnings = append(job.Warnings, fmt.Sprintf("%s: %v", fileName, errMarshal))
+				job.Warnings = append(job.Warnings, fmt.Sprintf("account_%d: %v", index+1, errBuild))
 			})
 			continue
 		}
-		if errWrite := h.writeAuthFile(ctx, filepath.Base(fileName), data); errWrite != nil {
+		if errWrite := h.upsertAccountPoolArchiveFile(filepath.Base(file.Name), file.Data); errWrite != nil {
 			h.updateSub2APIJob(jobID, func(job *sub2APIImportJob) {
 				job.Done++
 				job.Failed++
-				job.Warnings = append(job.Warnings, fmt.Sprintf("%s: %v", fileName, errWrite))
+				job.Warnings = append(job.Warnings, fmt.Sprintf("%s: %v", file.Name, errWrite))
 			})
 			continue
 		}
 		h.updateSub2APIJob(jobID, func(job *sub2APIImportJob) {
 			job.Done++
 			job.Imported++
-			job.Files = append(job.Files, fileName)
+			job.Files = append(job.Files, file.Name)
 			job.Warnings = append(job.Warnings, warnings...)
 		})
 	}
@@ -211,17 +209,40 @@ func (h *Handler) runSub2APIImport(ctx context.Context, jobID string, source str
 	})
 }
 
+func sub2APIAccountToAccountPoolArchiveFile(account sub2APIAccount, exportedAt string, folder string, index int, stamp int64) (accountPoolArchiveFile, []string, error) {
+	cpa, warnings := sub2APIAccountToCPA(account, exportedAt)
+	nameSeed := firstSub2APINonEmpty(cpa.Phone, cpa.Email, cpa.AccountID, account.Name, fmt.Sprintf("account_%d", index+1))
+	fileName := fmt.Sprintf("token_%s_%d.json", safeSub2APIFilePart(nameSeed), stamp+int64(index))
+	data, errMarshal := json.MarshalIndent(cpa, "", "  ")
+	if errMarshal != nil {
+		return accountPoolArchiveFile{}, warnings, errMarshal
+	}
+	return accountPoolArchiveFile{
+		Name:   accountPoolEntryNameForFolder(folder, fileName),
+		Data:   data,
+		Folder: normalizeAccountPoolFolder(folder),
+	}, warnings, nil
+}
+
 func parseSub2APIDocuments(source string) ([]sub2APIExport, error) {
 	var raw any
 	if err := json.Unmarshal([]byte(source), &raw); err != nil {
 		return nil, fmt.Errorf("invalid sub2api json: %w", err)
 	}
+	docs := decodeSub2APIDocumentsValue(raw)
+	if len(docs) == 0 {
+		return nil, fmt.Errorf("json does not contain sub2api accounts")
+	}
+	return docs, nil
+}
+
+func decodeSub2APIDocumentsValue(raw any) []sub2APIExport {
 	var docs []sub2APIExport
 	switch typed := raw.(type) {
 	case []any:
 		if looksLikeSub2APIAccountArray(typed) {
 			docs = append(docs, sub2APIExport{Accounts: decodeSub2APIAccounts(typed)})
-			return docs, nil
+			return docs
 		}
 		for _, item := range typed {
 			doc, ok := decodeSub2APIExport(item)
@@ -233,12 +254,20 @@ func parseSub2APIDocuments(source string) ([]sub2APIExport, error) {
 		doc, ok := decodeSub2APIExport(typed)
 		if ok {
 			docs = append(docs, doc)
+			return docs
+		}
+		if nested, ok := typed["data"]; ok {
+			if nestedSource, okString := nested.(string); okString {
+				nestedDocs, err := parseSub2APIDocuments(nestedSource)
+				if err != nil {
+					return nil
+				}
+				return nestedDocs
+			}
+			return decodeSub2APIDocumentsValue(nested)
 		}
 	}
-	if len(docs) == 0 {
-		return nil, fmt.Errorf("json does not contain sub2api accounts")
-	}
-	return docs, nil
+	return docs
 }
 
 func looksLikeSub2APIAccountArray(items []any) bool {
