@@ -88,6 +88,22 @@ const getFileModifiedLabel = (file: AuthFileItem): string => {
   return '';
 };
 
+const getFolderLatestTime = (
+  items: AuthFileItem[],
+  fileContentCache: Record<string, string>,
+  savedAtByName: Map<string, number>
+): number | null => {
+  let latestTime: number | null = null;
+  items.forEach((file) => {
+    const time = getRegistrationTime(file, fileContentCache, savedAtByName);
+    if (time === null) return;
+    if (latestTime === null || time > latestTime) {
+      latestTime = time;
+    }
+  });
+  return latestTime;
+};
+
 const parseDateValue = (value: unknown): number | null => {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value < 1e12 ? value * 1000 : value;
@@ -969,6 +985,14 @@ export function AccountPoolPage() {
       { value: 'success_desc', label: t('account_pool.sort_success_desc', { defaultValue: '成功最多' }) },
       { value: 'token_desc', label: t('account_pool.sort_token_desc', { defaultValue: 'Token 最多' }) },
       { value: 'failure_desc', label: t('account_pool.sort_failure_desc', { defaultValue: '失败最多' }) },
+      {
+        value: 'folder_time_desc',
+        label: t('account_pool.sort_folder_time_desc', { defaultValue: '文件夹最新' }),
+      },
+      {
+        value: 'folder_time_asc',
+        label: t('account_pool.sort_folder_time_asc', { defaultValue: '文件夹最早' }),
+      },
       { value: 'registered_desc', label: t('account_pool.sort_registered_desc') },
       { value: 'registered_asc', label: t('account_pool.sort_registered_asc') },
       { value: 'modified_desc', label: t('account_pool.sort_modified_desc') },
@@ -1203,6 +1227,7 @@ export function AccountPoolPage() {
         let unchecked = 0;
         let unsupported = 0;
         let unknownError = 0;
+        const latestTime = getFolderLatestTime(items, fileContentCache, savedAtByName);
         items.forEach((file) => {
           const result = checkResults[file.name];
           if (result?.status === 'loading') {
@@ -1231,6 +1256,8 @@ export function AccountPoolPage() {
           folder,
           info: folderInfoByName.get(folder),
           items,
+          latestTime,
+          latestTimeLabel: latestTime !== null ? formatUnixTimestamp(latestTime) : '',
           stats: {
             codes: Array.from(byCode.entries()).sort(([left], [right]) => left - right),
             checking: checkingCount,
@@ -1240,8 +1267,18 @@ export function AccountPoolPage() {
           },
         };
       })
-      .sort((left, right) => left.folder.localeCompare(right.folder));
-  }, [checkResults, filteredFiles, folderInfoByName]);
+      .sort((left, right) => {
+        if (sortMode === 'folder_time_desc' || sortMode === 'folder_time_asc') {
+          const diff = compareOptionalTime(
+            left.latestTime,
+            right.latestTime,
+            sortMode === 'folder_time_asc' ? 'asc' : 'desc'
+          );
+          if (diff !== 0) return diff;
+        }
+        return left.folder.localeCompare(right.folder);
+      });
+  }, [checkResults, fileContentCache, filteredFiles, folderInfoByName, savedAtByName, sortMode]);
   const folderRootMode = viewMode === 'folder' && !activeFolder;
   const pagedItemCount = folderRootMode ? folderGroups.length : displayedFiles.length;
   const totalPages = Math.max(1, Math.ceil(pagedItemCount / pageSize));
@@ -2514,9 +2551,10 @@ export function AccountPoolPage() {
                   </div>
                   <div className={styles.folderHeader}>
                     <h3 title={group.folder}>{group.folder}</h3>
-                    <p>
+                    <p title={group.latestTimeLabel || undefined}>
                       {group.info?.source_model || '未设置来源模型'}
                       {group.info?.source_info ? ` · ${group.info.source_info}` : ''}
+                      {group.latestTimeLabel ? ` · 最新 ${group.latestTimeLabel}` : ''}
                     </p>
                   </div>
                   <div className={styles.folderStatusGrid}>
