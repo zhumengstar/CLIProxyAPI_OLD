@@ -639,6 +639,20 @@ func isUnsafeAuthFileName(name string) bool {
 	return false
 }
 
+func accountPoolSyntheticDeleteName(name string) string {
+	name = strings.TrimSpace(strings.ReplaceAll(name, "\\", "/"))
+	name = strings.TrimPrefix(name, "/")
+	if !strings.HasPrefix(strings.ToLower(name), ".account-pool/") {
+		return ""
+	}
+	name = strings.TrimPrefix(name, ".account-pool/")
+	name = normalizeAccountPoolEntryName(name)
+	if isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+		return ""
+	}
+	return name
+}
+
 // Download single auth file by name
 func (h *Handler) DownloadAuthFile(c *gin.Context) {
 	name := strings.TrimSpace(c.Query("name"))
@@ -2948,6 +2962,10 @@ func uniqueAuthFileNames(names []string) []string {
 
 func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string, int, error) {
 	name = strings.TrimSpace(name)
+	if syntheticName := accountPoolSyntheticDeleteName(name); syntheticName != "" {
+		status, err := h.deleteAccountPoolSyntheticAuth(syntheticName)
+		return name, status, err
+	}
 	if isUnsafeAuthFileName(name) {
 		return "", http.StatusBadRequest, fmt.Errorf("invalid name")
 	}
@@ -2980,6 +2998,42 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 		}
 	}
 	return filepath.Base(name), http.StatusOK, nil
+}
+
+func (h *Handler) deleteAccountPoolSyntheticAuth(name string) (int, error) {
+	if h == nil || h.authManager == nil {
+		return http.StatusServiceUnavailable, fmt.Errorf("core auth manager unavailable")
+	}
+	auths := h.authManager.List()
+	ids := make([]string, 0, 1)
+	targetPath := filepath.Join(h.cfg.AuthDir, ".account-pool", filepath.FromSlash(name))
+	for _, auth := range auths {
+		if auth == nil || !h.isAccountPoolSyntheticAuth(auth) {
+			continue
+		}
+		authName := normalizeAccountPoolEntryName(auth.FileName)
+		authID := normalizeAccountPoolEntryName(auth.ID)
+		accountPoolRoot := strings.ReplaceAll(filepath.Clean(filepath.Join(h.cfg.AuthDir, ".account-pool")), "\\", "/") + "/"
+		authPathName := normalizeAccountPoolEntryName(strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(authAttribute(auth, "path")), "\\", "/"), accountPoolRoot))
+		if authName == name || authID == name || authPathName == name {
+			if strings.TrimSpace(auth.ID) != "" {
+				ids = append(ids, auth.ID)
+			}
+			if pathValue := strings.TrimSpace(authAttribute(auth, "path")); pathValue != "" {
+				targetPath = pathValue
+			}
+		}
+	}
+	if len(ids) > 0 {
+		h.authManager.RemoveAuths(ids)
+	}
+	if errRemove := os.Remove(targetPath); errRemove != nil && !os.IsNotExist(errRemove) {
+		return http.StatusInternalServerError, fmt.Errorf("failed to remove account pool auth mirror: %w", errRemove)
+	}
+	if len(ids) == 0 {
+		return http.StatusOK, nil
+	}
+	return http.StatusOK, nil
 }
 
 func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {

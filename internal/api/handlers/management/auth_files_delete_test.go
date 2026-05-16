@@ -245,6 +245,61 @@ func TestDeleteAuthFileAll_RemovesSyntheticRuntimeWithoutDeletingAccountPool(t *
 	}
 }
 
+func TestDeleteAuthFile_AccountPoolSyntheticNameDoesNotDeletePoolEntry(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	poolName := "pooled.json"
+	poolContent := []byte(`{"type":"codex","email":"pooled@example.com"}`)
+	if err := h.upsertAccountPoolArchiveFile(poolName, poolContent); err != nil {
+		t.Fatalf("failed to seed account pool: %v", err)
+	}
+	syntheticPath := filepath.Join(authDir, ".account-pool", poolName)
+	if err := os.MkdirAll(filepath.Dir(syntheticPath), 0o700); err != nil {
+		t.Fatalf("failed to create synthetic dir: %v", err)
+	}
+	if err := os.WriteFile(syntheticPath, poolContent, 0o600); err != nil {
+		t.Fatalf("failed to write synthetic auth mirror: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       poolName,
+		FileName: poolName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": syntheticPath,
+		},
+	}); err != nil {
+		t.Fatalf("failed to register synthetic auth: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(".account-pool/"+poolName), nil)
+	h.DeleteAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if auths := manager.List(); len(auths) != 0 {
+		t.Fatalf("expected synthetic runtime auth to be removed, got %d", len(auths))
+	}
+	if _, err := os.Stat(syntheticPath); !os.IsNotExist(err) {
+		t.Fatalf("expected synthetic mirror file to be removed, got err %v", err)
+	}
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		t.Fatalf("failed to read account pool: %v", err)
+	}
+	if got := string(entries[poolName]); got != string(poolContent) {
+		t.Fatalf("expected account pool entry to remain, got %q", got)
+	}
+}
+
 func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
