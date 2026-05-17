@@ -121,6 +121,7 @@ func buildRequestSummaryLogLine(c *gin.Context) string {
 
 	appendPart("user", GetRequestSummaryValue(c, RequestSummaryUsernameKey))
 	appendPart("user_id", GetRequestSummaryValue(c, RequestSummaryUserIDKey))
+	appendPart("session_id", GetRequestSummaryValue(c, RequestSummarySessionIDKey))
 	appendPart("channel", GetRequestSummaryValue(c, RequestSummaryUpstreamKey))
 	appendPart("model", GetRequestSummaryValue(c, RequestSummaryModelKey))
 	appendPart("type", GetRequestSummaryValue(c, RequestSummaryRequestTypeKey))

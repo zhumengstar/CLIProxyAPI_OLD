@@ -124,7 +124,7 @@
 
 .table {
   width: 100%;
-  min-width: 860px;
+  min-width: 980px;
   border-collapse: collapse;
 }
 
@@ -164,41 +164,50 @@
   white-space: nowrap;
 }
 
-.identityCell {
+.userCell {
   display: grid;
-  gap: 4px;
+  gap: 5px;
   min-width: 0;
 }
 
-.identityMain {
-  max-width: 280px;
-  overflow: hidden;
-  color: var(--text-primary);
-  font-weight: 800;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.identityLine {
-  display: grid;
-  grid-template-columns: 48px minmax(0, 1fr);
+.userMeta {
+  display: flex;
   align-items: center;
   gap: 6px;
-  max-width: 320px;
   min-width: 0;
   color: var(--text-tertiary);
   font-size: 11px;
 }
 
-.identityLine span {
-  color: var(--text-tertiary);
+.userMeta span {
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent);
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 3px 5px;
+  text-transform: uppercase;
 }
 
-.identityLine strong {
+.userMeta strong {
   min-width: 0;
   overflow: hidden;
-  color: var(--text-secondary);
+  color: var(--text-tertiary);
   font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sessionValue {
+  max-width: 220px;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+  font-size: 11px;
+  font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
 }

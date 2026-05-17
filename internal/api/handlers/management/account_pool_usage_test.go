@@ -2,84 +2,130 @@ package management
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
-func TestAccountPoolUsageRecordsAreNotTrimmed(t *testing.T) {
-	t.Parallel()
-
-	recorder := &accountPoolUsageRecorder{}
-	for i := 0; i < 305; i++ {
-		recorder.HandleUsage(context.Background(), usage.Record{
-			Provider:    "codex",
-			Model:       "gpt-5.5",
-			AuthID:      "auth",
-			Source:      "account@example.com",
-			RequestedAt: time.Unix(int64(i), 0),
-			Detail: usage.Detail{
-				InputTokens:  10,
-				OutputTokens: 1,
-				TotalTokens:  11,
+func TestAccountPoolUsageClearRemovesSummaries(t *testing.T) {
+	recorder := &accountPoolUsageRecorder{
+		records: []accountPoolUsageRecord{
+			{ID: "1", ServiceEmail: "user@example.com", TotalTokens: 10},
+		},
+		summaries: map[string]*accountPoolUsageSummary{
+			"email:user@example.com": {
+				Key:          "email:user@example.com",
+				ServiceEmail: "user@example.com",
+				Requests:     1,
+				TotalTokens:  10,
 			},
-		})
+		},
 	}
 
-	records, total := recorder.ListPage(400, 0)
-	if total != 305 {
-		t.Fatalf("total = %d, want 305", total)
+	recorder.Clear()
+
+	if len(recorder.records) != 0 {
+		t.Fatalf("records length = %d, want 0", len(recorder.records))
 	}
-	if len(records) != 305 {
-		t.Fatalf("records = %d, want 305", len(records))
+	if len(recorder.summaries) != 0 {
+		t.Fatalf("summaries length = %d, want 0", len(recorder.summaries))
 	}
+}
+
+func TestAccountPoolUsageListPageLimitZeroReturnsAll(t *testing.T) {
+	recorder := &accountPoolUsageRecorder{}
+	for i := 1; i <= 350; i++ {
+		recorder.records = append(recorder.records, accountPoolUsageRecord{ID: strconv.Itoa(i)})
+	}
+
+	records, total := recorder.ListPage(0, 0)
+
+	if total != 350 {
+		t.Fatalf("total = %d, want 350", total)
+	}
+	if len(records) != 350 {
+		t.Fatalf("records length = %d, want 350", len(records))
+	}
+}
+
+func TestAccountPoolUsageTotalsUsesSummaries(t *testing.T) {
+	recorder := &accountPoolUsageRecorder{
+		summaries: map[string]*accountPoolUsageSummary{
+			"email:a@example.com": {
+				Requests:            2,
+				Successes:           1,
+				Failures:            1,
+				InputTokens:         10,
+				OutputTokens:        20,
+				CachedTokens:        30,
+				CacheReadTokens:     40,
+				CacheCreationTokens: 50,
+				TotalTokens:         60,
+			},
+			"email:b@example.com": {
+				Requests:     3,
+				Successes:    3,
+				InputTokens:  7,
+				OutputTokens: 8,
+				TotalTokens:  9,
+			},
+		},
+	}
+
 	totals := recorder.Totals()
-	if totals.Requests != 305 || totals.InputTokens != 3050 || totals.OutputTokens != 305 || totals.TotalTokens != 3355 {
-		t.Fatalf("totals = %#v, want requests/input/output/total 305/3050/305/3355", totals)
+
+	if totals.Requests != 5 || totals.Successes != 4 || totals.Failures != 1 {
+		t.Fatalf("request totals = (%d, %d, %d), want (5, 4, 1)", totals.Requests, totals.Successes, totals.Failures)
+	}
+	if totals.InputTokens != 17 || totals.OutputTokens != 28 || totals.TotalTokens != 69 {
+		t.Fatalf("token totals = (%d, %d, %d), want (17, 28, 69)", totals.InputTokens, totals.OutputTokens, totals.TotalTokens)
 	}
 }
 
-func TestAccountPoolRequestIdentityInfersPlainSessionUsername(t *testing.T) {
-	t.Parallel()
-
+func TestAccountPoolRequestIdentityReadsOneAPIUsernameHeaders(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
-	req.Header.Set("X-Session-ID", "kinsovip")
-	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	ginCtx.Request = req
-
-	sessionID, userID, username, requestPath, _ := accountPoolRequestIdentity(context.WithValue(context.Background(), "gin", ginCtx))
-	if sessionID != "kinsovip" {
-		t.Fatalf("sessionID = %q, want kinsovip", sessionID)
-	}
-	if userID != "" {
-		t.Fatalf("userID = %q, want empty", userID)
-	}
-	if username != "kinsovip" {
-		t.Fatalf("username = %q, want kinsovip", username)
-	}
-	if requestPath != "/v1/chat/completions" {
-		t.Fatalf("requestPath = %q, want /v1/chat/completions", requestPath)
-	}
-}
-
-func TestAccountPoolRequestIdentityKeepsOpaqueSessionAsSessionOnly(t *testing.T) {
-	t.Parallel()
-
-	gin.SetMode(gin.TestMode)
-	req := httptest.NewRequest("POST", "/v1/responses", nil)
-	req.Header.Set("X-Session-ID", "019e2ee8-7697-7cc1-81cb-5eb87c81b07d")
-	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	ginCtx.Request = req
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request.Header.Set("X-Session-ID", "session-1")
+	ginCtx.Request.Header.Set("X_OneAPI_User_ID", "42")
+	ginCtx.Request.Header.Set("X_OneAPI_User_Name", "admin")
 
 	sessionID, userID, username, _, _ := accountPoolRequestIdentity(context.WithValue(context.Background(), "gin", ginCtx))
-	if sessionID != "019e2ee8-7697-7cc1-81cb-5eb87c81b07d" {
-		t.Fatalf("sessionID = %q, want UUID session", sessionID)
+
+	if sessionID != "session-1" || userID != "42" || username != "admin" {
+		t.Fatalf("identity = (%q, %q, %q), want (session-1, 42, admin)", sessionID, userID, username)
 	}
-	if userID != "" || username != "" {
-		t.Fatalf("userID/username = %q/%q, want empty/empty", userID, username)
+}
+
+func TestAccountPoolRequestIdentityReadsCodexTurnMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request.Header.Set("X-Session-ID", "019e3102-5e26-79f2-b3db-fa827155c090")
+	ginCtx.Request.Header.Set("X-Codex-Turn-Metadata", `{"user":{"id":42,"username":"admin"},"turn_id":"turn-1"}`)
+
+	sessionID, userID, username, _, _ := accountPoolRequestIdentity(context.WithValue(context.Background(), "gin", ginCtx))
+
+	if sessionID != "019e3102-5e26-79f2-b3db-fa827155c090" || userID != "42" || username != "admin" {
+		t.Fatalf("identity = (%q, %q, %q), want (019e3102..., 42, admin)", sessionID, userID, username)
+	}
+}
+
+func TestAccountPoolUsageIdentityForSessionBackfillsUsername(t *testing.T) {
+	recorder := &accountPoolUsageRecorder{
+		records: []accountPoolUsageRecord{
+			{SessionID: "session-1", NewAPIUserID: "42", Username: "admin"},
+		},
+	}
+
+	userID, username := recorder.identityForSession("session-1")
+
+	if userID != "42" || username != "admin" {
+		t.Fatalf("identity = (%q, %q), want (42, admin)", userID, username)
 	}
 }

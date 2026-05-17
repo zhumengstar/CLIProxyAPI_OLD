@@ -19,6 +19,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -36,8 +37,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
@@ -80,6 +83,44 @@ type accountPoolArchiveFile struct {
 	Folder string
 }
 
+type accountPoolImportJobStatus string
+
+const (
+	accountPoolImportPending accountPoolImportJobStatus = "pending"
+	accountPoolImportRunning accountPoolImportJobStatus = "running"
+	accountPoolImportDone    accountPoolImportJobStatus = "done"
+	accountPoolImportFailed  accountPoolImportJobStatus = "failed"
+)
+
+type accountPoolImportJob struct {
+	ID        string                     `json:"id"`
+	Status    accountPoolImportJobStatus `json:"status"`
+	Total     int                        `json:"total"`
+	Done      int                        `json:"done"`
+	Imported  int                        `json:"imported"`
+	Failed    int                        `json:"failed"`
+	Skipped   int                        `json:"skipped"`
+	Files     []string                   `json:"files"`
+	Failures  []authUploadFailure        `json:"failures,omitempty"`
+	Error     string                     `json:"error,omitempty"`
+	CreatedAt string                     `json:"created_at"`
+	UpdatedAt string                     `json:"updated_at"`
+}
+
+type accountPoolAuthWriteCandidate struct {
+	SourceName string
+	TargetName string
+	TargetPath string
+	Data       []byte
+	Auth       *coreauth.Auth
+}
+
+type accountPoolPendingUpload struct {
+	Name        string
+	DisplayName string
+	Data        []byte
+}
+
 type accountPoolDBEntry struct {
 	Name      string `json:"name"`
 	Data      string `json:"data"`
@@ -104,16 +145,39 @@ type accountPoolFolderInfo struct {
 	SourceModel string `json:"source_model,omitempty"`
 	SourceInfo  string `json:"source_info,omitempty"`
 	Count       int    `json:"count,omitempty"`
+	Requests    int64  `json:"requests,omitempty"`
+	TotalTokens int64  `json:"total_tokens,omitempty"`
 	CreatedAt   string `json:"created_at,omitempty"`
 	UpdatedAt   string `json:"updated_at,omitempty"`
 }
 
-type accountPoolAuthWriteCandidate struct {
-	SourceName string
-	TargetName string
-	TargetPath string
-	Data       []byte
-	Auth       *coreauth.Auth
+type accountPoolRepairStats struct {
+	ConvertedSub2 int `json:"converted_sub2"`
+	InferredCodex int `json:"inferred_codex"`
+	LLMRepaired   int `json:"llm_repaired"`
+	LLMFailed     int `json:"llm_failed"`
+}
+
+type accountPoolCheckResultPayload struct {
+	Status                string   `json:"status"`
+	Message               string   `json:"message,omitempty"`
+	Plan                  string   `json:"plan,omitempty"`
+	QuotaLines            []string `json:"quotaLines,omitempty"`
+	QuotaRemainingPercent *float64 `json:"quotaRemainingPercent,omitempty"`
+	StatusCode            int      `json:"statusCode,omitempty"`
+	CheckedAt             int64    `json:"checkedAt,omitempty"`
+}
+
+type accountPoolCheckResultUpdate struct {
+	Name        string                        `json:"name"`
+	ContentHash string                        `json:"content_hash"`
+	Result      accountPoolCheckResultPayload `json:"result"`
+}
+
+type accountPoolStoredCheckResult struct {
+	Result      string
+	ContentHash string
+	UpdatedAt   string
 }
 
 var accountPoolDBMu sync.Mutex
@@ -304,9 +368,6 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
-		if h.isAccountPoolSyntheticAuth(auth) {
-			continue
-		}
 		if entry := h.buildAuthFileEntry(auth, includeHash); entry != nil {
 			files = append(files, entry)
 		}
@@ -383,9 +444,6 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, includeHash bool) {
 		if !strings.HasSuffix(strings.ToLower(name), ".json") {
 			continue
 		}
-		if isInternalAuthDataFile(name) {
-			continue
-		}
 		if info, errInfo := e.Info(); errInfo == nil {
 			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
 
@@ -424,9 +482,6 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, includeHash bool) {
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth, includeHash bool) gin.H {
 	if auth == nil {
-		return nil
-	}
-	if h.isAccountPoolSyntheticAuth(auth) {
 		return nil
 	}
 	auth.EnsureIndex()
@@ -544,14 +599,6 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth, includeHash bool) gin.
 	return entry
 }
 
-func isInternalAuthDataFile(name string) bool {
-	name = strings.ToLower(strings.TrimSpace(filepath.Base(name)))
-	return name == "account-pool.db.json" ||
-		name == "account-pool.sqlite" ||
-		name == "account-pool.zip" ||
-		strings.HasPrefix(name, ".oauth-")
-}
-
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
 	if auth == nil || auth.Metadata == nil {
 		return nil
@@ -637,6 +684,43 @@ func isUnsafeAuthFileName(name string) bool {
 		return true
 	}
 	return false
+}
+
+func isUnsafeAuthFileDeleteName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return true
+	}
+	if filepath.VolumeName(name) != "" || filepath.IsAbs(name) {
+		return true
+	}
+	cleaned := filepath.Clean(filepath.FromSlash(name))
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return true
+	}
+	return false
+}
+
+func safeAuthFileDeletePath(authDir string, name string) (string, error) {
+	if isUnsafeAuthFileDeleteName(name) {
+		return "", fmt.Errorf("invalid name")
+	}
+	authDir = strings.TrimSpace(authDir)
+	if resolved, errResolve := util.ResolveAuthDir(authDir); errResolve == nil && resolved != "" {
+		authDir = resolved
+	}
+	authDir = filepath.Clean(authDir)
+	if !filepath.IsAbs(authDir) {
+		if abs, errAbs := filepath.Abs(authDir); errAbs == nil {
+			authDir = abs
+		}
+	}
+	targetPath := filepath.Join(authDir, filepath.Clean(filepath.FromSlash(strings.TrimSpace(name))))
+	targetPath = filepath.Clean(targetPath)
+	if rel, errRel := filepath.Rel(authDir, targetPath); errRel != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid name")
+	}
+	return targetPath, nil
 }
 
 // Download single auth file by name
@@ -744,34 +828,34 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	if all := c.Query("all"); all == "true" || all == "1" || all == "*" {
-		auths := h.authManager.List()
-		ids := make([]string, 0, len(auths))
-		syntheticIDs := make([]string, 0)
-		for _, auth := range auths {
-			if auth == nil || strings.TrimSpace(auth.ID) == "" {
-				continue
-			}
-			if h.isAccountPoolSyntheticAuth(auth) {
-				syntheticIDs = append(syntheticIDs, auth.ID)
-				continue
-			}
-			ids = append(ids, auth.ID)
-		}
-		deleted, failures := h.authManager.DeleteAuthFiles(ctx, ids)
-		if len(failures) > 0 {
-			errs := make([]string, 0, len(failures))
-			for _, errDelete := range failures {
-				errs = append(errs, errDelete.Error())
-			}
-			c.JSON(http.StatusMultiStatus, gin.H{
-				"status":  "partial",
-				"deleted": deleted,
-				"failed":  errs,
-			})
+		entries, err := os.ReadDir(h.cfg.AuthDir)
+		if err != nil {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 			return
 		}
-		if len(syntheticIDs) > 0 {
-			h.authManager.RemoveAuths(syntheticIDs)
+		deleted := 0
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if !strings.HasSuffix(strings.ToLower(name), ".json") {
+				continue
+			}
+			full := filepath.Join(h.cfg.AuthDir, name)
+			if !filepath.IsAbs(full) {
+				if abs, errAbs := filepath.Abs(full); errAbs == nil {
+					full = abs
+				}
+			}
+			if err = os.Remove(full); err == nil {
+				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
+					c.JSON(500, gin.H{"error": errDel.Error()})
+					return
+				}
+				deleted++
+				h.removeAuthRuntime(full)
+			}
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
 		return
@@ -791,10 +875,6 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 			c.JSON(status, gin.H{"error": errDelete.Error()})
 			return
 		}
-		if errLoad := h.authManager.Load(ctx); errLoad != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to refresh auth manager: %v", errLoad)})
-			return
-		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		return
 	}
@@ -808,12 +888,6 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 			continue
 		}
 		deletedFiles = append(deletedFiles, deletedName)
-	}
-	if len(deletedFiles) > 0 {
-		if errLoad := h.authManager.Load(ctx); errLoad != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to refresh auth manager: %v", errLoad)})
-			return
-		}
 	}
 	if len(failed) > 0 {
 		c.JSON(http.StatusMultiStatus, gin.H{
@@ -884,30 +958,37 @@ func (h *Handler) readUploadedAccountPoolFiles(file *multipart.FileHeader) ([]st
 	if file == nil {
 		return nil, nil, nil, fmt.Errorf("no file uploaded")
 	}
-	rawName := normalizeUploadPath(file.Filename)
-	name := normalizeAccountPoolEntryName(rawName)
-	lowerName := strings.ToLower(name)
-	if !isAccountPoolUploadName(lowerName) {
-		return nil, nil, nil, errAuthFileMustBeJSON
-	}
 	src, err := file.Open()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to open uploaded file: %w", err)
 	}
 	defer src.Close()
-
 	data, err := io.ReadAll(src)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to read uploaded file: %w", err)
+	}
+	return h.readAccountPoolUploadData(file.Filename, data)
+}
+
+func (h *Handler) readAccountPoolUploadData(fileName string, data []byte) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
+	rawName := normalizeUploadPath(fileName)
+	name := normalizeAccountPoolEntryName(rawName)
+	lowerName := strings.ToLower(name)
+	if !isAccountPoolUploadName(lowerName) {
+		return nil, nil, nil, errAuthFileMustBeJSON
 	}
 	folder := accountPoolFolderFromUploadPath(rawName)
 	if isArchiveUploadName(lowerName) {
 		return readAccountPoolFilesFromArchive(data, filepath.Base(name), folder)
 	}
+	if uploaded, failures, files, ok := readAccountPoolFilesFromSub2JSON(data, folder); ok {
+		return uploaded, failures, files, nil
+	}
 	if _, err := h.buildAuthFromFileData(name, data); err != nil {
 		return nil, nil, nil, err
 	}
-	return []string{name}, nil, []accountPoolArchiveFile{{Name: name, Data: data, Folder: folder}}, nil
+	entryName := accountPoolEntryNameForFolder(folder, filepath.Base(name))
+	return []string{entryName}, nil, []accountPoolArchiveFile{{Name: entryName, Data: data, Folder: folder}}, nil
 }
 
 func isAccountPoolUploadName(name string) bool {
@@ -1050,6 +1131,12 @@ func readAccountPoolFilesFromZip(data []byte, folder string) ([]string, []authUp
 			failures = append(failures, authUploadFailure{Name: name, Error: "invalid auth file"})
 			continue
 		}
+		if sub2Uploaded, sub2Failures, sub2Files, ok := readAccountPoolFilesFromSub2JSON(entryData, folder); ok {
+			uploaded = append(uploaded, sub2Uploaded...)
+			failures = append(failures, sub2Failures...)
+			archiveFiles = append(archiveFiles, sub2Files...)
+			continue
+		}
 		entryName := accountPoolEntryNameForFolder(folder, name)
 		uploaded = append(uploaded, entryName)
 		archiveFiles = append(archiveFiles, accountPoolArchiveFile{Name: entryName, Data: entryData, Folder: folder})
@@ -1144,6 +1231,12 @@ func buildAccountPoolArchiveFilesFromRaw(files map[string][]byte, folder string)
 			failures = append(failures, authUploadFailure{Name: name, Error: "invalid auth file"})
 			continue
 		}
+		if sub2Uploaded, sub2Failures, sub2Files, ok := readAccountPoolFilesFromSub2JSON(entryData, folder); ok {
+			uploaded = append(uploaded, sub2Uploaded...)
+			failures = append(failures, sub2Failures...)
+			archiveFiles = append(archiveFiles, sub2Files...)
+			continue
+		}
 		entryName := accountPoolEntryNameForFolder(folder, name)
 		uploaded = append(uploaded, entryName)
 		archiveFiles = append(archiveFiles, accountPoolArchiveFile{Name: entryName, Data: entryData, Folder: folder})
@@ -1152,6 +1245,132 @@ func buildAccountPoolArchiveFilesFromRaw(files map[string][]byte, folder string)
 		return nil, nil, nil, errAuthArchiveNoJSON
 	}
 	return uploaded, failures, archiveFiles, nil
+}
+
+func readAccountPoolFilesFromSub2JSON(data []byte, folder string) ([]string, []authUploadFailure, []accountPoolArchiveFile, bool) {
+	docs, err := parseSub2APIDocuments(string(data))
+	if err != nil {
+		return nil, nil, nil, false
+	}
+	accounts := flattenSub2APIAccounts(docs)
+	if len(accounts) == 0 {
+		return nil, nil, nil, false
+	}
+	folder = normalizeAccountPoolFolder(folder)
+	stamp := time.Now().Unix()
+	uploaded := make([]string, 0, len(accounts))
+	failures := make([]authUploadFailure, 0)
+	archiveFiles := make([]accountPoolArchiveFile, 0, len(accounts))
+	for index, item := range accounts {
+		file, warnings, errBuild := sub2APIAccountToAccountPoolArchiveFile(item.account, item.exportedAt, folder, index, stamp)
+		if errBuild != nil {
+			failures = append(failures, authUploadFailure{Name: fmt.Sprintf("account_%d", index+1), Error: errBuild.Error()})
+			continue
+		}
+		for _, warning := range warnings {
+			if strings.TrimSpace(warning) != "" {
+				log.WithField("folder", folder).Warn(warning)
+			}
+		}
+		uploaded = append(uploaded, file.Name)
+		archiveFiles = append(archiveFiles, file)
+	}
+	return uploaded, failures, archiveFiles, true
+}
+
+func convertAccountPoolSub2Entries(entries map[string][]byte) (map[string][]byte, bool) {
+	converted, changed, _ := convertAccountPoolSub2EntriesWithStats(entries)
+	return converted, changed
+}
+
+func convertAccountPoolSub2EntriesWithStats(entries map[string][]byte) (map[string][]byte, bool, int) {
+	if len(entries) == 0 {
+		return entries, false, 0
+	}
+	var converted map[string][]byte
+	changed := false
+	convertedCount := 0
+	for name, data := range entries {
+		name = normalizeAccountPoolEntryName(name)
+		if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		folder := accountPoolFolderFromEntryName(name)
+		_, _, files, ok := readAccountPoolFilesFromSub2JSON(data, folder)
+		if !ok || len(files) == 0 {
+			continue
+		}
+		if converted == nil {
+			converted = make(map[string][]byte, len(entries)+len(files))
+			for entryName, entryData := range entries {
+				converted[entryName] = entryData
+			}
+		}
+		delete(converted, name)
+		for _, file := range files {
+			entryName := normalizeAccountPoolEntryName(file.Name)
+			if entryName == "" || isUnsafeAccountPoolEntryName(entryName) || !strings.HasSuffix(strings.ToLower(entryName), ".json") {
+				continue
+			}
+			removeDuplicateAccountPoolEntries(converted, entryName, file.Data)
+			converted[entryName] = file.Data
+			convertedCount++
+		}
+		changed = true
+	}
+	if !changed {
+		return entries, false, 0
+	}
+	return dedupeAccountPoolEntries(converted), true, convertedCount
+}
+
+func repairAccountPoolUnsupportedEntries(entries map[string][]byte) (map[string][]byte, bool, accountPoolRepairStats) {
+	converted, changedSub2, convertedSub2 := convertAccountPoolSub2EntriesWithStats(entries)
+	stats := accountPoolRepairStats{ConvertedSub2: convertedSub2}
+	repaired := changedSub2
+	if converted == nil {
+		converted = entries
+	}
+	next := make(map[string][]byte, len(converted))
+	for name, data := range converted {
+		name = normalizeAccountPoolEntryName(name)
+		if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		repairedData, ok := inferAccountPoolCodexType(data)
+		if ok {
+			data = repairedData
+			stats.InferredCodex++
+			repaired = true
+		}
+		next[name] = data
+	}
+	if !repaired {
+		return entries, false, stats
+	}
+	return dedupeAccountPoolEntries(next), true, stats
+}
+
+func inferAccountPoolCodexType(data []byte) ([]byte, bool) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || strings.TrimSpace(gjson.GetBytes(trimmed, "type").String()) != "" {
+		return data, false
+	}
+	if strings.TrimSpace(gjson.GetBytes(trimmed, "refresh_token").String()) == "" &&
+		strings.TrimSpace(gjson.GetBytes(trimmed, "access_token").String()) == "" &&
+		strings.TrimSpace(gjson.GetBytes(trimmed, "id_token").String()) == "" {
+		return data, false
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(trimmed, &parsed); err != nil {
+		return data, false
+	}
+	parsed["type"] = "codex"
+	repaired, err := json.MarshalIndent(parsed, "", "  ")
+	if err != nil {
+		return data, false
+	}
+	return repaired, true
 }
 
 func defaultAccountPoolFolder() string {
@@ -1172,10 +1391,86 @@ func accountPoolFolderFromUploadPath(name string) string {
 	if strings.Contains(name, "/") {
 		return normalizeAccountPoolFolder(strings.Split(name, "/")[0])
 	}
-	if isArchiveUploadName(strings.ToLower(name)) {
+	lowerName := strings.ToLower(name)
+	if isArchiveUploadName(lowerName) {
 		return accountPoolFolderFromUploadName(name)
 	}
 	return defaultAccountPoolFolder()
+}
+
+func accountPoolFolderFromEntryName(name string) string {
+	name = normalizeAccountPoolEntryName(name)
+	if strings.Contains(name, "/") {
+		return normalizeAccountPoolFolder(strings.Split(name, "/")[0])
+	}
+	return defaultAccountPoolFolder()
+}
+
+func accountPoolFolderFromStoredEntry(name string, folder string) string {
+	folder = normalizeAccountPoolFolder(folder)
+	name = normalizeAccountPoolEntryName(name)
+	if strings.Contains(name, "/") {
+		return normalizeAccountPoolFolder(strings.Split(name, "/")[0])
+	}
+	return defaultAccountPoolFolder()
+}
+
+var (
+	accountPoolEmailDomainPattern = regexp.MustCompile(`(?i)@([a-z0-9.-]+\.[a-z]{2,})`)
+	accountPoolDomainPattern      = regexp.MustCompile(`(?i)([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:_[0-9]+(?:_[0-9]+)?)?$`)
+)
+
+func inferAccountPoolFolderFromName(name string) string {
+	name = normalizeAccountPoolEntryName(name)
+	if name == "" {
+		return ""
+	}
+	if strings.Contains(name, "/") {
+		return normalizeAccountPoolFolder(strings.Split(name, "/")[0])
+	}
+	return defaultAccountPoolFolder()
+}
+
+func inferLegacyAccountPoolFolderFromFlatName(name string) string {
+	name = normalizeAccountPoolEntryName(name)
+	if name == "" || strings.Contains(name, "/") {
+		return ""
+	}
+	base := strings.TrimSuffix(filepath.Base(name), filepath.Ext(name))
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return ""
+	}
+	if matches := accountPoolEmailDomainPattern.FindStringSubmatch(base); len(matches) > 1 {
+		return normalizeAccountPoolFolder(matches[1])
+	}
+	if matches := accountPoolDomainPattern.FindStringSubmatch(base); len(matches) > 1 {
+		return normalizeAccountPoolFolder(matches[1])
+	}
+	if prefix := strings.TrimSpace(strings.Split(base, "_")[0]); prefix != "" {
+		return normalizeAccountPoolFolder(prefix)
+	}
+	return normalizeAccountPoolFolder(base)
+}
+
+func inferAccountPoolFolder(name string, data []byte) string {
+	normalizedName := normalizeAccountPoolEntryName(name)
+	if normalizedName != "" && !strings.Contains(normalizedName, "/") {
+		return defaultAccountPoolFolder()
+	}
+	if folder := inferAccountPoolFolderFromName(normalizedName); folder != "" && folder != defaultAccountPoolFolder() {
+		return folder
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 {
+		if typeValue := strings.TrimSpace(gjson.GetBytes(trimmed, "type").String()); typeValue != "" {
+			return normalizeAccountPoolFolder(typeValue)
+		}
+		if providerValue := strings.TrimSpace(gjson.GetBytes(trimmed, "provider").String()); providerValue != "" {
+			return normalizeAccountPoolFolder(providerValue)
+		}
+	}
+	return inferAccountPoolFolderFromName(name)
 }
 
 func normalizeAccountPoolFolder(folder string) string {
@@ -1184,7 +1479,7 @@ func normalizeAccountPoolFolder(folder string) string {
 		return defaultAccountPoolFolder()
 	}
 	folder = filepath.Base(folder)
-	folder = strings.TrimSpace(strings.TrimSuffix(folder, filepath.Ext(folder)))
+	folder = strings.TrimSpace(folder)
 	if folder == "" || folder == "." {
 		return defaultAccountPoolFolder()
 	}
@@ -1343,6 +1638,33 @@ func uploadedFileDisplayName(file *multipart.FileHeader) string {
 	return filepath.Base(strings.TrimSpace(file.Filename))
 }
 
+func readAccountPoolPendingUploads(fileHeaders []*multipart.FileHeader) ([]accountPoolPendingUpload, error) {
+	uploads := make([]accountPoolPendingUpload, 0, len(fileHeaders))
+	for _, file := range fileHeaders {
+		if file == nil {
+			continue
+		}
+		src, err := file.Open()
+		if err != nil {
+			return nil, fmt.Errorf("failed to open uploaded file %s: %w", uploadedFileDisplayName(file), err)
+		}
+		data, errRead := io.ReadAll(src)
+		errClose := src.Close()
+		if errRead != nil {
+			return nil, fmt.Errorf("failed to read uploaded file %s: %w", uploadedFileDisplayName(file), errRead)
+		}
+		if errClose != nil {
+			return nil, fmt.Errorf("failed to close uploaded file %s: %w", uploadedFileDisplayName(file), errClose)
+		}
+		uploads = append(uploads, accountPoolPendingUpload{
+			Name:        file.Filename,
+			DisplayName: uploadedFileDisplayName(file),
+			Data:        data,
+		})
+	}
+	return uploads, nil
+}
+
 func uploadErrorMessage(err error) string {
 	if errors.Is(err, errAuthFileMustBeJSON) {
 		return "file must be .json or .zip"
@@ -1471,7 +1793,14 @@ func (h *Handler) readAccountPoolDatabaseLocked() (map[string][]byte, error) {
 		return nil, fmt.Errorf("failed to create auth dir: %w", err)
 	}
 	if _, err := os.Stat(h.accountPoolSQLitePath()); err == nil {
-		return h.readAccountPoolSQLiteLocked()
+		if errEnsure := h.ensureAccountPoolSQLiteSub2Converted(); errEnsure != nil {
+			return nil, errEnsure
+		}
+		entries, errRead := h.readAccountPoolSQLiteLocked()
+		if errRead != nil {
+			return nil, errRead
+		}
+		return h.migrateAccountPoolSub2EntriesLocked(entries)
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("failed to stat account pool sqlite database: %w", err)
 	}
@@ -1486,12 +1815,300 @@ func (h *Handler) readAccountPoolDatabaseLocked() (map[string][]byte, error) {
 			return nil, errRead
 		}
 	}
+	entries, _ = convertAccountPoolSub2Entries(entries)
 	if len(entries) > 0 {
 		if errWrite := h.writeAccountPoolSQLiteLocked(entries); errWrite != nil {
 			return nil, errWrite
 		}
 	}
 	return entries, nil
+}
+
+func (h *Handler) migrateAccountPoolSub2EntriesLocked(entries map[string][]byte) (map[string][]byte, error) {
+	converted, changed := convertAccountPoolSub2Entries(entries)
+	if !changed {
+		return entries, nil
+	}
+	if err := h.writeAccountPoolSQLiteLocked(converted); err != nil {
+		return nil, fmt.Errorf("failed to migrate sub2api account pool entries: %w", err)
+	}
+	return converted, nil
+}
+
+func (h *Handler) ensureAccountPoolSQLiteSub2Converted() error {
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool sqlite database")
+		}
+	}()
+
+	var candidateCount int
+	if err = db.QueryRow(`
+SELECT COUNT(*)
+FROM account_pool_entries
+WHERE COALESCE(type, '') = ''
+  AND COALESCE(provider, '') = ''
+  AND data LIKE '%"accounts"%'
+`).Scan(&candidateCount); err != nil {
+		return fmt.Errorf("failed to inspect account pool sqlite sub2 rows: %w", err)
+	}
+	if candidateCount == 0 {
+		return nil
+	}
+	entries, errRead := h.readAccountPoolSQLiteLocked()
+	if errRead != nil {
+		return errRead
+	}
+	converted, changed, _ := repairAccountPoolUnsupportedEntries(entries)
+	if !changed {
+		return nil
+	}
+	if errWrite := h.writeAccountPoolSQLiteLocked(converted); errWrite != nil {
+		return fmt.Errorf("failed to persist converted sub2 account pool entries: %w", errWrite)
+	}
+	return nil
+}
+
+func (h *Handler) ensureAccountPoolSQLiteFoldersInferred() error {
+	accountPoolDBMu.Lock()
+	defer accountPoolDBMu.Unlock()
+
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool sqlite database")
+		}
+	}()
+
+	rows, err := db.Query(`SELECT name, data, COALESCE(folder, '') FROM account_pool_entries`)
+	if err != nil {
+		return fmt.Errorf("failed to query account pool folder inference candidates: %w", err)
+	}
+	type folderUpdate struct {
+		name   string
+		folder string
+	}
+	updates := make([]folderUpdate, 0)
+	for rows.Next() {
+		var name, data, folder string
+		if errScan := rows.Scan(&name, &data, &folder); errScan != nil {
+			_ = rows.Close()
+			return fmt.Errorf("failed to scan account pool folder inference candidate: %w", errScan)
+		}
+		currentFolder := normalizeAccountPoolFolder(folder)
+		normalizedName := normalizeAccountPoolEntryName(name)
+		if accountPoolEntryNameHasDefaultFolderPrefix(normalizedName) && currentFolder != defaultAccountPoolFolder() {
+			updates = append(updates, folderUpdate{name: name, folder: defaultAccountPoolFolder()})
+			continue
+		}
+		if normalizedName != "" && !strings.Contains(normalizedName, "/") && currentFolder != defaultAccountPoolFolder() {
+			updates = append(updates, folderUpdate{name: name, folder: defaultAccountPoolFolder()})
+			continue
+		}
+		if currentFolder != "" && currentFolder != defaultAccountPoolFolder() {
+			continue
+		}
+		inferred := inferAccountPoolFolder(name, []byte(data))
+		if inferred == "" || inferred == defaultAccountPoolFolder() {
+			continue
+		}
+		updates = append(updates, folderUpdate{name: name, folder: inferred})
+	}
+	if errClose := rows.Close(); errClose != nil {
+		return fmt.Errorf("failed to close account pool folder inference rows: %w", errClose)
+	}
+	if errRows := rows.Err(); errRows != nil {
+		return fmt.Errorf("failed to read account pool folder inference rows: %w", errRows)
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin account pool folder inference transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if errRollback := tx.Rollback(); errRollback != nil {
+				log.WithError(errRollback).Debug("failed to rollback account pool folder inference transaction")
+			}
+		}
+	}()
+	stmt, err := tx.Prepare(`UPDATE account_pool_entries SET folder = ? WHERE name = ?`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare account pool folder inference update: %w", err)
+	}
+	defer func() {
+		if errClose := stmt.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool folder inference statement")
+		}
+	}()
+	now := time.Now().UTC().Format(time.RFC3339)
+	folders := make(map[string]struct{}, len(updates))
+	for _, update := range updates {
+		if _, errExec := stmt.Exec(update.folder, update.name); errExec != nil {
+			return fmt.Errorf("failed to update inferred account pool folder %s: %w", update.name, errExec)
+		}
+		folders[update.folder] = struct{}{}
+	}
+	if err = upsertAccountPoolFoldersTx(tx, folders, now); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit account pool folder inference: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func accountPoolEntryNameHasDefaultFolderPrefix(name string) bool {
+	name = normalizeAccountPoolEntryName(name)
+	if !strings.Contains(name, "/") {
+		return false
+	}
+	first := strings.Split(name, "/")[0]
+	return normalizeAccountPoolFolder(first) == defaultAccountPoolFolder()
+}
+
+func (h *Handler) ensureAccountPoolSQLiteSingleAccountFoldersDefault() error {
+	accountPoolDBMu.Lock()
+	defer accountPoolDBMu.Unlock()
+
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool sqlite database")
+		}
+	}()
+
+	rows, err := db.Query(`SELECT name, COALESCE(folder, '') FROM account_pool_entries`)
+	if err != nil {
+		return fmt.Errorf("failed to query account pool single-folder candidates: %w", err)
+	}
+	type singleFolderEntry struct {
+		name   string
+		folder string
+	}
+	groups := make(map[string][]singleFolderEntry)
+	existingNames := make(map[string]struct{})
+	for rows.Next() {
+		var name, folder string
+		if errScan := rows.Scan(&name, &folder); errScan != nil {
+			_ = rows.Close()
+			return fmt.Errorf("failed to scan account pool single-folder candidate: %w", errScan)
+		}
+		name = normalizeAccountPoolEntryName(name)
+		if name == "" {
+			continue
+		}
+		existingNames[name] = struct{}{}
+		entryFolder := accountPoolFolderFromStoredEntry(name, folder)
+		groups[entryFolder] = append(groups[entryFolder], singleFolderEntry{name: name, folder: entryFolder})
+	}
+	if errClose := rows.Close(); errClose != nil {
+		return fmt.Errorf("failed to close account pool single-folder rows: %w", errClose)
+	}
+	if errRows := rows.Err(); errRows != nil {
+		return fmt.Errorf("failed to read account pool single-folder rows: %w", errRows)
+	}
+
+	type folderMove struct {
+		from string
+		to   string
+	}
+	moves := make([]folderMove, 0)
+	for folder, entries := range groups {
+		if folder == "" || folder == defaultAccountPoolFolder() || len(entries) != 1 {
+			continue
+		}
+		from := entries[0].name
+		to := uniqueDefaultAccountPoolEntryName(from, existingNames)
+		if to == "" || to == from {
+			continue
+		}
+		delete(existingNames, from)
+		existingNames[to] = struct{}{}
+		moves = append(moves, folderMove{from: from, to: to})
+	}
+	if len(moves) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin account pool single-folder transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if errRollback := tx.Rollback(); errRollback != nil {
+				log.WithError(errRollback).Debug("failed to rollback account pool single-folder transaction")
+			}
+		}
+	}()
+
+	stmt, err := tx.Prepare(`UPDATE account_pool_entries SET name = ?, folder = ?, updated_at = ? WHERE name = ?`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare account pool single-folder update: %w", err)
+	}
+	defer func() {
+		if errClose := stmt.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool single-folder statement")
+		}
+	}()
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, move := range moves {
+		if _, errExec := stmt.Exec(move.to, defaultAccountPoolFolder(), now, move.from); errExec != nil {
+			return fmt.Errorf("failed to move account pool single-folder entry %s: %w", move.from, errExec)
+		}
+	}
+	if err = upsertAccountPoolFoldersTx(tx, map[string]struct{}{defaultAccountPoolFolder(): {}}, now); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit account pool single-folder migration: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func uniqueDefaultAccountPoolEntryName(name string, existing map[string]struct{}) string {
+	name = normalizeAccountPoolEntryName(name)
+	if name == "" {
+		return ""
+	}
+	base := path.Base(name)
+	if base == "." || base == "/" || base == "" {
+		return ""
+	}
+	target := accountPoolEntryNameForFolder(defaultAccountPoolFolder(), base)
+	if target == "" {
+		return ""
+	}
+	if _, ok := existing[target]; !ok || target == name {
+		return target
+	}
+	ext := path.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	for i := 2; i < 10000; i++ {
+		candidate := accountPoolEntryNameForFolder(defaultAccountPoolFolder(), fmt.Sprintf("%s_%d%s", stem, i, ext))
+		if _, ok := existing[candidate]; !ok {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func (h *Handler) readAccountPoolJSONDatabase() (map[string][]byte, error) {
@@ -1608,7 +2225,10 @@ CREATE TABLE IF NOT EXISTS account_pool_entries (
 	size INTEGER NOT NULL DEFAULT 0,
 	data TEXT NOT NULL,
 	created_at TEXT NOT NULL,
-	updated_at TEXT NOT NULL
+	updated_at TEXT NOT NULL,
+	check_result TEXT NOT NULL DEFAULT '',
+	check_content_hash TEXT NOT NULL DEFAULT '',
+	check_updated_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_account_pool_entries_email ON account_pool_entries(email);
 CREATE INDEX IF NOT EXISTS idx_account_pool_entries_type ON account_pool_entries(type);
@@ -1641,6 +2261,9 @@ func ensureAccountPoolSQLiteSchema(db *sql.DB) error {
 		def   string
 	}{
 		{"account_pool_entries", "folder", "TEXT NOT NULL DEFAULT ''"},
+		{"account_pool_entries", "check_result", "TEXT NOT NULL DEFAULT ''"},
+		{"account_pool_entries", "check_content_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"account_pool_entries", "check_updated_at", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range columns {
 		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", column.table, column.name, column.def)); err != nil {
@@ -1702,15 +2325,18 @@ CREATE TABLE account_pool_entries (
 	size INTEGER NOT NULL DEFAULT 0,
 	data TEXT NOT NULL,
 	created_at TEXT NOT NULL,
-	updated_at TEXT NOT NULL
+	updated_at TEXT NOT NULL,
+	check_result TEXT NOT NULL DEFAULT '',
+	check_content_hash TEXT NOT NULL DEFAULT '',
+	check_updated_at TEXT NOT NULL DEFAULT ''
 )`); err != nil {
 		return fmt.Errorf("failed to create migrated account pool sqlite table: %w", err)
 	}
 	if _, err = tx.Exec(`
 INSERT OR REPLACE INTO account_pool_entries (
-	name, content_hash, type, provider, email, folder, size, data, created_at, updated_at
+	name, content_hash, type, provider, email, folder, size, data, created_at, updated_at, check_result, check_content_hash, check_updated_at
 )
-SELECT name, content_hash, type, provider, email, COALESCE(folder, ''), size, data, created_at, updated_at
+SELECT name, content_hash, type, provider, email, COALESCE(folder, ''), size, data, created_at, updated_at, '', '', ''
 FROM account_pool_entries_old_hash_unique
 WHERE name IS NOT NULL AND TRIM(name) != ''`); err != nil {
 		return fmt.Errorf("failed to copy account pool sqlite entries: %w", err)
@@ -1850,6 +2476,26 @@ func (h *Handler) writeAccountPoolSQLiteLocked(entries map[string][]byte) error 
 			}
 		}
 	}()
+	previousChecks := make(map[string]accountPoolStoredCheckResult)
+	if rows, errRows := tx.Query(`SELECT name, COALESCE(check_result, ''), COALESCE(check_content_hash, ''), COALESCE(check_updated_at, '') FROM account_pool_entries`); errRows == nil {
+		for rows.Next() {
+			var name string
+			var check accountPoolStoredCheckResult
+			if errScan := rows.Scan(&name, &check.Result, &check.ContentHash, &check.UpdatedAt); errScan != nil {
+				log.WithError(errScan).Debug("failed to scan previous account pool check result")
+				continue
+			}
+			name = normalizeAccountPoolEntryName(name)
+			if name != "" && strings.TrimSpace(check.Result) != "" {
+				previousChecks[name] = check
+			}
+		}
+		if errClose := rows.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close previous account pool check result rows")
+		}
+	} else {
+		log.WithError(errRows).Debug("failed to load previous account pool check results")
+	}
 	if _, err = tx.Exec(`DELETE FROM account_pool_entries`); err != nil {
 		return fmt.Errorf("failed to clear account pool sqlite database: %w", err)
 	}
@@ -1857,8 +2503,8 @@ func (h *Handler) writeAccountPoolSQLiteLocked(entries map[string][]byte) error 
 	folders := make(map[string]struct{})
 	stmt, err := tx.Prepare(`
 INSERT INTO account_pool_entries (
-	name, content_hash, type, provider, email, folder, size, data, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	name, content_hash, type, provider, email, folder, size, data, created_at, updated_at, check_result, check_content_hash, check_updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(name) DO UPDATE SET
 	content_hash=excluded.content_hash,
 	type=excluded.type,
@@ -1867,6 +2513,9 @@ ON CONFLICT(name) DO UPDATE SET
 	folder=CASE WHEN excluded.folder != '' THEN excluded.folder ELSE account_pool_entries.folder END,
 	size=excluded.size,
 	data=excluded.data,
+	check_result=CASE WHEN excluded.check_result != '' THEN excluded.check_result ELSE account_pool_entries.check_result END,
+	check_content_hash=CASE WHEN excluded.check_content_hash != '' THEN excluded.check_content_hash ELSE account_pool_entries.check_content_hash END,
+	check_updated_at=CASE WHEN excluded.check_updated_at != '' THEN excluded.check_updated_at ELSE account_pool_entries.check_updated_at END,
 	updated_at=excluded.updated_at
 `)
 	if err != nil {
@@ -1881,6 +2530,10 @@ ON CONFLICT(name) DO UPDATE SET
 		name = normalizeAccountPoolEntryName(name)
 		entry := buildAccountPoolDBEntry(name, data, now)
 		folders[entry.Folder] = struct{}{}
+		check := previousChecks[name]
+		if check.ContentHash != "" && check.ContentHash != entry.Hash {
+			check = accountPoolStoredCheckResult{}
+		}
 		if _, err = stmt.Exec(
 			entry.Name,
 			entry.Hash,
@@ -1892,6 +2545,9 @@ ON CONFLICT(name) DO UPDATE SET
 			entry.Data,
 			entry.CreatedAt,
 			entry.UpdatedAt,
+			check.Result,
+			check.ContentHash,
+			check.UpdatedAt,
 		); err != nil {
 			return fmt.Errorf("failed to insert account pool sqlite entry %s: %w", name, err)
 		}
@@ -1931,8 +2587,8 @@ func (h *Handler) upsertAccountPoolSQLiteFilesLocked(files []accountPoolArchiveF
 	}()
 	stmt, err := tx.Prepare(`
 INSERT INTO account_pool_entries (
-	name, content_hash, type, provider, email, folder, size, data, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	name, content_hash, type, provider, email, folder, size, data, created_at, updated_at, check_result, check_content_hash, check_updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(name) DO UPDATE SET
 	content_hash=excluded.content_hash,
 	type=excluded.type,
@@ -1941,6 +2597,9 @@ ON CONFLICT(name) DO UPDATE SET
 	folder=CASE WHEN excluded.folder != '' THEN excluded.folder ELSE account_pool_entries.folder END,
 	size=excluded.size,
 	data=excluded.data,
+	check_result=CASE WHEN excluded.check_result != '' THEN excluded.check_result ELSE account_pool_entries.check_result END,
+	check_content_hash=CASE WHEN excluded.check_content_hash != '' THEN excluded.check_content_hash ELSE account_pool_entries.check_content_hash END,
+	check_updated_at=CASE WHEN excluded.check_updated_at != '' THEN excluded.check_updated_at ELSE account_pool_entries.check_updated_at END,
 	updated_at=excluded.updated_at
 `)
 	if err != nil {
@@ -1964,7 +2623,9 @@ ON CONFLICT(name) DO UPDATE SET
 			continue
 		}
 		entry := buildAccountPoolDBEntry(name, file.Data, now)
-		entry.Folder = normalizeAccountPoolFolder(file.Folder)
+		if strings.TrimSpace(file.Folder) != "" {
+			entry.Folder = normalizeAccountPoolFolder(file.Folder)
+		}
 		for _, identity := range accountPoolIdentityKeys(file.Data) {
 			if previousName := pendingIdentities[identity]; previousName != "" && !strings.EqualFold(previousName, name) {
 				delete(pendingEntries, previousName)
@@ -2032,6 +2693,9 @@ ON CONFLICT(name) DO UPDATE SET
 			entry.Data,
 			entry.CreatedAt,
 			entry.UpdatedAt,
+			"",
+			"",
+			"",
 		); err != nil {
 			return fmt.Errorf("failed to upsert account pool sqlite entry %s: %w", name, err)
 		}
@@ -2097,7 +2761,7 @@ func buildAccountPoolDBEntry(name string, data []byte, now string) accountPoolDB
 		Type:      typeValue,
 		Provider:  typeValue,
 		Email:     emailValue,
-		Folder:    defaultAccountPoolFolder(),
+		Folder:    inferAccountPoolFolder(name, trimmed),
 		Size:      len(trimmed),
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -2324,6 +2988,882 @@ func normalizeAccountPoolJSON(value any) any {
 	default:
 		return value
 	}
+}
+
+func (h *Handler) DownloadAccountPoolArchive(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if c.Request != nil && c.Request.Method == http.MethodPost {
+		names, errNames := requestedAuthFileNamesForDelete(c)
+		if errNames != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errNames.Error()})
+			return
+		}
+		filtered := make(map[string][]byte, len(names))
+		for _, name := range names {
+			name = normalizeAccountPoolEntryName(name)
+			if isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid name: %s", name)})
+				return
+			}
+			if data, ok := entries[name]; ok {
+				filtered[name] = data
+			}
+		}
+		entries = filtered
+	}
+	data, err := buildAccountPoolZip(entries)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", buildAccountPoolArchiveName()))
+	c.Data(http.StatusOK, "application/zip", data)
+}
+
+func (h *Handler) ListAccountPoolEntries(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	includeHash := strings.EqualFold(strings.TrimSpace(c.Query("include_hash")), "true")
+	if _, err := os.Stat(h.accountPoolSQLitePath()); err == nil {
+		if errEnsure := h.ensureAccountPoolSQLiteSub2Converted(); errEnsure != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errEnsure.Error()})
+			return
+		}
+		if errEnsureFolders := h.ensureAccountPoolSQLiteFoldersInferred(); errEnsureFolders != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errEnsureFolders.Error()})
+			return
+		}
+		if errEnsureSingleFolders := h.ensureAccountPoolSQLiteSingleAccountFoldersDefault(); errEnsureSingleFolders != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errEnsureSingleFolders.Error()})
+			return
+		}
+		files, folderInfos, errList := h.listAccountPoolSQLiteEntrySummaries(includeHash)
+		if errList != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errList.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"files": files, "folders": folderInfos})
+		return
+	} else if !os.IsNotExist(err) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to stat account pool sqlite database: %v", err)})
+		return
+	}
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	folderByName, errFolders := h.readAccountPoolFolderMapLocked()
+	if errFolders != nil {
+		log.WithError(errFolders).Warn("failed to read account pool folder map")
+		folderByName = map[string]string{}
+	}
+	folderInfos, errFolderInfos := h.listAccountPoolFolders()
+	if errFolderInfos != nil {
+		log.WithError(errFolderInfos).Warn("failed to read account pool folder info")
+		folderInfos = nil
+	}
+	files := make([]gin.H, 0, len(entries))
+	folderUsage := make(map[string]accountPoolUsageSummary)
+	for name, data := range entries {
+		folder := inferAccountPoolFolder(name, data)
+		if storedFolder := normalizeAccountPoolFolder(folderByName[name]); storedFolder != "" && storedFolder != defaultAccountPoolFolder() {
+			folder = storedFolder
+		}
+		entry := gin.H{
+			"id":         name,
+			"auth_id":    name,
+			"auth_index": name,
+			"name":       name,
+			"size":       len(data),
+			"source":     "account_pool",
+			"folder":     folder,
+		}
+		if typeValue := strings.TrimSpace(gjson.GetBytes(data, "type").String()); typeValue != "" {
+			entry["type"] = typeValue
+			entry["provider"] = typeValue
+		}
+		if emailValue := strings.TrimSpace(gjson.GetBytes(data, "email").String()); emailValue != "" {
+			entry["email"] = emailValue
+		}
+		summary := accountPoolUsage.SummaryForAccountPoolEntry(name, accountPoolUsageEmailFromEntry(data))
+		applyAccountPoolUsageSummary(entry, summary)
+		accumulateAccountPoolFolderUsage(folderUsage, folder, summary)
+		if includeHash {
+			entry["content_hash"] = hashAccountPoolContent(data)
+		}
+		files = append(files, entry)
+	}
+	applyAccountPoolFolderUsageSummaries(folderInfos, folderUsage)
+	sort.Slice(files, func(i, j int) bool {
+		nameI, _ := files[i]["name"].(string)
+		nameJ, _ := files[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	c.JSON(http.StatusOK, gin.H{"files": files, "folders": folderInfos})
+}
+
+func (h *Handler) RepairAccountPoolEntries(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	repairedEntries, changed, stats := repairAccountPoolUnsupportedEntries(entries)
+	if llmEntries, llmChanged, llmStats := h.repairAccountPoolEntriesWithLLM(c.Request.Context(), repairedEntries); llmChanged {
+		repairedEntries = llmEntries
+		changed = true
+		stats.LLMRepaired += llmStats.LLMRepaired
+		stats.LLMFailed += llmStats.LLMFailed
+	} else {
+		stats.LLMFailed += llmStats.LLMFailed
+	}
+	if changed {
+		if errWrite := h.writeAccountPoolArchive(repairedEntries); errWrite != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errWrite.Error()})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":         "ok",
+		"repaired":       changed,
+		"converted_sub2": stats.ConvertedSub2,
+		"inferred_codex": stats.InferredCodex,
+		"llm_repaired":   stats.LLMRepaired,
+		"llm_failed":     stats.LLMFailed,
+	})
+}
+
+func (h *Handler) repairAccountPoolEntriesWithLLM(ctx context.Context, entries map[string][]byte) (map[string][]byte, bool, accountPoolRepairStats) {
+	stats := accountPoolRepairStats{}
+	if len(entries) == 0 {
+		return entries, false, stats
+	}
+	model, ok := h.accountPoolRepairModel()
+	if !ok {
+		return entries, false, stats
+	}
+	next := make(map[string][]byte, len(entries))
+	for name, data := range entries {
+		next[name] = data
+	}
+	changed := false
+	for name, data := range entries {
+		name = normalizeAccountPoolEntryName(name)
+		if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "" {
+			continue
+		}
+		repaired, err := h.repairAccountPoolJSONWithOwnModel(ctx, model, name, data)
+		if err != nil {
+			stats.LLMFailed++
+			log.WithError(err).Warnf("failed to repair account pool entry %s with llm", name)
+			continue
+		}
+		if len(bytes.TrimSpace(repaired)) == 0 || strings.TrimSpace(gjson.GetBytes(repaired, "type").String()) == "" {
+			stats.LLMFailed++
+			continue
+		}
+		removeDuplicateAccountPoolEntries(next, name, repaired)
+		next[name] = repaired
+		stats.LLMRepaired++
+		changed = true
+	}
+	if !changed {
+		return entries, false, stats
+	}
+	return dedupeAccountPoolEntries(next), true, stats
+}
+
+func (h *Handler) accountPoolRepairModel() (string, bool) {
+	if h == nil || h.authManager == nil {
+		return "", false
+	}
+	if h.authManager.HomeEnabled() {
+		return "auto", true
+	}
+	model, err := registry.GetGlobalRegistry().GetFirstAvailableModel("openai")
+	if err == nil && strings.TrimSpace(model) != "" {
+		return strings.TrimSpace(model), true
+	}
+	model, err = registry.GetGlobalRegistry().GetFirstAvailableModel("")
+	if err == nil && strings.TrimSpace(model) != "" {
+		return strings.TrimSpace(model), true
+	}
+	return "", false
+}
+
+func (h *Handler) repairAccountPoolJSONWithOwnModel(ctx context.Context, model string, name string, data []byte) ([]byte, error) {
+	if h == nil || h.authManager == nil {
+		return nil, fmt.Errorf("auth manager is not available")
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil, fmt.Errorf("repair model is not available")
+	}
+	raw := string(bytes.TrimSpace(data))
+	if len(raw) > 120000 {
+		raw = raw[:120000]
+	}
+	prompt := fmt.Sprintf(`Convert this account JSON into one valid CLIProxyAPI CPA auth JSON object.
+Return JSON only, no markdown. Preserve all useful token fields. If it is an OpenAI/Codex OAuth account, set "type":"codex".
+Required output shape when possible:
+{"type":"codex","email":"","access_token":"","refresh_token":"","id_token":"","client_id":"","account_id":"","expired":"","last_refresh":""}
+File name: %s
+Input JSON:
+%s`, name, raw)
+	body := map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "system", "content": "You repair malformed auth JSON. Return exactly one JSON object and nothing else."},
+			{"role": "user", "content": prompt},
+		},
+		"temperature": 0,
+	}
+	bodyData, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+
+	var sdkCfg *sdkconfig.SDKConfig
+	if h.cfg != nil {
+		sdkCfg = &h.cfg.SDKConfig
+	}
+	apiHandler := sdkhandlers.NewBaseAPIHandlers(sdkCfg, h.authManager)
+	respData, _, errMsg := apiHandler.ExecuteWithAuthManager(ctx, "openai", model, bodyData, "")
+	if errMsg != nil {
+		if errMsg.Error == nil {
+			return nil, fmt.Errorf("own model repair failed with status %d", errMsg.StatusCode)
+		}
+		return nil, fmt.Errorf("own model repair failed: %w", errMsg.Error)
+	}
+	content := strings.TrimSpace(gjson.GetBytes(respData, "choices.0.message.content").String())
+	if content == "" {
+		return nil, fmt.Errorf("llm repair returned empty content")
+	}
+	content = strings.TrimPrefix(content, "```json")
+	content = strings.TrimPrefix(content, "```")
+	content = strings.TrimSuffix(content, "```")
+	content = strings.TrimSpace(content)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(content), &parsed); err != nil {
+		return nil, fmt.Errorf("llm repair returned invalid json: %w", err)
+	}
+	if strings.TrimSpace(fmt.Sprint(parsed["type"])) == "" &&
+		(strings.TrimSpace(fmt.Sprint(parsed["refresh_token"])) != "" ||
+			strings.TrimSpace(fmt.Sprint(parsed["access_token"])) != "" ||
+			strings.TrimSpace(fmt.Sprint(parsed["id_token"])) != "") {
+		parsed["type"] = "codex"
+	}
+	return json.MarshalIndent(parsed, "", "  ")
+}
+
+func normalizeAccountPoolCheckResultPayload(result accountPoolCheckResultPayload, now time.Time) (accountPoolCheckResultPayload, bool) {
+	status := strings.ToLower(strings.TrimSpace(result.Status))
+	switch status {
+	case "success", "error", "unsupported", "idle":
+	default:
+		return accountPoolCheckResultPayload{}, false
+	}
+	if status == "idle" {
+		return accountPoolCheckResultPayload{Status: status, CheckedAt: now.UnixMilli()}, true
+	}
+	if result.CheckedAt <= 0 {
+		result.CheckedAt = now.UnixMilli()
+	}
+	result.Status = status
+	result.Message = strings.TrimSpace(result.Message)
+	if len(result.Message) > 1000 {
+		result.Message = result.Message[:1000]
+	}
+	result.Plan = strings.TrimSpace(result.Plan)
+	if len(result.Plan) > 120 {
+		result.Plan = result.Plan[:120]
+	}
+	if result.StatusCode < 0 {
+		result.StatusCode = 0
+	}
+	if len(result.QuotaLines) > 8 {
+		result.QuotaLines = result.QuotaLines[:8]
+	}
+	for i, line := range result.QuotaLines {
+		line = strings.TrimSpace(line)
+		if len(line) > 240 {
+			line = line[:240]
+		}
+		result.QuotaLines[i] = line
+	}
+	return result, true
+}
+
+func applyAccountPoolCheckResult(entry gin.H, rawResult string, checkContentHash string, checkUpdatedAt string, contentHash string) {
+	rawResult = strings.TrimSpace(rawResult)
+	if rawResult == "" {
+		return
+	}
+	checkContentHash = strings.TrimSpace(checkContentHash)
+	contentHash = strings.TrimSpace(contentHash)
+	if checkContentHash != "" && contentHash != "" && checkContentHash != contentHash {
+		return
+	}
+	var result accountPoolCheckResultPayload
+	if err := json.Unmarshal([]byte(rawResult), &result); err != nil {
+		return
+	}
+	result, ok := normalizeAccountPoolCheckResultPayload(result, time.Now())
+	if !ok {
+		return
+	}
+	entry["check_status"] = result.Status
+	if result.Message != "" {
+		entry["check_message"] = result.Message
+	}
+	if result.Plan != "" {
+		entry["check_plan"] = result.Plan
+	}
+	if len(result.QuotaLines) > 0 {
+		entry["check_quota_lines"] = result.QuotaLines
+	}
+	if result.QuotaRemainingPercent != nil {
+		entry["check_quota_remaining_percent"] = *result.QuotaRemainingPercent
+	}
+	if result.StatusCode > 0 {
+		entry["check_status_code"] = result.StatusCode
+	}
+	if result.CheckedAt > 0 {
+		entry["check_checked_at"] = result.CheckedAt
+	} else if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(checkUpdatedAt)); err == nil {
+		entry["check_checked_at"] = parsed.UnixMilli()
+	}
+	if checkContentHash != "" {
+		entry["check_content_hash"] = checkContentHash
+	}
+}
+
+func (h *Handler) PatchAccountPoolCheckResults(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	var req struct {
+		Results []accountPoolCheckResultUpdate `json:"results"`
+		Updates []accountPoolCheckResultUpdate `json:"updates"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	updates := req.Results
+	if len(updates) == 0 {
+		updates = req.Updates
+	}
+	if len(updates) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "results are required"})
+		return
+	}
+
+	accountPoolDBMu.Lock()
+	defer accountPoolDBMu.Unlock()
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool sqlite database")
+		}
+	}()
+	tx, err := db.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to begin account pool check result transaction: %v", err)})
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if errRollback := tx.Rollback(); errRollback != nil {
+				log.WithError(errRollback).Debug("failed to rollback account pool check result transaction")
+			}
+		}
+	}()
+	stmt, err := tx.Prepare(`UPDATE account_pool_entries SET check_result = ?, check_content_hash = ?, check_updated_at = ? WHERE name = ?`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to prepare account pool check result update: %v", err)})
+		return
+	}
+	defer func() {
+		if errClose := stmt.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool check result statement")
+		}
+	}()
+	now := time.Now().UTC()
+	updated := 0
+	skipped := 0
+	missing := make([]string, 0)
+	for _, update := range updates {
+		name := normalizeAccountPoolEntryName(update.Name)
+		if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			skipped++
+			continue
+		}
+		result, ok := normalizeAccountPoolCheckResultPayload(update.Result, now)
+		if !ok {
+			skipped++
+			continue
+		}
+		resultJSON, errMarshal := json.Marshal(result)
+		if errMarshal != nil {
+			skipped++
+			continue
+		}
+		res, errExec := stmt.Exec(string(resultJSON), strings.TrimSpace(update.ContentHash), now.Format(time.RFC3339), name)
+		if errExec != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update account pool check result %s: %v", name, errExec)})
+			return
+		}
+		rowsAffected, _ := res.RowsAffected()
+		if rowsAffected == 0 {
+			missing = append(missing, name)
+			continue
+		}
+		updated++
+	}
+	if err = tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to commit account pool check results: %v", err)})
+		return
+	}
+	committed = true
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "updated": updated, "skipped": skipped, "missing": missing})
+}
+
+func (h *Handler) listAccountPoolSQLiteEntrySummaries(includeHash bool) ([]gin.H, []accountPoolFolderInfo, error) {
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool sqlite database")
+		}
+	}()
+
+	folderInfos, errFolders := listAccountPoolFoldersFromDB(db)
+	if errFolders != nil {
+		return nil, nil, errFolders
+	}
+
+	rows, err := db.Query(`
+SELECT name, content_hash, COALESCE(type, ''), COALESCE(provider, ''), COALESCE(email, ''), COALESCE(folder, ''), size, COALESCE(check_result, ''), COALESCE(check_content_hash, ''), COALESCE(check_updated_at, '')
+FROM account_pool_entries
+ORDER BY lower(name)`)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to query account pool sqlite summaries: %w", err)
+	}
+	defer func() {
+		if errClose := rows.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool sqlite summary rows")
+		}
+	}()
+
+	files := make([]gin.H, 0)
+	folderUsage := make(map[string]accountPoolUsageSummary)
+	for rows.Next() {
+		var name, contentHash, typeValue, provider, email, folder, checkResult, checkContentHash, checkUpdatedAt string
+		var size int
+		if errScan := rows.Scan(&name, &contentHash, &typeValue, &provider, &email, &folder, &size, &checkResult, &checkContentHash, &checkUpdatedAt); errScan != nil {
+			return nil, nil, fmt.Errorf("failed to scan account pool sqlite summary: %w", errScan)
+		}
+		name = normalizeAccountPoolEntryName(name)
+		if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		entryFolder := accountPoolFolderFromStoredEntry(name, folder)
+		entry := gin.H{
+			"id":         name,
+			"auth_id":    name,
+			"auth_index": name,
+			"name":       name,
+			"size":       size,
+			"source":     "account_pool",
+			"folder":     entryFolder,
+		}
+		if typeValue != "" {
+			entry["type"] = typeValue
+		}
+		if provider != "" {
+			entry["provider"] = provider
+		} else if typeValue != "" {
+			entry["provider"] = typeValue
+		}
+		if email != "" {
+			entry["email"] = email
+		}
+		summary := accountPoolUsage.SummaryForAccountPoolEntry(name, email)
+		applyAccountPoolUsageSummary(entry, summary)
+		accumulateAccountPoolFolderUsage(folderUsage, entryFolder, summary)
+		if includeHash {
+			entry["content_hash"] = contentHash
+		}
+		applyAccountPoolCheckResult(entry, checkResult, checkContentHash, checkUpdatedAt, contentHash)
+		files = append(files, entry)
+	}
+	if errRows := rows.Err(); errRows != nil {
+		return nil, nil, fmt.Errorf("failed to read account pool sqlite summaries: %w", errRows)
+	}
+	applyAccountPoolFolderUsageSummaries(folderInfos, folderUsage)
+	return files, folderInfos, nil
+}
+
+func applyAccountPoolUsageSummary(entry gin.H, summary accountPoolUsageSummary) {
+	if summary.Requests <= 0 &&
+		summary.Successes <= 0 &&
+		summary.Failures <= 0 &&
+		summary.InputTokens <= 0 &&
+		summary.OutputTokens <= 0 &&
+		summary.CachedTokens <= 0 &&
+		summary.CacheReadTokens <= 0 &&
+		summary.CacheCreationTokens <= 0 &&
+		summary.TotalTokens <= 0 {
+		return
+	}
+	entry["usage_requests"] = summary.Requests
+	entry["usage_successes"] = summary.Successes
+	entry["usage_failures"] = summary.Failures
+	entry["usage_input_tokens"] = summary.InputTokens
+	entry["usage_output_tokens"] = summary.OutputTokens
+	entry["usage_cached_tokens"] = summary.CachedTokens
+	entry["usage_cache_read_tokens"] = summary.CacheReadTokens
+	entry["usage_cache_creation_tokens"] = summary.CacheCreationTokens
+	entry["usage_total_tokens"] = summary.TotalTokens
+	if summary.LastUsedAt != "" {
+		entry["usage_last_used_at"] = summary.LastUsedAt
+	}
+}
+
+func accumulateAccountPoolFolderUsage(folderUsage map[string]accountPoolUsageSummary, folder string, summary accountPoolUsageSummary) {
+	if folderUsage == nil {
+		return
+	}
+	folder = normalizeAccountPoolFolder(folder)
+	if folder == "" {
+		folder = defaultAccountPoolFolder()
+	}
+	current := folderUsage[folder]
+	mergeAccountPoolUsageSummary(&current, summary)
+	folderUsage[folder] = current
+}
+
+func applyAccountPoolFolderUsageSummaries(folderInfos []accountPoolFolderInfo, folderUsage map[string]accountPoolUsageSummary) {
+	if len(folderInfos) == 0 || len(folderUsage) == 0 {
+		return
+	}
+	for index := range folderInfos {
+		folder := normalizeAccountPoolFolder(folderInfos[index].Folder)
+		summary := folderUsage[folder]
+		folderInfos[index].Requests = summary.Requests
+		folderInfos[index].TotalTokens = summary.TotalTokens
+	}
+}
+
+func (h *Handler) listAccountPoolFolders() ([]accountPoolFolderInfo, error) {
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool sqlite database")
+		}
+	}()
+	return listAccountPoolFoldersFromDB(db)
+}
+
+func listAccountPoolFoldersFromDB(db *sql.DB) ([]accountPoolFolderInfo, error) {
+	rows, err := db.Query(`
+SELECT e.name, COALESCE(e.folder, ''), COALESCE(f.source_model, ''), COALESCE(f.source_info, ''), COALESCE(f.created_at, ''), COALESCE(f.updated_at, '')
+FROM account_pool_entries e
+LEFT JOIN account_pool_folders f ON f.folder = e.folder
+ORDER BY lower(e.name)`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query account pool folders: %w", err)
+	}
+	defer func() {
+		if errClose := rows.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool folder info rows")
+		}
+	}()
+	foldersByName := make(map[string]*accountPoolFolderInfo)
+	for rows.Next() {
+		var item accountPoolFolderInfo
+		var name string
+		if errScan := rows.Scan(&name, &item.Folder, &item.SourceModel, &item.SourceInfo, &item.CreatedAt, &item.UpdatedAt); errScan != nil {
+			return nil, fmt.Errorf("failed to scan account pool folder info: %w", errScan)
+		}
+		item.Folder = accountPoolFolderFromStoredEntry(name, item.Folder)
+		if item.Folder == "" {
+			continue
+		}
+		if existing, ok := foldersByName[item.Folder]; ok {
+			existing.Count++
+			if existing.SourceModel == "" {
+				existing.SourceModel = item.SourceModel
+			}
+			if existing.SourceInfo == "" {
+				existing.SourceInfo = item.SourceInfo
+			}
+			continue
+		}
+		item.Count = 1
+		copyItem := item
+		foldersByName[item.Folder] = &copyItem
+	}
+	if errRows := rows.Err(); errRows != nil {
+		return nil, fmt.Errorf("failed to read account pool folder info: %w", errRows)
+	}
+	folders := make([]accountPoolFolderInfo, 0, len(foldersByName))
+	for _, item := range foldersByName {
+		folders = append(folders, *item)
+	}
+	sort.Slice(folders, func(i, j int) bool {
+		return strings.ToLower(folders[i].Folder) < strings.ToLower(folders[j].Folder)
+	})
+	return folders, nil
+}
+
+func (h *Handler) PatchAccountPoolFolder(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	var req struct {
+		Folder      string `json:"folder"`
+		SourceModel string `json:"source_model"`
+		SourceInfo  string `json:"source_info"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	folder := normalizeAccountPoolFolder(req.Folder)
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool sqlite database")
+		}
+	}()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err = db.Exec(`
+INSERT INTO account_pool_folders (folder, source_model, source_info, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(folder) DO UPDATE SET
+	source_model=excluded.source_model,
+	source_info=excluded.source_info,
+	updated_at=excluded.updated_at`, folder, strings.TrimSpace(req.SourceModel), strings.TrimSpace(req.SourceInfo), now, now); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "folder": folder})
+}
+
+func (h *Handler) storeAccountPoolImportJob(job *accountPoolImportJob) {
+	if h == nil || job == nil {
+		return
+	}
+	h.accountPoolJobsMu.Lock()
+	defer h.accountPoolJobsMu.Unlock()
+	h.accountPoolJobs[job.ID] = cloneAccountPoolImportJob(job)
+}
+
+func (h *Handler) updateAccountPoolImportJob(id string, update func(*accountPoolImportJob)) {
+	if h == nil {
+		return
+	}
+	h.accountPoolJobsMu.Lock()
+	defer h.accountPoolJobsMu.Unlock()
+	job := h.accountPoolJobs[id]
+	if job == nil {
+		return
+	}
+	update(job)
+	job.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+}
+
+func (h *Handler) getAccountPoolImportJob(id string) *accountPoolImportJob {
+	if h == nil {
+		return nil
+	}
+	h.accountPoolJobsMu.Lock()
+	defer h.accountPoolJobsMu.Unlock()
+	return cloneAccountPoolImportJob(h.accountPoolJobs[id])
+}
+
+func cloneAccountPoolImportJob(job *accountPoolImportJob) *accountPoolImportJob {
+	if job == nil {
+		return nil
+	}
+	out := *job
+	out.Files = append([]string(nil), job.Files...)
+	out.Failures = append([]authUploadFailure(nil), job.Failures...)
+	return &out
+}
+
+func (h *Handler) GetAccountPoolImport(c *gin.Context) {
+	job := h.getAccountPoolImportJob(c.Param("id"))
+	if job == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"job": job})
+}
+
+func (h *Handler) runAccountPoolImportJob(jobID string, uploads []accountPoolPendingUpload) {
+	h.updateAccountPoolImportJob(jobID, func(job *accountPoolImportJob) {
+		job.Status = accountPoolImportRunning
+		job.Total = len(uploads)
+	})
+
+	archiveFiles := make([]accountPoolArchiveFile, 0, len(uploads))
+	for _, upload := range uploads {
+		names, failures, updates, errUpload := h.readAccountPoolUploadData(upload.Name, upload.Data)
+		h.updateAccountPoolImportJob(jobID, func(job *accountPoolImportJob) {
+			job.Done++
+			if errUpload != nil {
+				if errors.Is(errUpload, errAuthFileMustBeJSON) {
+					job.Skipped++
+					return
+				}
+				job.Failed++
+				job.Failures = append(job.Failures, authUploadFailure{Name: upload.DisplayName, Error: uploadErrorMessage(errUpload)})
+				return
+			}
+			job.Imported += len(names)
+			job.Files = append(job.Files, names...)
+			for _, failure := range failures {
+				job.Failed++
+				job.Failures = append(job.Failures, failure)
+			}
+		})
+		if errUpload != nil {
+			continue
+		}
+		archiveFiles = append(archiveFiles, updates...)
+	}
+	if len(archiveFiles) > 0 {
+		if errArchive := h.upsertAccountPoolArchiveFiles(archiveFiles); errArchive != nil {
+			h.updateAccountPoolImportJob(jobID, func(job *accountPoolImportJob) {
+				job.Status = accountPoolImportFailed
+				job.Error = errArchive.Error()
+			})
+			return
+		}
+	}
+	h.updateAccountPoolImportJob(jobID, func(job *accountPoolImportJob) {
+		if job.Imported == 0 && job.Failed > 0 {
+			job.Status = accountPoolImportFailed
+			job.Error = "all account pool files failed to import"
+			return
+		}
+		if job.Imported == 0 && job.Skipped > 0 {
+			job.Status = accountPoolImportFailed
+			job.Error = "no importable account pool files found"
+			return
+		}
+		job.Status = accountPoolImportDone
+	})
+}
+
+func (h *Handler) UploadAccountPoolEntries(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	fileHeaders, errMultipart := h.multipartAuthFileHeaders(c)
+	if errMultipart != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errMultipart)})
+		return
+	}
+	if len(fileHeaders) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no files uploaded"})
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Query("async")), "true") {
+		uploads, errRead := readAccountPoolPendingUploads(fileHeaders)
+		if errRead != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errRead.Error()})
+			return
+		}
+		now := time.Now().UTC()
+		job := &accountPoolImportJob{
+			ID:        fmt.Sprintf("account-pool-import-%d", now.UnixNano()),
+			Status:    accountPoolImportPending,
+			Total:     len(uploads),
+			CreatedAt: now.Format(time.RFC3339),
+			UpdatedAt: now.Format(time.RFC3339),
+		}
+		h.storeAccountPoolImportJob(job)
+		go h.runAccountPoolImportJob(job.ID, uploads)
+		c.JSON(http.StatusAccepted, gin.H{"job": job})
+		return
+	}
+	uploaded := make([]string, 0, len(fileHeaders))
+	failed := make([]gin.H, 0)
+	archiveFiles := make([]accountPoolArchiveFile, 0, len(fileHeaders))
+	for _, file := range fileHeaders {
+		names, failures, updates, errUpload := h.readUploadedAccountPoolFiles(file)
+		if errUpload != nil {
+			if errors.Is(errUpload, errAuthFileMustBeJSON) {
+				continue
+			}
+			failed = append(failed, gin.H{"name": uploadedFileDisplayName(file), "error": uploadErrorMessage(errUpload)})
+			continue
+		}
+		uploaded = append(uploaded, names...)
+		archiveFiles = append(archiveFiles, updates...)
+		for _, failure := range failures {
+			failed = append(failed, gin.H{"name": failure.Name, "error": failure.Error})
+		}
+	}
+	if len(archiveFiles) > 0 {
+		if errArchive := h.upsertAccountPoolArchiveFiles(archiveFiles); errArchive != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errArchive.Error()})
+			return
+		}
+	}
+	if len(failed) > 0 {
+		c.JSON(http.StatusMultiStatus, gin.H{
+			"status":   "partial",
+			"uploaded": len(uploaded),
+			"files":    uploaded,
+			"failed":   failed,
+		})
+		return
+	}
+	if len(uploaded) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no json account pool files uploaded"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "uploaded": len(uploaded), "files": uploaded})
 }
 
 func (h *Handler) WriteAccountPoolToAuthFiles(c *gin.Context) {
@@ -2565,235 +4105,6 @@ func (h *Handler) writeAccountPoolAuthCandidates(ctx context.Context, candidates
 	return written, failed
 }
 
-func (h *Handler) DownloadAccountPoolArchive(c *gin.Context) {
-	if h == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
-		return
-	}
-	entries, err := h.readAccountPoolArchive()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if c.Request != nil && c.Request.Method == http.MethodPost {
-		names, errNames := requestedAuthFileNamesForDelete(c)
-		if errNames != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": errNames.Error()})
-			return
-		}
-		filtered := make(map[string][]byte, len(names))
-		for _, name := range names {
-			name = normalizeAccountPoolEntryName(name)
-			if isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
-				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid name: %s", name)})
-				return
-			}
-			if data, ok := entries[name]; ok {
-				filtered[name] = data
-			}
-		}
-		entries = filtered
-	}
-	data, err := buildAccountPoolZip(entries)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", buildAccountPoolArchiveName()))
-	c.Data(http.StatusOK, "application/zip", data)
-}
-
-func (h *Handler) ListAccountPoolEntries(c *gin.Context) {
-	if h == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
-		return
-	}
-	includeHash := strings.EqualFold(strings.TrimSpace(c.Query("include_hash")), "true")
-	entries, err := h.readAccountPoolArchive()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	folderByName, errFolders := h.readAccountPoolFolderMapLocked()
-	if errFolders != nil {
-		log.WithError(errFolders).Warn("failed to read account pool folder map")
-		folderByName = map[string]string{}
-	}
-	folderInfos, errFolderInfos := h.listAccountPoolFolders()
-	if errFolderInfos != nil {
-		log.WithError(errFolderInfos).Warn("failed to read account pool folder info")
-		folderInfos = nil
-	}
-	files := make([]gin.H, 0, len(entries))
-	for name, data := range entries {
-		folder := normalizeAccountPoolFolder(folderByName[name])
-		entry := gin.H{
-			"id":         name,
-			"auth_id":    name,
-			"auth_index": name,
-			"name":       name,
-			"size":       len(data),
-			"source":     "account_pool",
-			"folder":     folder,
-		}
-		if typeValue := strings.TrimSpace(gjson.GetBytes(data, "type").String()); typeValue != "" {
-			entry["type"] = typeValue
-			entry["provider"] = typeValue
-		}
-		if emailValue := strings.TrimSpace(gjson.GetBytes(data, "email").String()); emailValue != "" {
-			entry["email"] = emailValue
-		}
-		if includeHash {
-			entry["content_hash"] = hashAccountPoolContent(data)
-		}
-		files = append(files, entry)
-	}
-	sort.Slice(files, func(i, j int) bool {
-		nameI, _ := files[i]["name"].(string)
-		nameJ, _ := files[j]["name"].(string)
-		return strings.ToLower(nameI) < strings.ToLower(nameJ)
-	})
-	c.JSON(http.StatusOK, gin.H{"files": files, "folders": folderInfos})
-}
-
-func (h *Handler) listAccountPoolFolders() ([]accountPoolFolderInfo, error) {
-	db, err := h.openAccountPoolSQLiteLocked()
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if errClose := db.Close(); errClose != nil {
-			log.WithError(errClose).Debug("failed to close account pool sqlite database")
-		}
-	}()
-	rows, err := db.Query(`
-SELECT folder, source_model, source_info, count, created_at, updated_at
-FROM (
-	SELECT f.folder, COALESCE(f.source_model, '') AS source_model, COALESCE(f.source_info, '') AS source_info, COALESCE(c.count, 0) AS count, f.created_at, f.updated_at
-	FROM account_pool_folders f
-	LEFT JOIN (
-		SELECT folder, COUNT(*) AS count FROM account_pool_entries GROUP BY folder
-	) c ON c.folder = f.folder
-	UNION
-	SELECT e.folder, '', '', COUNT(*) AS count, '', ''
-	FROM account_pool_entries e
-	WHERE e.folder NOT IN (SELECT folder FROM account_pool_folders)
-	GROUP BY e.folder
-) folders
-ORDER BY lower(folder)`)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query account pool folders: %w", err)
-	}
-	defer func() {
-		if errClose := rows.Close(); errClose != nil {
-			log.WithError(errClose).Debug("failed to close account pool folder info rows")
-		}
-	}()
-	folders := make([]accountPoolFolderInfo, 0)
-	for rows.Next() {
-		var item accountPoolFolderInfo
-		if errScan := rows.Scan(&item.Folder, &item.SourceModel, &item.SourceInfo, &item.Count, &item.CreatedAt, &item.UpdatedAt); errScan != nil {
-			return nil, fmt.Errorf("failed to scan account pool folder info: %w", errScan)
-		}
-		item.Folder = normalizeAccountPoolFolder(item.Folder)
-		folders = append(folders, item)
-	}
-	if errRows := rows.Err(); errRows != nil {
-		return nil, fmt.Errorf("failed to read account pool folder info: %w", errRows)
-	}
-	return folders, nil
-}
-
-func (h *Handler) PatchAccountPoolFolder(c *gin.Context) {
-	if h == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
-		return
-	}
-	var req struct {
-		Folder      string `json:"folder"`
-		SourceModel string `json:"source_model"`
-		SourceInfo  string `json:"source_info"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		return
-	}
-	folder := normalizeAccountPoolFolder(req.Folder)
-	db, err := h.openAccountPoolSQLiteLocked()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	defer func() {
-		if errClose := db.Close(); errClose != nil {
-			log.WithError(errClose).Debug("failed to close account pool sqlite database")
-		}
-	}()
-	now := time.Now().UTC().Format(time.RFC3339)
-	if _, err = db.Exec(`
-INSERT INTO account_pool_folders (folder, source_model, source_info, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(folder) DO UPDATE SET
-	source_model=excluded.source_model,
-	source_info=excluded.source_info,
-	updated_at=excluded.updated_at`, folder, strings.TrimSpace(req.SourceModel), strings.TrimSpace(req.SourceInfo), now, now); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "folder": folder})
-}
-
-func (h *Handler) UploadAccountPoolEntries(c *gin.Context) {
-	if h == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
-		return
-	}
-	fileHeaders, errMultipart := h.multipartAuthFileHeaders(c)
-	if errMultipart != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errMultipart)})
-		return
-	}
-	if len(fileHeaders) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no files uploaded"})
-		return
-	}
-	uploaded := make([]string, 0, len(fileHeaders))
-	failed := make([]gin.H, 0)
-	archiveFiles := make([]accountPoolArchiveFile, 0, len(fileHeaders))
-	for _, file := range fileHeaders {
-		names, failures, updates, errUpload := h.readUploadedAccountPoolFiles(file)
-		if errUpload != nil {
-			failed = append(failed, gin.H{"name": uploadedFileDisplayName(file), "error": uploadErrorMessage(errUpload)})
-			continue
-		}
-		uploaded = append(uploaded, names...)
-		archiveFiles = append(archiveFiles, updates...)
-		for _, failure := range failures {
-			failed = append(failed, gin.H{"name": failure.Name, "error": failure.Error})
-		}
-	}
-	if len(archiveFiles) > 0 {
-		if errArchive := h.upsertAccountPoolArchiveFiles(archiveFiles); errArchive != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errArchive.Error()})
-			return
-		}
-	}
-	if len(failed) > 0 {
-		c.JSON(http.StatusMultiStatus, gin.H{
-			"status":   "partial",
-			"uploaded": len(uploaded),
-			"files":    uploaded,
-			"failed":   failed,
-		})
-		return
-	}
-	if len(uploaded) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no json account pool files uploaded"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "uploaded": len(uploaded), "files": uploaded})
-}
-
 func (h *Handler) DownloadAccountPoolEntry(c *gin.Context) {
 	if h == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
@@ -2809,18 +4120,198 @@ func (h *Handler) DownloadAccountPoolEntry(c *gin.Context) {
 		return
 	}
 
-	entries, err := h.readAccountPoolArchive()
+	data, err := h.readAccountPoolArchiveEntry(name)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	data, ok := entries[name]
-	if !ok {
+	if len(bytes.TrimSpace(data)) == 0 {
+		data, name, err = h.findAccountPoolEntryByName(name)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "account pool entry not found"})
 		return
 	}
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", name))
 	c.Data(http.StatusOK, "application/json", data)
+}
+
+func (h *Handler) findAccountPoolEntryByName(name string) ([]byte, string, error) {
+	name = normalizeAccountPoolEntryName(name)
+	if name == "" {
+		return nil, "", nil
+	}
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		return nil, "", err
+	}
+	if data := bytes.TrimSpace(entries[name]); len(data) > 0 {
+		return append([]byte(nil), data...), name, nil
+	}
+	base := path.Base(name)
+	type match struct {
+		name string
+		data []byte
+	}
+	matches := make([]match, 0, 2)
+	for entryName, data := range entries {
+		entryName = normalizeAccountPoolEntryName(entryName)
+		if entryName == "" {
+			continue
+		}
+		if strings.EqualFold(entryName, name) || strings.EqualFold(path.Base(entryName), base) || strings.HasSuffix(strings.ToLower(entryName), "/"+strings.ToLower(base)) {
+			if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 {
+				matches = append(matches, match{name: entryName, data: append([]byte(nil), trimmed...)})
+			}
+		}
+	}
+	if len(matches) == 0 {
+		return nil, "", nil
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if len(matches[i].name) != len(matches[j].name) {
+			return len(matches[i].name) < len(matches[j].name)
+		}
+		return strings.ToLower(matches[i].name) < strings.ToLower(matches[j].name)
+	})
+	return matches[0].data, matches[0].name, nil
+}
+
+func (h *Handler) WriteAccountPoolEntriesToAuthFiles(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+	var req struct {
+		Names     []string `json:"names"`
+		Overwrite bool     `json:"overwrite"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	names := uniqueAuthFileNames(req.Names)
+	if len(names) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "names are required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	if req.Overwrite {
+		entries, errRead := os.ReadDir(h.cfg.AuthDir)
+		if errRead != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", errRead)})
+			return
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".json") {
+				continue
+			}
+			full := filepath.Join(h.cfg.AuthDir, e.Name())
+			if errRemove := os.Remove(full); errRemove != nil && !os.IsNotExist(errRemove) {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to delete auth file %s: %v", e.Name(), errRemove)})
+				return
+			}
+			if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": errDel.Error()})
+				return
+			}
+			h.removeAuthRuntime(full)
+		}
+	}
+
+	uploaded := make([]string, 0, len(names))
+	failed := make([]gin.H, 0)
+	usedTargetNames := make(map[string]int, len(names))
+	for _, requestedName := range names {
+		name := normalizeAccountPoolEntryName(requestedName)
+		if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			failed = append(failed, gin.H{"name": requestedName, "error": "invalid name"})
+			continue
+		}
+		data, resolvedName, errRead := h.findAccountPoolEntryByName(name)
+		if errRead != nil {
+			failed = append(failed, gin.H{"name": requestedName, "error": errRead.Error()})
+			continue
+		}
+		if len(bytes.TrimSpace(data)) == 0 {
+			failed = append(failed, gin.H{"name": requestedName, "error": "account pool entry not found"})
+			continue
+		}
+		targetName := filepath.Base(resolvedName)
+		if targetName == "." || targetName == "" {
+			targetName = filepath.Base(name)
+		}
+		targetName = uniqueAccountPoolAuthFileName(targetName, resolvedName, usedTargetNames)
+		if errWrite := h.writeAuthFileWithArchive(ctx, targetName, data, false); errWrite != nil {
+			failed = append(failed, gin.H{"name": requestedName, "error": errWrite.Error()})
+			continue
+		}
+		uploaded = append(uploaded, targetName)
+	}
+	if len(failed) > 0 {
+		c.JSON(http.StatusMultiStatus, gin.H{
+			"status":   "partial",
+			"uploaded": len(uploaded),
+			"files":    uploaded,
+			"failed":   failed,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "uploaded": len(uploaded), "files": uploaded})
+}
+
+func uniqueAccountPoolAuthFileName(baseName, sourceName string, used map[string]int) string {
+	baseName = filepath.Base(strings.TrimSpace(baseName))
+	if baseName == "." || baseName == "" {
+		baseName = "account.json"
+	}
+	if used == nil {
+		return baseName
+	}
+	key := strings.ToLower(baseName)
+	if used[key] == 0 {
+		used[key] = 1
+		return baseName
+	}
+	used[key]++
+	ext := filepath.Ext(baseName)
+	stem := strings.TrimSuffix(baseName, ext)
+	prefix := sanitizeAccountPoolAuthFileStem(sourceName)
+	if prefix != "" && !strings.EqualFold(prefix, stem) {
+		stem = prefix + "_" + stem
+	}
+	nextName := fmt.Sprintf("%s_%d%s", stem, used[key], ext)
+	for used[strings.ToLower(nextName)] > 0 {
+		used[key]++
+		nextName = fmt.Sprintf("%s_%d%s", stem, used[key], ext)
+	}
+	used[strings.ToLower(nextName)] = 1
+	return nextName
+}
+
+func sanitizeAccountPoolAuthFileStem(name string) string {
+	name = normalizeAccountPoolEntryName(name)
+	name = strings.TrimSuffix(name, path.Ext(name))
+	name = strings.Trim(name, "/")
+	if name == "" {
+		return ""
+	}
+	replacer := strings.NewReplacer("/", "_", "\\", "_", " ", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+	stem := replacer.Replace(name)
+	stem = strings.Trim(stem, "._-")
+	if len(stem) > 80 {
+		stem = stem[len(stem)-80:]
+	}
+	return stem
 }
 
 func (h *Handler) DeleteAccountPoolEntries(c *gin.Context) {
@@ -2948,11 +4439,14 @@ func uniqueAuthFileNames(names []string) []string {
 
 func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string, int, error) {
 	name = strings.TrimSpace(name)
-	if isUnsafeAuthFileName(name) {
+	if isUnsafeAuthFileDeleteName(name) {
 		return "", http.StatusBadRequest, fmt.Errorf("invalid name")
 	}
 
-	targetPath := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
+	targetPath, errPath := safeAuthFileDeletePath(h.cfg.AuthDir, name)
+	if errPath != nil {
+		return "", http.StatusBadRequest, errPath
+	}
 	targetID := ""
 	if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
 		targetID = strings.TrimSpace(targetAuth.ID)
@@ -2967,19 +4461,19 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	}
 	if errRemove := os.Remove(targetPath); errRemove != nil {
 		if os.IsNotExist(errRemove) {
-			return filepath.Base(name), http.StatusNotFound, errAuthFileNotFound
+			return name, http.StatusNotFound, errAuthFileNotFound
 		}
-		return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
+		return name, http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
 	}
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
-		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
+		return name, http.StatusInternalServerError, errDeleteRecord
 	}
 	if targetID != "" {
-		if _, failures := h.authManager.DeleteAuthFiles(ctx, []string{targetID}); len(failures) > 0 {
-			return filepath.Base(name), http.StatusInternalServerError, failures[0]
-		}
+		h.removeAuthRuntime(targetID)
+	} else {
+		h.removeAuthRuntime(targetPath)
 	}
-	return filepath.Base(name), http.StatusOK, nil
+	return name, http.StatusOK, nil
 }
 
 func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
@@ -2990,18 +4484,38 @@ func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
 	if name == "" {
 		return nil
 	}
+	cleanName := filepath.Clean(filepath.FromSlash(name))
+	baseName := filepath.Base(cleanName)
 	if auth, ok := h.authManager.GetByID(name); ok {
 		return auth
+	}
+	if cleanName != name {
+		if auth, ok := h.authManager.GetByID(cleanName); ok {
+			return auth
+		}
 	}
 	auths := h.authManager.List()
 	for _, auth := range auths {
 		if auth == nil {
 			continue
 		}
-		if strings.TrimSpace(auth.FileName) == name {
+		fileName := strings.TrimSpace(auth.FileName)
+		cleanFileName := filepath.Clean(filepath.FromSlash(fileName))
+		if fileName == name || cleanFileName == cleanName {
 			return auth
 		}
-		if filepath.Base(strings.TrimSpace(authAttribute(auth, "path"))) == name {
+		authPath := strings.TrimSpace(authAttribute(auth, "path"))
+		if filepath.Base(authPath) == baseName {
+			if cleanName == baseName {
+				return auth
+			}
+			if h != nil && h.cfg != nil {
+				if expectedPath, errPath := safeAuthFileDeletePath(h.cfg.AuthDir, name); errPath == nil && filepath.Clean(authPath) == filepath.Clean(expectedPath) {
+					return auth
+				}
+			}
+		}
+		if authPath != "" && filepath.Clean(authPath) == cleanName {
 			return auth
 		}
 	}
@@ -3390,7 +4904,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-func (h *Handler) disableAuth(ctx context.Context, id string) {
+func (h *Handler) removeAuthRuntime(id string) {
 	if h == nil || h.authManager == nil {
 		return
 	}
@@ -3399,24 +4913,14 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		return
 	}
 	if auth, ok := h.authManager.GetByID(id); ok {
-		auth.Disabled = true
-		auth.Status = coreauth.StatusDisabled
-		auth.StatusMessage = "removed via management API"
-		auth.UpdatedAt = time.Now()
-		_, _ = h.authManager.Update(ctx, auth)
+		h.authManager.Remove(auth.ID)
 		return
 	}
 	authID := h.authIDForPath(id)
 	if authID == "" {
 		return
 	}
-	if auth, ok := h.authManager.GetByID(authID); ok {
-		auth.Disabled = true
-		auth.Status = coreauth.StatusDisabled
-		auth.StatusMessage = "removed via management API"
-		auth.UpdatedAt = time.Now()
-		_, _ = h.authManager.Update(ctx, auth)
-	}
+	h.authManager.Remove(authID)
 }
 
 func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {

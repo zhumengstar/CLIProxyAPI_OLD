@@ -28,6 +28,12 @@ export const ACCOUNT_POOL_UPDATED_EVENT = 'cli-proxy-account-pool-updated';
 const ACCOUNT_POOL_REFRESH_DEBOUNCE_MS = 400;
 const ACCOUNT_POOL_REFRESH_CONCURRENCY = 5;
 const ACCOUNT_POOL_DYNAMIC_TIMEOUT_MAX_MS = 10 * 60 * 1000;
+const ACCOUNT_POOL_LOCAL_CACHE_TTL_MS = 3 * 60 * 1000;
+
+type AccountPoolStoragePayload = {
+  cachedAt: number;
+  records: AccountPoolRecord[];
+};
 
 const getAccountPoolDynamicTimeout = (count: number, perItemMs = 140): number => {
   const safeCount = Math.max(0, Math.ceil(Number.isFinite(count) ? count : 0));
@@ -93,6 +99,16 @@ const ACCOUNT_POOL_FILE_STORAGE_KEYS = [
   'checkCheckedAt',
   'check_content_hash',
   'checkContentHash',
+  'usage_requests',
+  'usage_successes',
+  'usage_failures',
+  'usage_input_tokens',
+  'usage_output_tokens',
+  'usage_cached_tokens',
+  'usage_cache_read_tokens',
+  'usage_cache_creation_tokens',
+  'usage_total_tokens',
+  'usage_last_used_at',
   'id_token',
 ] as const;
 
@@ -153,8 +169,21 @@ export const readAccountPoolRecords = (): AccountPoolRecord[] => {
     const raw = window.localStorage.getItem(ACCOUNT_POOL_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    return parsed.reduce<AccountPoolRecord[]>((records, item) => {
+    if (Array.isArray(parsed)) {
+      window.localStorage.removeItem(ACCOUNT_POOL_STORAGE_KEY);
+      return [];
+    }
+    if (!parsed || typeof parsed !== 'object') return [];
+    const payload = parsed as Partial<AccountPoolStoragePayload>;
+    if (
+      typeof payload.cachedAt !== 'number' ||
+      Date.now() - payload.cachedAt > ACCOUNT_POOL_LOCAL_CACHE_TTL_MS
+    ) {
+      window.localStorage.removeItem(ACCOUNT_POOL_STORAGE_KEY);
+      return [];
+    }
+    if (!Array.isArray(payload.records)) return [];
+    return payload.records.reduce<AccountPoolRecord[]>((records, item) => {
       if (!item || typeof item !== 'object') return records;
       const record = item as Partial<AccountPoolRecord>;
       if (!record.file || typeof record.file !== 'object') return records;
@@ -199,12 +228,29 @@ export const writeAccountPoolRecords = (records: AccountPoolRecord[]) => {
       check_status_code: record.file.check_status_code ?? record.file.checkStatusCode,
       check_checked_at: record.file.check_checked_at ?? record.file.checkCheckedAt,
       check_content_hash: record.file.check_content_hash ?? record.file.checkContentHash,
+      usage_requests: record.file.usage_requests,
+      usage_successes: record.file.usage_successes,
+      usage_failures: record.file.usage_failures,
+      usage_input_tokens: record.file.usage_input_tokens,
+      usage_output_tokens: record.file.usage_output_tokens,
+      usage_cached_tokens: record.file.usage_cached_tokens,
+      usage_cache_read_tokens: record.file.usage_cache_read_tokens,
+      usage_cache_creation_tokens: record.file.usage_cache_creation_tokens,
+      usage_total_tokens: record.file.usage_total_tokens,
+      usage_last_used_at: record.file.usage_last_used_at,
     },
     hash: record.hash,
     savedAt: record.savedAt,
     sourceFingerprint: record.sourceFingerprint,
   }));
-  const serialized = JSON.stringify(compactRecords);
+  const serialized = JSON.stringify({
+    cachedAt: Date.now(),
+    records: compactRecords,
+  } satisfies AccountPoolStoragePayload);
+  const minimalSerialized = JSON.stringify({
+    cachedAt: Date.now(),
+    records: minimalRecords,
+  } satisfies AccountPoolStoragePayload);
   try {
     window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, serialized);
   } catch (err) {
@@ -214,7 +260,7 @@ export const writeAccountPoolRecords = (records: AccountPoolRecord[]) => {
         window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, serialized);
       } catch {
         try {
-          window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, JSON.stringify(minimalRecords));
+          window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, minimalSerialized);
         } catch {
           window.localStorage.removeItem(ACCOUNT_POOL_STORAGE_KEY);
         }

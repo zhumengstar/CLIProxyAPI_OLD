@@ -68,7 +68,7 @@ const (
 	refreshMaxConcurrency = 16
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 5 * time.Minute
-	authCleanupInterval   = 10 * time.Minute
+	authCleanupInterval   = 3 * time.Minute
 	// refreshIneffectiveBackoff throttles refresh attempts when an executor returns
 	// success but the auth still evaluates as needing refresh (e.g. token expiry
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
@@ -1190,6 +1190,28 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
+}
+
+// Remove deletes an auth entry from the in-memory runtime indexes.
+func (m *Manager) Remove(authID string) {
+	if m == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	m.mu.Lock()
+	delete(m.auths, authID)
+	m.mu.Unlock()
+
+	if m.scheduler != nil {
+		m.scheduler.removeAuth(authID)
+	}
+	registry.GetGlobalRegistry().UnregisterClient(authID)
+	if selector, ok := m.selector.(*SessionAffinitySelector); ok && selector != nil {
+		selector.InvalidateAuth(authID)
+	}
 }
 
 // UpsertMany inserts or replaces auth entries with a single in-memory scheduler
@@ -2592,7 +2614,6 @@ func (m *Manager) StartInvalidAuthCleanup(parent context.Context, interval time.
 	m.cleanupCancel = cancelCtx
 	m.mu.Unlock()
 
-	log.Infof("invalid auth file cleanup started (interval=%s)", interval)
 	go m.invalidAuthCleanupLoop(ctx, interval)
 }
 
@@ -2660,17 +2681,7 @@ func (m *Manager) deleteAuthFile(ctx context.Context, authID string, path string
 		}
 	}
 
-	m.mu.Lock()
-	delete(m.auths, authID)
-	m.mu.Unlock()
-
-	if m.scheduler != nil {
-		m.scheduler.removeAuth(authID)
-	}
-	registry.GetGlobalRegistry().UnregisterClient(authID)
-	if selector, ok := m.selector.(*SessionAffinitySelector); ok && selector != nil {
-		selector.InvalidateAuth(authID)
-	}
+	m.Remove(authID)
 	return nil
 }
 
@@ -2696,25 +2707,17 @@ func persistentAuthPath(auth *Auth) string {
 		}
 	}
 	if fileName := strings.TrimSpace(auth.FileName); strings.HasSuffix(strings.ToLower(fileName), ".json") {
-		if isAccountPoolRuntimeAuthPath(fileName) {
-			return ""
-		}
 		return fileName
 	}
 	if id := strings.TrimSpace(auth.ID); strings.HasSuffix(strings.ToLower(id), ".json") {
-		if isAccountPoolRuntimeAuthPath(id) {
-			return ""
-		}
 		return id
 	}
 	return ""
 }
 
-func isAccountPoolRuntimeAuthPath(pathValue string) bool {
-	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(pathValue), "\\", "/"))
-	return strings.Contains(normalized, "/.account-pool/") ||
-		strings.HasPrefix(normalized, ".account-pool/") ||
-		strings.Contains(normalized, "/account-pool.")
+func isAccountPoolRuntimeAuthPath(path string) bool {
+	normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(path)), "\\", "/")
+	return strings.Contains(normalized, "/.account-pool/") || strings.HasPrefix(normalized, ".account-pool/")
 }
 
 func shouldDeleteInvalidAuthFile(auth *Auth, now time.Time) bool {

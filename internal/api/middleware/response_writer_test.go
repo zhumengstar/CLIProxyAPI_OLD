@@ -32,6 +32,44 @@ func TestExtractRequestBodyPrefersOverride(t *testing.T) {
 	}
 }
 
+func TestRequestSummaryUsernameHeaderAliases(t *testing.T) {
+	headers := map[string][]string{
+		"X_OneAPI_User_ID":   {"42"},
+		"X_OneAPI_User_Name": {"admin"},
+	}
+
+	userID := firstHeaderValueAny(headers, requestSummaryUserIDHeaders...)
+	username := firstHeaderValueAny(headers, requestSummaryUsernameHeaders...)
+
+	if userID != "42" || username != "admin" {
+		t.Fatalf("identity = (%q, %q), want (42, admin)", userID, username)
+	}
+}
+
+func TestRequestSummaryUsernameFallsBackToUserID(t *testing.T) {
+	headers := map[string][]string{
+		"X-NewAPI-User-ID": {"42"},
+	}
+
+	userID := firstHeaderValueAny(headers, requestSummaryUserIDHeaders...)
+	username := firstHeaderValueAny(headers, requestSummaryUsernameHeaders...)
+	if username == "" {
+		username = userID
+	}
+
+	if username != "42" {
+		t.Fatalf("username = %q, want user id fallback", username)
+	}
+}
+
+func TestRequestSummaryIdentityReadsCodexTurnMetadata(t *testing.T) {
+	userID, username := requestSummaryIdentityFromTurnMetadata(`{"user":{"id":42,"username":"admin"},"turn_id":"turn-1"}`)
+
+	if userID != "42" || username != "admin" {
+		t.Fatalf("identity = (%q, %q), want (42, admin)", userID, username)
+	}
+}
+
 func TestExtractRequestBodySupportsStringOverride(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

@@ -24,6 +24,7 @@ export type ParsedLogLine = {
   path?: string;
   user?: string;
   userId?: string;
+  sessionId?: string;
   channel?: string;
   model?: string;
   requestType?: string;

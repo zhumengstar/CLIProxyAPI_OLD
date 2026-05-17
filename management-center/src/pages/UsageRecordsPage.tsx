@@ -17,6 +17,59 @@ import styles from './UsageRecordsPage.module.scss';
 
 const MIN_USAGE_PAGE_SIZE = 1;
 const DEFAULT_USAGE_PAGE_SIZE = 30;
+const USAGE_RECORDS_CACHE_KEY = 'usage-records-page-cache-v1';
+const USAGE_RECORDS_CACHE_TTL_MS = 3 * 60 * 1000;
+
+type UsageRecordsPageCache = {
+  cachedAt: number;
+  page: number;
+  pageSize: number;
+  records: AccountPoolUsageRecord[];
+  summaries: AccountPoolUsageSummary[];
+  totals: AccountPoolUsageTotals | null;
+  totalRecords: number;
+};
+
+const readUsageRecordsCache = (): UsageRecordsPageCache | null => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(USAGE_RECORDS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<UsageRecordsPageCache>;
+    if (
+      typeof parsed !== 'object' ||
+      parsed == null ||
+      typeof parsed.cachedAt !== 'number' ||
+      Date.now() - parsed.cachedAt > USAGE_RECORDS_CACHE_TTL_MS ||
+      typeof parsed.page !== 'number' ||
+      typeof parsed.pageSize !== 'number' ||
+      !Array.isArray(parsed.records) ||
+      !Array.isArray(parsed.summaries)
+    ) {
+      return null;
+    }
+    return {
+      cachedAt: parsed.cachedAt,
+      page: parsed.page,
+      pageSize: parsed.pageSize,
+      records: parsed.records as AccountPoolUsageRecord[],
+      summaries: parsed.summaries as AccountPoolUsageSummary[],
+      totals: (parsed.totals as AccountPoolUsageTotals | null) ?? null,
+      totalRecords: typeof parsed.totalRecords === 'number' ? parsed.totalRecords : 0,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const writeUsageRecordsCache = (value: UsageRecordsPageCache): void => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(USAGE_RECORDS_CACHE_KEY, JSON.stringify(value));
+  } catch {
+    // Ignore storage quota and serialization errors.
+  }
+};
 
 const formatUsageRecordTime = (value: string): string => {
   const time = Date.parse(value);
@@ -42,44 +95,6 @@ const getCacheTokens = (
 
 const normalizeText = (value: unknown): string => String(value ?? '').trim().toLowerCase();
 
-const normalizeUsageIdentityText = (value: unknown): string => {
-  const text = String(value ?? '').trim();
-  return text === '-' ? '' : text;
-};
-
-const parseNewAPISession = (sessionID: string): { userID: string; username: string } => {
-  const session = sessionID.trim();
-  const prefix = 'newapi-user-';
-  if (!session.toLowerCase().startsWith(prefix)) {
-    return { userID: '', username: '' };
-  }
-  const raw = session.slice(prefix.length).trim();
-  const separator = raw.indexOf('+');
-  if (separator < 0) {
-    return { userID: raw.trim(), username: '' };
-  }
-  return {
-    userID: raw.slice(0, separator).trim(),
-    username: raw.slice(separator + 1).trim(),
-  };
-};
-
-const isLikelyOpaqueSessionID = (sessionID: string): boolean =>
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionID) ||
-  sessionID.includes(':');
-
-const getRecordUserIdentity = (record: AccountPoolUsageRecord) => {
-  const sessionID = normalizeUsageIdentityText(record.session_id);
-  const parsed = parseNewAPISession(sessionID);
-  const explicitUsername = normalizeUsageIdentityText(record.username) || parsed.username;
-  const userID = normalizeUsageIdentityText(record.newapi_user_id) || parsed.userID;
-  return {
-    username: explicitUsername || (!userID && sessionID && !isLikelyOpaqueSessionID(sessionID) ? sessionID : ''),
-    userID,
-    sessionID,
-  };
-};
-
 const getRecordStatusCode = (record: AccountPoolUsageRecord): number =>
   record.status_code ?? (record.success ? 200 : 0);
 
@@ -99,22 +114,69 @@ const getRecordUserFilterValue = (record: AccountPoolUsageRecord): string =>
   String(record.newapi_user_id || record.username || record.session_id || '').trim();
 
 const getRecordUserFilterLabel = (record: AccountPoolUsageRecord): string => {
-  const { username, userID: userId, sessionID } = getRecordUserIdentity(record);
+  const { username, userId } = getUsageRecordUserParts(record);
   if (username && userId) return `${username} (ID ${userId})`;
   if (username) return username;
   if (userId) return `ID ${userId}`;
-  return sessionID;
+  return String(record.session_id || '').trim();
 };
 
 const clampPageSize = (value: number): number =>
   Math.max(MIN_USAGE_PAGE_SIZE, Math.round(value));
+
+const compactSessionID = (value: string): string => {
+  const trimmed = value.trim();
+  if (trimmed.length <= 24) return trimmed;
+  return `${trimmed.slice(0, 8)}...${trimmed.slice(-6)}`;
+};
+
+const parseNewAPISession = (sessionID: string): { userId: string; username: string } => {
+  const prefix = 'newapi-user-';
+  const trimmed = sessionID.trim();
+  if (!trimmed.toLowerCase().startsWith(prefix)) {
+    return { userId: '', username: '' };
+  }
+  const raw = trimmed.slice(prefix.length);
+  const [userId = '', username = ''] = raw.split('+', 2);
+  return { userId: userId.trim(), username: username.trim() };
+};
+
+const isUUIDLikeSessionID = (value: string): boolean =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
+
+const isReadableSessionName = (value: string): boolean => {
+  const trimmed = value.trim();
+  return trimmed !== '' && !trimmed.includes(':') && !isUUIDLikeSessionID(trimmed) && /^[\w.@-]+$/.test(trimmed);
+};
+
+const getUsageRecordUserParts = (record: AccountPoolUsageRecord) => {
+  const sessionID = String(record.session_id || '').trim();
+  const parsedSession = parseNewAPISession(sessionID);
+  const username =
+    String(record.username || '').trim() || parsedSession.username || (isReadableSessionName(sessionID) ? sessionID : '');
+  const userId = String(record.newapi_user_id || '').trim() || parsedSession.userId;
+  return { username, userId, sessionID };
+};
+
+const getUsageRecordUserNameDisplay = (record: AccountPoolUsageRecord) => {
+  const { username, userId } = getUsageRecordUserParts(record);
+  if (username) return { text: username, title: username };
+  if (userId) return { text: `ID ${userId}`, title: userId };
+  return { text: '-', title: '' };
+};
+
+const getUsageRecordSessionDisplay = (record: AccountPoolUsageRecord) => {
+  const { sessionID } = getUsageRecordUserParts(record);
+  if (!sessionID) return { text: '-', title: '' };
+  return { text: compactSessionID(sessionID), title: sessionID };
+};
 
 export function UsageRecordsPage() {
   const { t } = useTranslation();
   const showNotification = useNotificationStore((state) => state.showNotification);
   const [records, setRecords] = useState<AccountPoolUsageRecord[]>([]);
   const [summaries, setSummaries] = useState<AccountPoolUsageSummary[]>([]);
-  const [serverTotals, setServerTotals] = useState<AccountPoolUsageTotals | null>(null);
+  const [usageTotals, setUsageTotals] = useState<AccountPoolUsageTotals | null>(null);
   const [totalRecords, setTotalRecords] = useState(0);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
@@ -127,18 +189,39 @@ export function UsageRecordsPage() {
   const [pageSizeInput, setPageSizeInput] = useState(String(DEFAULT_USAGE_PAGE_SIZE));
 
   const loadRecords = useCallback(async () => {
-    setLoading(true);
+    const cache = readUsageRecordsCache();
+    const useCache = cache != null && cache.page === page && cache.pageSize === pageSize;
+    if (useCache) {
+      setRecords(cache.records);
+      setSummaries(cache.summaries);
+      setUsageTotals(cache.totals);
+      setTotalRecords(cache.totalRecords);
+      setLoading(false);
+    } else {
+      setLoading(true);
+    }
     try {
       const response = await authFilesApi.getAccountPoolUsageRecords({ limit: pageSize, page });
       setRecords(response.records);
       setSummaries(response.summaries);
-      setServerTotals(response.totals ?? null);
+      setUsageTotals(response.totals ?? null);
       setTotalRecords(response.total ?? response.records.length);
+      writeUsageRecordsCache({
+        cachedAt: Date.now(),
+        page,
+        pageSize,
+        records: response.records,
+        summaries: response.summaries,
+        totals: response.totals ?? null,
+        totalRecords: response.total ?? response.records.length,
+      });
     } catch (err: unknown) {
-      setRecords([]);
-      setSummaries([]);
-      setServerTotals(null);
-      setTotalRecords(0);
+      if (!useCache) {
+        setRecords([]);
+        setSummaries([]);
+        setUsageTotals(null);
+        setTotalRecords(0);
+      }
       const message = err instanceof Error ? err.message : t('common.unknown_error');
       showNotification(message, 'error');
     } finally {
@@ -151,8 +234,11 @@ export function UsageRecordsPage() {
       await authFilesApi.clearAccountPoolUsageRecords();
       setRecords([]);
       setSummaries([]);
-      setServerTotals(null);
+      setUsageTotals(null);
       setTotalRecords(0);
+      if (typeof window !== 'undefined') {
+        window.localStorage.removeItem(USAGE_RECORDS_CACHE_KEY);
+      }
       showNotification('使用记录已清空', 'success');
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('common.unknown_error');
@@ -237,32 +323,18 @@ export function UsageRecordsPage() {
     });
   }, [modelFilter, records, search, statusFilter, userFilter]);
 
-  const totals = useMemo(() => {
-    if (serverTotals) {
-      return {
-        requests: serverTotals.requests ?? 0,
-        successes: serverTotals.successes ?? 0,
-        failures: serverTotals.failures ?? 0,
-        inputTokens: serverTotals.input_tokens ?? 0,
-        outputTokens: serverTotals.output_tokens ?? 0,
-        cacheTokens: getCacheTokens(serverTotals),
-        tokens: serverTotals.total_tokens ?? 0,
-      };
-    }
-    return filteredRecords.reduce(
-      (acc, item) => {
-        acc.requests += 1;
-        acc.successes += item.success ? 1 : 0;
-        acc.failures += item.success ? 0 : 1;
-        acc.inputTokens += item.input_tokens ?? 0;
-        acc.outputTokens += item.output_tokens ?? 0;
-        acc.cacheTokens += getCacheTokens(item);
-        acc.tokens += item.total_tokens ?? 0;
-        return acc;
-      },
-      { requests: 0, successes: 0, failures: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0, tokens: 0 }
-    );
-  }, [filteredRecords, serverTotals]);
+  const totals = useMemo(
+    () => ({
+      requests: usageTotals?.requests ?? totalRecords,
+      successes: usageTotals?.successes ?? 0,
+      failures: usageTotals?.failures ?? 0,
+      inputTokens: usageTotals?.input_tokens ?? 0,
+      outputTokens: usageTotals?.output_tokens ?? 0,
+      cacheTokens: usageTotals ? getCacheTokens(usageTotals) : 0,
+      tokens: usageTotals?.total_tokens ?? 0,
+    }),
+    [totalRecords, usageTotals]
+  );
 
   const totalPages = Math.max(1, Math.ceil(totalRecords / pageSize));
   const currentPage = Math.min(page, totalPages);
@@ -317,7 +389,7 @@ export function UsageRecordsPage() {
             <Button variant="secondary" size="sm" onClick={() => void loadRecords()} loading={loading}>
               {t('common.refresh')}
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => void clearRecords()} disabled={records.length === 0}>
+            <Button variant="ghost" size="sm" onClick={() => void clearRecords()} disabled={totalRecords === 0}>
               {t('common.clear', { defaultValue: '清空' })}
             </Button>
           </div>
@@ -404,7 +476,7 @@ export function UsageRecordsPage() {
           <>
             <div className={styles.tableMeta}>
               <span>
-                当前页 {filteredRecords.length} 条，共 {totalRecords} 条记录，{summaryCount} 个账号有汇总
+                当前页 {pageRecords.length} 条，筛选后 {filteredRecords.length} 条，共 {totalRecords} 条记录，{summaryCount} 个账号有汇总
               </span>
               <label className={styles.pageSizeControl}>
                 <span>每页</span>
@@ -437,7 +509,8 @@ export function UsageRecordsPage() {
                 <thead>
                   <tr>
                     <th>时间</th>
-                    <th>NewAPI 用户</th>
+                    <th>用户名</th>
+                    <th>Session ID</th>
                     <th>服务账号邮箱</th>
                     <th>模型</th>
                     <th>状态</th>
@@ -446,7 +519,8 @@ export function UsageRecordsPage() {
                 </thead>
                 <tbody>
                   {pageRecords.map((record) => {
-                    const identity = getRecordUserIdentity(record);
+                    const userDisplay = getUsageRecordUserNameDisplay(record);
+                    const sessionDisplay = getUsageRecordSessionDisplay(record);
                     const statusCode = getRecordStatusCode(record);
                     return (
                       <tr key={record.id}>
@@ -461,18 +535,13 @@ export function UsageRecordsPage() {
                           </button>
                         </td>
                         <td>
-                          <div className={styles.identityCell}>
-                            <div className={styles.identityMain}>
-                              {identity.username || identity.userID || '-'}
-                            </div>
-                            <div className={styles.identityLine}>
-                              <span>用户ID</span>
-                              <strong>{identity.userID || '-'}</strong>
-                            </div>
-                            <div className={styles.identityLine} title={identity.sessionID || undefined}>
-                              <span>会话ID</span>
-                              <strong>{identity.sessionID || '-'}</strong>
-                            </div>
+                          <div className={styles.strong} title={userDisplay.title}>
+                            {userDisplay.text}
+                          </div>
+                        </td>
+                        <td>
+                          <div className={styles.sessionValue} title={sessionDisplay.title}>
+                            {sessionDisplay.text}
                           </div>
                         </td>
                         <td>

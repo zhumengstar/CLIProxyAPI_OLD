@@ -5,11 +5,14 @@ package middleware
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
@@ -20,6 +23,83 @@ import (
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
 const responseBodyOverrideContextKey = "RESPONSE_BODY_OVERRIDE"
 const websocketTimelineOverrideContextKey = "WEBSOCKET_TIMELINE_OVERRIDE"
+
+var requestSummaryUserIDHeaders = []string{
+	"X-NewAPI-User-ID",
+	"X-NewAPI-UserId",
+	"X-NewAPI-User-Id",
+	"NewAPI-User-ID",
+	"NewAPI-UserId",
+	"NewAPI-User-Id",
+	"X-New-Api-User-Id",
+	"X-New-Api-User-ID",
+	"New-Api-User-Id",
+	"New-Api-User-ID",
+	"X-OneAPI-User-ID",
+	"X-OneAPI-UserId",
+	"X-OneAPI-User-Id",
+	"OneAPI-User-ID",
+	"OneAPI-UserId",
+	"OneAPI-User-Id",
+	"X-One-API-User-Id",
+	"One-API-User-Id",
+	"X-User-ID",
+	"X-User-Id",
+	"X-UserId",
+	"X-Consumer-ID",
+	"X-Consumer-Id",
+	"X-Authenticated-User-ID",
+	"X-Authenticated-User-Id",
+}
+
+var requestSummaryUsernameHeaders = []string{
+	"X-NewAPI-Username",
+	"X-NewAPI-UserName",
+	"X-NewAPI-User-Name",
+	"X-NewAPI-User",
+	"X-NewAPI-Name",
+	"NewAPI-Username",
+	"NewAPI-UserName",
+	"NewAPI-User-Name",
+	"NewAPI-User",
+	"NewAPI-Name",
+	"X-New-Api-Username",
+	"X-New-Api-UserName",
+	"X-New-Api-User-Name",
+	"X-New-Api-User",
+	"X-New-Api-Name",
+	"New-Api-Username",
+	"New-Api-UserName",
+	"New-Api-User-Name",
+	"New-Api-User",
+	"New-Api-Name",
+	"X-OneAPI-Username",
+	"X-OneAPI-UserName",
+	"X-OneAPI-User-Name",
+	"X-OneAPI-User",
+	"OneAPI-Username",
+	"OneAPI-UserName",
+	"OneAPI-User-Name",
+	"OneAPI-User",
+	"X-One-API-Username",
+	"X-One-API-UserName",
+	"X-One-API-User-Name",
+	"X-One-API-User",
+	"One-API-Username",
+	"One-API-UserName",
+	"One-API-User-Name",
+	"One-API-User",
+	"X-Username",
+	"X-User-Name",
+	"X-UserName",
+	"X-User",
+	"X-Forwarded-User",
+	"X-Authenticated-User",
+	"X-Consumer-Username",
+	"X-Consumer-User",
+	"X-Login-Name",
+	"X-Account-Name",
+}
 
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
@@ -331,7 +411,30 @@ func (w *ResponseWriterWrapper) populateRequestSummary(c *gin.Context, requestBo
 		return
 	}
 
-	userID, username := parseRequestSummarySessionID(firstHeaderValue(w.requestInfo.Headers, "X-Session-ID"))
+	sessionID := firstHeaderValue(w.requestInfo.Headers, "X-Session-ID")
+	userID, username := parseRequestSummarySessionID(sessionID)
+	if userID == "" {
+		userID = firstHeaderValueAny(w.requestInfo.Headers, requestSummaryUserIDHeaders...)
+	}
+	if username == "" {
+		username = firstHeaderValueAny(w.requestInfo.Headers, requestSummaryUsernameHeaders...)
+	}
+	if userID == "" || username == "" {
+		metadataUserID, metadataUsername := requestSummaryIdentityFromTurnMetadata(firstHeaderValue(w.requestInfo.Headers, "X-Codex-Turn-Metadata"))
+		if userID == "" {
+			userID = metadataUserID
+		}
+		if username == "" {
+			username = metadataUsername
+		}
+	}
+	if username == "" && isReadableRequestSummarySessionName(sessionID) {
+		username = sessionID
+	}
+	if username == "" {
+		username = userID
+	}
+	logging.SetRequestSummaryValue(c, logging.RequestSummarySessionIDKey, sessionID)
 	logging.SetRequestSummaryValue(c, logging.RequestSummaryUserIDKey, userID)
 	logging.SetRequestSummaryValue(c, logging.RequestSummaryUsernameKey, username)
 	logging.SetRequestSummaryValue(c, logging.RequestSummaryModelKey, firstNonEmptyJSONField(requestBody, "model", "model_name", "response.model"))
@@ -357,8 +460,10 @@ func firstHeaderValue(headers map[string][]string, key string) string {
 	if len(headers) == 0 {
 		return ""
 	}
+	normalizedKey := normalizeRequestSummaryHeaderName(key)
 	for currentKey, values := range headers {
-		if !strings.EqualFold(strings.TrimSpace(currentKey), key) {
+		if !strings.EqualFold(strings.TrimSpace(currentKey), key) &&
+			normalizeRequestSummaryHeaderName(currentKey) != normalizedKey {
 			continue
 		}
 		if len(values) == 0 {
@@ -367,6 +472,168 @@ func firstHeaderValue(headers map[string][]string, key string) string {
 		return strings.TrimSpace(values[0])
 	}
 	return ""
+}
+
+func normalizeRequestSummaryHeaderName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	var builder strings.Builder
+	builder.Grow(len(name))
+	for _, char := range name {
+		if char == '-' || char == '_' || char == ' ' {
+			continue
+		}
+		builder.WriteRune(unicode.ToLower(char))
+	}
+	return builder.String()
+}
+
+func firstHeaderValueAny(headers map[string][]string, keys ...string) string {
+	for _, key := range keys {
+		if value := firstHeaderValue(headers, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func requestSummaryIdentityFromTurnMetadata(raw string) (userID string, username string) {
+	for _, candidate := range requestSummaryMetadataCandidates(raw) {
+		if id, name := requestSummaryIdentityFromJSON(candidate); id != "" || name != "" {
+			return id, name
+		}
+	}
+	return "", ""
+}
+
+func requestSummaryMetadataCandidates(raw string) [][]byte {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	candidates := [][]byte{[]byte(raw)}
+	if decoded, err := url.QueryUnescape(raw); err == nil && decoded != raw {
+		candidates = append(candidates, []byte(strings.TrimSpace(decoded)))
+	}
+	for _, encoding := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if decoded, err := encoding.DecodeString(raw); err == nil && len(decoded) > 0 {
+			candidates = append(candidates, decoded)
+		}
+	}
+	return candidates
+}
+
+func requestSummaryIdentityFromJSON(data []byte) (userID string, username string) {
+	data = []byte(strings.TrimSpace(string(data)))
+	if len(data) == 0 || data[0] != '{' {
+		return "", ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return "", ""
+	}
+	userID = firstRequestSummaryMetadataString(payload,
+		"user_id", "userid", "userId", "uid", "id", "newapi_user_id", "newapiUserId",
+		"user.id", "user.user_id", "user.userId", "user.uid", "account.id", "account.user_id",
+	)
+	username = firstRequestSummaryMetadataString(payload,
+		"username", "user_name", "userName", "name", "login", "email", "newapi_username", "newapiUsername",
+		"user.username", "user.user_name", "user.userName", "user.name", "user.login", "user.email",
+		"account.username", "account.user_name", "account.name", "account.email",
+	)
+	return userID, username
+}
+
+func firstRequestSummaryMetadataString(payload map[string]any, paths ...string) string {
+	for _, path := range paths {
+		if value := requestSummaryMetadataValue(payload, strings.Split(path, ".")); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func requestSummaryMetadataValue(value any, parts []string) string {
+	if len(parts) == 0 {
+		switch typed := value.(type) {
+		case string:
+			return strings.TrimSpace(typed)
+		case float64:
+			if typed == float64(int64(typed)) {
+				return strconv.FormatInt(int64(typed), 10)
+			}
+		case json.Number:
+			return strings.TrimSpace(typed.String())
+		}
+		return ""
+	}
+	current, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	want := normalizeRequestSummaryMetadataKey(parts[0])
+	for key, child := range current {
+		if normalizeRequestSummaryMetadataKey(key) == want {
+			return requestSummaryMetadataValue(child, parts[1:])
+		}
+	}
+	return ""
+}
+
+func normalizeRequestSummaryMetadataKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	var builder strings.Builder
+	builder.Grow(len(key))
+	for _, char := range key {
+		if char == '-' || char == '_' || char == ' ' {
+			continue
+		}
+		builder.WriteRune(unicode.ToLower(char))
+	}
+	return builder.String()
+}
+
+func isReadableRequestSummarySessionName(sessionID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || strings.Contains(sessionID, ":") || isUUIDLikeRequestSummarySessionID(sessionID) {
+		return false
+	}
+	for _, char := range sessionID {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-' || char == '.' || char == '@' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isUUIDLikeRequestSummarySessionID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i, char := range value {
+		switch i {
+		case 8, 13, 18, 23:
+			if char != '-' {
+				return false
+			}
+		default:
+			if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f' || char >= 'A' && char <= 'F') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func parseRequestSummarySessionID(sessionID string) (userID string, username string) {

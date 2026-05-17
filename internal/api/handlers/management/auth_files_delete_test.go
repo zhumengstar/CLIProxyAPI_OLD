@@ -273,3 +273,48 @@ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 		t.Fatalf("expected auth file to be removed from auth dir, stat err: %v", errStat)
 	}
 }
+
+func TestDeleteAuthFile_AllowsSafeRelativeSubdirectoryPath(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	relName := filepath.ToSlash(filepath.Join(".account-pool", "token_1.json"))
+	filePath := filepath.Join(authDir, ".account-pool", "token_1.json")
+	if errMkdir := os.MkdirAll(filepath.Dir(filePath), 0o700); errMkdir != nil {
+		t.Fatalf("failed to create account pool dir: %v", errMkdir)
+	}
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       relName,
+		FileName: relName,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(relName), nil)
+	ctx.Request = req
+
+	h.DeleteAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if _, errStat := os.Stat(filePath); !os.IsNotExist(errStat) {
+		t.Fatalf("expected nested auth file to be removed, stat err: %v", errStat)
+	}
+}

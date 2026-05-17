@@ -9,6 +9,7 @@ import (
 const (
 	RequestSummaryUsernameKey       = "REQUEST_SUMMARY_USERNAME"
 	RequestSummaryUserIDKey         = "REQUEST_SUMMARY_USER_ID"
+	RequestSummarySessionIDKey      = "REQUEST_SUMMARY_SESSION_ID"
 	RequestSummaryModelKey          = "REQUEST_SUMMARY_MODEL"
 	RequestSummaryRequestTypeKey    = "REQUEST_SUMMARY_REQUEST_TYPE"
 	RequestSummaryUpstreamKey       = "REQUEST_SUMMARY_UPSTREAM"

@@ -212,6 +212,21 @@ func (h *Handler) runSub2APIImport(ctx context.Context, jobID string, source str
 	})
 }
 
+func sub2APIAccountToAccountPoolArchiveFile(account sub2APIAccount, exportedAt string, folder string, index int, stamp int64) (accountPoolArchiveFile, []string, error) {
+	cpa, warnings := sub2APIAccountToCPA(account, exportedAt)
+	nameSeed := firstSub2APINonEmpty(cpa.Phone, cpa.Email, cpa.AccountID, account.Name, fmt.Sprintf("account_%d", index+1))
+	fileName := fmt.Sprintf("token_%s_%d.json", safeSub2APIFilePart(nameSeed), stamp+int64(index))
+	data, errMarshal := json.MarshalIndent(cpa, "", "  ")
+	if errMarshal != nil {
+		return accountPoolArchiveFile{}, warnings, errMarshal
+	}
+	return accountPoolArchiveFile{
+		Name:   fileName,
+		Data:   data,
+		Folder: strings.TrimSpace(folder),
+	}, warnings, nil
+}
+
 func parseSub2APIDocuments(source string) ([]sub2APIExport, error) {
 	var raw any
 	if err := json.Unmarshal([]byte(source), &raw); err != nil {

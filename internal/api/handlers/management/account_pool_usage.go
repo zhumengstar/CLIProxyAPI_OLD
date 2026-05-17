@@ -3,16 +3,20 @@ package management
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 	apimiddleware "github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
@@ -22,9 +26,85 @@ import (
 )
 
 const (
-	defaultAccountPoolUsagePageSize = 80
 	maxAccountPoolUsageParamsLength = 16 * 1024
 )
+
+var accountPoolUsageUserIDHeaders = []string{
+	"X-NewAPI-User-ID",
+	"X-NewAPI-UserId",
+	"X-NewAPI-User-Id",
+	"NewAPI-User-ID",
+	"NewAPI-UserId",
+	"NewAPI-User-Id",
+	"X-New-Api-User-Id",
+	"X-New-Api-User-ID",
+	"New-Api-User-Id",
+	"New-Api-User-ID",
+	"X-OneAPI-User-ID",
+	"X-OneAPI-UserId",
+	"X-OneAPI-User-Id",
+	"OneAPI-User-ID",
+	"OneAPI-UserId",
+	"OneAPI-User-Id",
+	"X-One-API-User-Id",
+	"One-API-User-Id",
+	"X-User-ID",
+	"X-User-Id",
+	"X-UserId",
+	"X-Consumer-ID",
+	"X-Consumer-Id",
+	"X-Authenticated-User-ID",
+	"X-Authenticated-User-Id",
+}
+
+var accountPoolUsageUsernameHeaders = []string{
+	"X-NewAPI-Username",
+	"X-NewAPI-UserName",
+	"X-NewAPI-User-Name",
+	"X-NewAPI-User",
+	"X-NewAPI-Name",
+	"NewAPI-Username",
+	"NewAPI-UserName",
+	"NewAPI-User-Name",
+	"NewAPI-User",
+	"NewAPI-Name",
+	"X-New-Api-Username",
+	"X-New-Api-UserName",
+	"X-New-Api-User-Name",
+	"X-New-Api-User",
+	"X-New-Api-Name",
+	"New-Api-Username",
+	"New-Api-UserName",
+	"New-Api-User-Name",
+	"New-Api-User",
+	"New-Api-Name",
+	"X-OneAPI-Username",
+	"X-OneAPI-UserName",
+	"X-OneAPI-User-Name",
+	"X-OneAPI-User",
+	"OneAPI-Username",
+	"OneAPI-UserName",
+	"OneAPI-User-Name",
+	"OneAPI-User",
+	"X-One-API-Username",
+	"X-One-API-UserName",
+	"X-One-API-User-Name",
+	"X-One-API-User",
+	"One-API-Username",
+	"One-API-UserName",
+	"One-API-User-Name",
+	"One-API-User",
+	"X-Username",
+	"X-User-Name",
+	"X-UserName",
+	"X-User",
+	"X-Forwarded-User",
+	"X-Authenticated-User",
+	"X-Consumer-Username",
+	"X-Consumer-User",
+	"X-Login-Name",
+	"X-Account-Name",
+}
 
 type accountPoolUsageRecord struct {
 	ID                  string `json:"id"`
@@ -126,6 +206,15 @@ func (r *accountPoolUsageRecorder) HandleUsage(ctx context.Context, record usage
 		return
 	}
 	sessionID, userID, username, requestPath, requestParams := accountPoolRequestIdentity(ctx)
+	if username == "" || userID == "" {
+		cachedUserID, cachedUsername := r.identityForSession(sessionID)
+		if userID == "" {
+			userID = cachedUserID
+		}
+		if username == "" {
+			username = cachedUsername
+		}
+	}
 	requestedAt := record.RequestedAt
 	if requestedAt.IsZero() {
 		requestedAt = time.Now()
@@ -222,6 +311,34 @@ func (r *accountPoolUsageRecorder) HandleUsage(ctx context.Context, record usage
 	r.mu.Unlock()
 }
 
+func (r *accountPoolUsageRecorder) identityForSession(sessionID string) (userID string, username string) {
+	if r == nil {
+		return "", ""
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return "", ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for i := len(r.records) - 1; i >= 0; i-- {
+		record := r.records[i]
+		if strings.TrimSpace(record.SessionID) != sessionID {
+			continue
+		}
+		if userID == "" {
+			userID = strings.TrimSpace(record.NewAPIUserID)
+		}
+		if username == "" {
+			username = strings.TrimSpace(record.Username)
+		}
+		if userID != "" && username != "" {
+			return userID, username
+		}
+	}
+	return userID, username
+}
+
 func (r *accountPoolUsageRecorder) List(limit int) []accountPoolUsageRecord {
 	records, _ := r.ListPage(limit, 0)
 	return records
@@ -231,9 +348,6 @@ func (r *accountPoolUsageRecorder) ListPage(limit int, offset int) ([]accountPoo
 	if r == nil {
 		return nil, 0
 	}
-	if limit <= 0 {
-		limit = defaultAccountPoolUsagePageSize
-	}
 	if offset < 0 {
 		offset = 0
 	}
@@ -242,6 +356,9 @@ func (r *accountPoolUsageRecorder) ListPage(limit int, offset int) ([]accountPoo
 	total := len(r.records)
 	if offset >= total {
 		return []accountPoolUsageRecord{}, total
+	}
+	if limit <= 0 || limit > total-offset {
+		limit = total - offset
 	}
 	out := make([]accountPoolUsageRecord, 0, limit)
 	skipped := 0
@@ -261,6 +378,7 @@ func (r *accountPoolUsageRecorder) Clear() {
 	}
 	r.mu.Lock()
 	r.records = nil
+	r.summaries = nil
 	if err := r.clearRecordsLocked(); err != nil {
 		log.WithError(err).Warn("failed to clear persisted account pool usage records")
 	}
@@ -379,6 +497,33 @@ func (r *accountPoolUsageRecorder) Summaries() []accountPoolUsageSummary {
 	return out
 }
 
+func (r *accountPoolUsageRecorder) SummaryForAccountPoolEntry(name string, email string) accountPoolUsageSummary {
+	if r == nil {
+		return accountPoolUsageSummary{}
+	}
+	candidates := accountPoolUsageEntrySummaryKeys(name, email)
+	if len(candidates) == 0 {
+		return accountPoolUsageSummary{}
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	seen := make(map[string]struct{}, len(candidates))
+	var total accountPoolUsageSummary
+	for _, key := range candidates {
+		summary := r.summaries[key]
+		if summary == nil {
+			continue
+		}
+		if _, ok := seen[summary.Key]; ok {
+			continue
+		}
+		seen[summary.Key] = struct{}{}
+		mergeAccountPoolUsageSummary(&total, *summary)
+	}
+	return total
+}
+
 func (r *accountPoolUsageRecorder) Totals() accountPoolUsageTotals {
 	if r == nil {
 		return accountPoolUsageTotals{}
@@ -401,6 +546,125 @@ func (r *accountPoolUsageRecorder) Totals() accountPoolUsageTotals {
 		totals.TotalTokens += item.TotalTokens
 	}
 	return totals
+}
+
+func accountPoolUsageEntrySummaryKeys(name string, email string) []string {
+	keys := make([]string, 0, 8)
+	seen := make(map[string]struct{}, 8)
+	add := func(key string) {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	for _, value := range accountPoolUsageIdentifierVariants(name) {
+		add("auth_id:" + value)
+		add("auth_index:" + value)
+	}
+	if value := strings.ToLower(strings.TrimSpace(email)); value != "" {
+		add("email:" + value)
+	}
+	return keys
+}
+
+func accountPoolUsageIdentifierVariants(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	normalized := strings.ReplaceAll(value, "\\", "/")
+	base := path.Base(normalized)
+	if base == "." || base == "/" {
+		base = ""
+	}
+	variants := []string{value, normalized, base}
+	out := make([]string, 0, len(variants))
+	seen := make(map[string]struct{}, len(variants))
+	for _, variant := range variants {
+		variant = strings.TrimSpace(variant)
+		if variant == "" {
+			continue
+		}
+		if _, ok := seen[variant]; ok {
+			continue
+		}
+		seen[variant] = struct{}{}
+		out = append(out, variant)
+	}
+	return out
+}
+
+func mergeAccountPoolUsageSummary(target *accountPoolUsageSummary, source accountPoolUsageSummary) {
+	if target == nil {
+		return
+	}
+	if target.Key == "" {
+		target.Key = source.Key
+	}
+	if target.ServiceEmail == "" {
+		target.ServiceEmail = source.ServiceEmail
+	}
+	if target.AuthID == "" {
+		target.AuthID = source.AuthID
+	}
+	if target.AuthIndex == "" {
+		target.AuthIndex = source.AuthIndex
+	}
+	if target.AuthType == "" {
+		target.AuthType = source.AuthType
+	}
+	if target.Provider == "" {
+		target.Provider = source.Provider
+	}
+	if target.Model == "" {
+		target.Model = source.Model
+	}
+	if target.Alias == "" {
+		target.Alias = source.Alias
+	}
+	target.Requests += source.Requests
+	target.Successes += source.Successes
+	target.Failures += source.Failures
+	target.InputTokens += source.InputTokens
+	target.OutputTokens += source.OutputTokens
+	target.CachedTokens += source.CachedTokens
+	target.CacheReadTokens += source.CacheReadTokens
+	target.CacheCreationTokens += source.CacheCreationTokens
+	target.TotalTokens += source.TotalTokens
+	if compareUsageTime(source.LastUsedAt, target.LastUsedAt) > 0 {
+		target.LastUsedAt = source.LastUsedAt
+	}
+}
+
+func compareUsageTime(left string, right string) int {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if left == "" && right == "" {
+		return 0
+	}
+	if left == "" {
+		return -1
+	}
+	if right == "" {
+		return 1
+	}
+	leftTime, leftErr := time.Parse(time.RFC3339, left)
+	rightTime, rightErr := time.Parse(time.RFC3339, right)
+	if leftErr == nil && rightErr == nil {
+		if leftTime.After(rightTime) {
+			return 1
+		}
+		if leftTime.Before(rightTime) {
+			return -1
+		}
+		return 0
+	}
+	return strings.Compare(left, right)
 }
 
 func accountPoolUsageSummaryKey(item accountPoolUsageRecord) string {
@@ -767,6 +1031,9 @@ func (r *accountPoolUsageRecorder) clearRecordsLocked() error {
 	if _, err = db.Exec(`DELETE FROM account_pool_usage_records`); err != nil {
 		return fmt.Errorf("failed to clear account pool usage records: %w", err)
 	}
+	if _, err = db.Exec(`DELETE FROM account_pool_usage_summaries`); err != nil {
+		return fmt.Errorf("failed to clear account pool usage summaries: %w", err)
+	}
 	return nil
 }
 
@@ -826,10 +1093,35 @@ func accountPoolRequestIdentity(ctx context.Context) (sessionID string, userID s
 	if !ok || ginCtx == nil || ginCtx.Request == nil {
 		return "", "", "", "", ""
 	}
-	sessionID = firstNonEmptyHeader(ginCtx.Request.Header, "X-Session-ID", "Session-Id", "Session_id")
+	sessionID = strings.TrimSpace(ginCtx.GetHeader("X-Session-ID"))
 	userID, username = parseNewAPISessionID(sessionID)
-	if username == "" && userID == "" {
-		username = inferUsernameFromPlainSessionID(sessionID)
+	if userID == "" {
+		userID = firstAccountPoolUsageHeader(ginCtx, accountPoolUsageUserIDHeaders...)
+	}
+	if username == "" {
+		username = firstAccountPoolUsageHeader(ginCtx, accountPoolUsageUsernameHeaders...)
+	}
+	if userID == "" || username == "" {
+		metadataUserID, metadataUsername := accountPoolIdentityFromTurnMetadata(ginCtx.GetHeader("X-Codex-Turn-Metadata"))
+		if userID == "" {
+			userID = metadataUserID
+		}
+		if username == "" {
+			username = metadataUsername
+		}
+	}
+	if username == "" && isReadableAccountPoolUsageSessionName(sessionID) {
+		username = sessionID
+	}
+	if username == "" {
+		username = userID
+	}
+	if username == "" {
+		log.Debugf(
+			"account pool usage missing NewAPI username; session_id=%s header_names=%s",
+			truncateAccountPoolUsageLogValue(sessionID),
+			strings.Join(accountPoolUsageHeaderNames(ginCtx), ","),
+		)
 	}
 	if ginCtx.Request.URL != nil {
 		requestPath = strings.TrimSpace(ginCtx.Request.URL.Path)
@@ -838,36 +1130,200 @@ func accountPoolRequestIdentity(ctx context.Context) (sessionID string, userID s
 	return sessionID, userID, username, requestPath, requestParams
 }
 
-func firstNonEmptyHeader(headers http.Header, names ...string) string {
+func accountPoolUsageHeaderNames(ctx *gin.Context) []string {
+	if ctx == nil || ctx.Request == nil || len(ctx.Request.Header) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(ctx.Request.Header))
+	for name := range ctx.Request.Header {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func truncateAccountPoolUsageLogValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 12 {
+		return value
+	}
+	return value[:8] + "..."
+}
+
+func firstAccountPoolUsageHeader(ctx *gin.Context, names ...string) string {
+	if ctx == nil {
+		return ""
+	}
+	normalizedNames := make(map[string]struct{}, len(names))
 	for _, name := range names {
-		value := strings.TrimSpace(headers.Get(name))
-		if value != "" {
+		if normalized := normalizeAccountPoolUsageHeaderName(name); normalized != "" {
+			normalizedNames[normalized] = struct{}{}
+		}
+	}
+	for _, name := range names {
+		if value := strings.TrimSpace(ctx.GetHeader(name)); value != "" {
+			return value
+		}
+	}
+	for name, values := range ctx.Request.Header {
+		if _, ok := normalizedNames[normalizeAccountPoolUsageHeaderName(name)]; !ok {
+			continue
+		}
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeAccountPoolUsageHeaderName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	var builder strings.Builder
+	builder.Grow(len(name))
+	for _, char := range name {
+		if char == '-' || char == '_' || char == ' ' {
+			continue
+		}
+		builder.WriteRune(unicode.ToLower(char))
+	}
+	return builder.String()
+}
+
+func accountPoolIdentityFromTurnMetadata(raw string) (userID string, username string) {
+	for _, candidate := range accountPoolUsageMetadataCandidates(raw) {
+		if id, name := accountPoolIdentityFromJSON(candidate); id != "" || name != "" {
+			return id, name
+		}
+	}
+	return "", ""
+}
+
+func accountPoolUsageMetadataCandidates(raw string) [][]byte {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	candidates := [][]byte{[]byte(raw)}
+	if decoded, err := url.QueryUnescape(raw); err == nil && decoded != raw {
+		candidates = append(candidates, []byte(strings.TrimSpace(decoded)))
+	}
+	for _, encoding := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if decoded, err := encoding.DecodeString(raw); err == nil && len(decoded) > 0 {
+			candidates = append(candidates, decoded)
+		}
+	}
+	return candidates
+}
+
+func accountPoolIdentityFromJSON(data []byte) (userID string, username string) {
+	data = []byte(strings.TrimSpace(string(data)))
+	if len(data) == 0 || data[0] != '{' {
+		return "", ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return "", ""
+	}
+	userID = firstAccountPoolMetadataString(payload,
+		"user_id", "userid", "userId", "uid", "id", "newapi_user_id", "newapiUserId",
+		"user.id", "user.user_id", "user.userId", "user.uid", "account.id", "account.user_id",
+	)
+	username = firstAccountPoolMetadataString(payload,
+		"username", "user_name", "userName", "name", "login", "email", "newapi_username", "newapiUsername",
+		"user.username", "user.user_name", "user.userName", "user.name", "user.login", "user.email",
+		"account.username", "account.user_name", "account.name", "account.email",
+	)
+	return userID, username
+}
+
+func firstAccountPoolMetadataString(payload map[string]any, paths ...string) string {
+	for _, path := range paths {
+		if value := accountPoolMetadataValue(payload, strings.Split(path, ".")); value != "" {
 			return value
 		}
 	}
 	return ""
 }
 
-func inferUsernameFromPlainSessionID(sessionID string) string {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" || strings.Contains(sessionID, ":") || looksLikeUUID(sessionID) {
+func accountPoolMetadataValue(value any, parts []string) string {
+	if len(parts) == 0 {
+		switch typed := value.(type) {
+		case string:
+			return strings.TrimSpace(typed)
+		case float64:
+			if typed == float64(int64(typed)) {
+				return strconv.FormatInt(int64(typed), 10)
+			}
+		case json.Number:
+			return strings.TrimSpace(typed.String())
+		}
 		return ""
 	}
-	return sessionID
+	current, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	want := normalizeAccountPoolUsageMetadataKey(parts[0])
+	for key, child := range current {
+		if normalizeAccountPoolUsageMetadataKey(key) == want {
+			return accountPoolMetadataValue(child, parts[1:])
+		}
+	}
+	return ""
 }
 
-func looksLikeUUID(value string) bool {
+func normalizeAccountPoolUsageMetadataKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	var builder strings.Builder
+	builder.Grow(len(key))
+	for _, char := range key {
+		if char == '-' || char == '_' || char == ' ' {
+			continue
+		}
+		builder.WriteRune(unicode.ToLower(char))
+	}
+	return builder.String()
+}
+
+func isReadableAccountPoolUsageSessionName(sessionID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || strings.Contains(sessionID, ":") || isUUIDLikeAccountPoolUsageSessionID(sessionID) {
+		return false
+	}
+	for _, char := range sessionID {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-' || char == '.' || char == '@' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isUUIDLikeAccountPoolUsageSessionID(value string) bool {
 	if len(value) != 36 {
 		return false
 	}
-	for index, char := range value {
-		switch index {
+	for i, char := range value {
+		switch i {
 		case 8, 13, 18, 23:
 			if char != '-' {
 				return false
 			}
 		default:
-			if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+			if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f' || char >= 'A' && char <= 'F') {
 				return false
 			}
 		}
@@ -977,7 +1433,7 @@ func (h *Handler) GetAccountPoolUsageRecords(c *gin.Context) {
 	limit := 80
 	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
 		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed <= 0 {
+		if err != nil || parsed < 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid limit: %s", raw)})
 			return
 		}
@@ -998,7 +1454,9 @@ func (h *Handler) GetAccountPoolUsageRecords(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid page: %s", raw)})
 			return
 		}
-		offset = (parsed - 1) * limit
+		if limit > 0 {
+			offset = (parsed - 1) * limit
+		}
 	}
 	if summaryOnly {
 		c.JSON(http.StatusOK, gin.H{

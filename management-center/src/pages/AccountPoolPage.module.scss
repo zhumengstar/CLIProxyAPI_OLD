@@ -713,6 +713,31 @@
   filter: drop-shadow(0 8px 10px color-mix(in srgb, #000 13%, transparent));
 }
 
+.folderImportTime {
+  position: absolute;
+  top: 0;
+  right: 2px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 108px;
+  min-height: 26px;
+  padding: 3px 8px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--bg-primary) 94%, transparent);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.2;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 6px 12px color-mix(in srgb, #000 8%, transparent);
+}
+
 .folderIconTab {
   position: absolute;
   top: 0;
@@ -772,6 +797,27 @@
   box-shadow: 0 6px 14px color-mix(in srgb, #000 8%, transparent);
 }
 
+.folderTokenBadge {
+  position: absolute;
+  right: 2px;
+  bottom: 40px;
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  max-width: 128px;
+  padding: 3px 8px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--success-color) 24%, var(--border-color));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-primary) 92%, transparent);
+  color: var(--success-color);
+  font-size: 11px;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 6px 14px color-mix(in srgb, #000 8%, transparent);
+}
+
 .folderHeader {
   display: flex;
   min-width: 0;
@@ -789,6 +835,17 @@
   font-size: 14px;
   font-weight: 800;
   line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folderTokenLine {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--success-color);
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -852,6 +909,12 @@
   border-color: color-mix(in srgb, var(--primary-color) 30%, var(--border-color));
   background: color-mix(in srgb, var(--primary-color) 9%, var(--bg-primary));
   color: var(--primary-color);
+}
+
+.folderTokenPill {
+  border-color: color-mix(in srgb, var(--success-color) 28%, var(--border-color));
+  background: color-mix(in srgb, var(--success-color) 9%, var(--bg-primary));
+  color: var(--success-color);
 }
 
 .folderHeaderActions {

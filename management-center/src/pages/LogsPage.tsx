@@ -873,6 +873,11 @@ export function LogsPage({ mode = 'all' }: LogsPageProps) {
                                 ID {line.userId}
                               </span>
                             )}
+                            {line.sessionId && (
+                              <span className={styles.metaPill} title={`Session ID ${line.sessionId}`}>
+                                Session {line.sessionId}
+                              </span>
+                            )}
                             {line.channel && (
                               <span className={styles.metaPill} title={`渠道 ${line.channel}`}>
                                 渠道 {line.channel}

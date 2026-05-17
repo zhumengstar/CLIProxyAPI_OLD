@@ -14,7 +14,7 @@ const LOG_TIME_OF_DAY_REGEX = /^\d{1,2}:\d{2}:\d{2}(?:\.\d{1,3})?$/;
 const GIN_TIMESTAMP_SEGMENT_REGEX =
   /^\[GIN\]\s+(\d{4})\/(\d{2})\/(\d{2})\s*-\s*(\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)\s*$/;
 const REQUEST_SUMMARY_FIELD_REGEX =
-  /\b(user|user_id|channel|model|type|matched_email|retry|first_byte_ms|tokens)=([^\s|]+)/g;
+  /\b(user|user_id|session_id|channel|model|type|matched_email|retry|first_byte_ms|tokens)=([^\s|]+)/g;
 
 const HTTP_STATUS_PATTERNS: RegExp[] = [
   /\|\s*([1-5]\d{2})\s*\|/,
@@ -142,6 +142,7 @@ export const parseLogLine = (raw: string): ParsedLogLine => {
   let message = remaining;
   let user: string | undefined;
   let userId: string | undefined;
+  let sessionId: string | undefined;
   let channel: string | undefined;
   let model: string | undefined;
   let requestType: string | undefined;
@@ -281,6 +282,9 @@ export const parseLogLine = (raw: string): ParsedLogLine => {
         case 'user_id':
           userId = value;
           break;
+        case 'session_id':
+          sessionId = value;
+          break;
         case 'channel':
           channel = value;
           break;
@@ -332,6 +336,7 @@ export const parseLogLine = (raw: string): ParsedLogLine => {
     path,
     user,
     userId,
+    sessionId,
     channel,
     model,
     requestType,

@@ -3,7 +3,6 @@ package management
 import (
 	"archive/zip"
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"mime/multipart"
@@ -12,11 +11,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/tidwall/gjson"
 )
 
 func TestUploadAuthFile_BatchMultipart(t *testing.T) {
@@ -215,6 +216,413 @@ func TestAccountPoolPreservesFolderPathsAndMovesDuplicateAccount(t *testing.T) {
 	}
 }
 
+func TestUploadAccountPoolEntries_SkipsUnsupportedMultipartFiles(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	files := []struct {
+		name    string
+		content string
+	}{
+		{name: "notes.txt", content: "not an auth file"},
+		{name: "valid.json", content: `{"type":"codex","email":"valid@example.com"}`},
+	}
+	for _, file := range files {
+		part, err := writer.CreateFormFile("file", file.name)
+		if err != nil {
+			t.Fatalf("failed to create multipart file %s: %v", file.name, err)
+		}
+		if _, err = part.Write([]byte(file.content)); err != nil {
+			t.Fatalf("failed to write multipart file %s: %v", file.name, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("failed to close multipart writer: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/account-pool/upload", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+
+	h.UploadAccountPoolEntries(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		t.Fatalf("failed to read account pool entries: %v", err)
+	}
+	if _, ok := entries["valid/valid.json"]; !ok {
+		t.Fatalf("expected valid json file to be imported")
+	}
+	if _, ok := entries["notes.txt"]; ok {
+		t.Fatalf("expected unsupported text file to be skipped")
+	}
+}
+
+func TestUploadAccountPoolEntries_ConvertsSub2JSONIntoFolder(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+
+	source := `{
+		"exported_at": "2026-05-14T01:00:00Z",
+		"accounts": [{
+			"name": "user@example.com",
+			"credentials": {
+				"access_token": "access",
+				"refresh_token": "refresh",
+				"id_token": "id",
+				"client_id": "client",
+				"email": "user@example.com",
+				"chatgpt_account_id": "acct",
+				"expires_at": 1770000000
+			}
+		}]
+	}`
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "sub2_export.json")
+	if err != nil {
+		t.Fatalf("failed to create multipart file: %v", err)
+	}
+	if _, err = part.Write([]byte(source)); err != nil {
+		t.Fatalf("failed to write multipart file: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("failed to close multipart writer: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/account-pool/upload", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+
+	h.UploadAccountPoolEntries(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		t.Fatalf("failed to read account pool entries: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one converted CPA entry, got %d", len(entries))
+	}
+	for name, data := range entries {
+		if !strings.HasPrefix(name, "sub2_export/token_user@example.com_") {
+			t.Fatalf("expected converted file under sub2_export folder, got %s", name)
+		}
+		if got := gjson.GetBytes(data, "type").String(); got != "codex" {
+			t.Fatalf("expected converted CPA type codex, got %q", got)
+		}
+		if got := gjson.GetBytes(data, "email").String(); got != "user@example.com" {
+			t.Fatalf("expected converted email, got %q", got)
+		}
+	}
+}
+
+func TestReadAccountPoolArchive_MigratesLegacySub2Entries(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+	legacyName := "Sub2Api_export/sub2api_user.json"
+	legacySource := []byte(`{
+		"exported_at": "2026-05-14T01:00:00Z",
+		"accounts": [{
+			"name": "user@example.com",
+			"credentials": {
+				"access_token": "access",
+				"refresh_token": "refresh",
+				"id_token": "id",
+				"client_id": "client",
+				"email": "user@example.com",
+				"chatgpt_account_id": "acct",
+				"expires_at": 1770000000
+			}
+		}]
+	}`)
+	if err := h.upsertAccountPoolArchiveFile(legacyName, legacySource); err != nil {
+		t.Fatalf("failed to seed legacy sub2 entry: %v", err)
+	}
+
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		t.Fatalf("failed to read account pool archive: %v", err)
+	}
+	if _, ok := entries[legacyName]; ok {
+		t.Fatalf("expected legacy sub2 entry to be removed")
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one converted entry, got %d", len(entries))
+	}
+	for name, data := range entries {
+		if !strings.HasPrefix(name, "Sub2Api_export/token_user@example.com_") {
+			t.Fatalf("expected converted entry in original folder, got %s", name)
+		}
+		if got := gjson.GetBytes(data, "type").String(); got != "codex" {
+			t.Fatalf("expected converted CPA type codex, got %q", got)
+		}
+		if got := gjson.GetBytes(data, "refresh_token").String(); got != "refresh" {
+			t.Fatalf("expected converted refresh token, got %q", got)
+		}
+	}
+}
+
+func TestEnsureAccountPoolSQLiteSub2Converted(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+	legacyName := "Sub2Api_export/sub2api_user.json"
+	legacySource := []byte(`{
+		"exported_at": "2026-05-14T01:00:00Z",
+		"accounts": [{
+			"name": "user@example.com",
+			"credentials": {
+				"access_token": "access",
+				"refresh_token": "refresh",
+				"id_token": "id",
+				"client_id": "client",
+				"email": "user@example.com",
+				"chatgpt_account_id": "acct",
+				"expires_at": 1770000000
+			}
+		}]
+	}`)
+	if err := h.upsertAccountPoolArchiveFile(legacyName, legacySource); err != nil {
+		t.Fatalf("failed to seed legacy sqlite entry: %v", err)
+	}
+
+	if err := h.ensureAccountPoolSQLiteSub2Converted(); err != nil {
+		t.Fatalf("ensureAccountPoolSQLiteSub2Converted failed: %v", err)
+	}
+
+	files, _, err := h.listAccountPoolSQLiteEntrySummaries(true)
+	if err != nil {
+		t.Fatalf("listAccountPoolSQLiteEntrySummaries failed: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected one converted entry, got %d", len(files))
+	}
+	file := files[0]
+	if got := file["folder"]; got != "Sub2Api_export" {
+		t.Fatalf("folder = %v, want Sub2Api_export", got)
+	}
+	if got := file["type"]; got != "codex" {
+		t.Fatalf("type = %v, want codex", got)
+	}
+}
+
+func TestBuildAccountPoolDBEntryUsesPathFolder(t *testing.T) {
+	entry := buildAccountPoolDBEntry(
+		"folder-a/user.json",
+		[]byte(`{"type":"codex","email":"user@example.com"}`),
+		"2026-05-16T00:00:00Z",
+	)
+	if entry.Folder != "folder-a" {
+		t.Fatalf("Folder = %q, want folder-a", entry.Folder)
+	}
+}
+
+func TestBuildAccountPoolDBEntryKeepsFlatNameInDefaultFolder(t *testing.T) {
+	tests := []string{
+		"KimberlyLewis2464SB@outlook.com.json",
+		"aaronbennett_mcp-ar01.synthetic-trr7.benchmark-g1z5.alignment-84ri.reinforcement-5q21.0z58cn.info.json",
+		"token_+27630204011_1778642950.json",
+	}
+
+	for _, name := range tests {
+		entry := buildAccountPoolDBEntry(
+			name,
+			[]byte(`{"type":"codex","email":"user@example.com"}`),
+			"2026-05-16T00:00:00Z",
+		)
+		if entry.Folder != defaultAccountPoolFolder() {
+			t.Fatalf("Folder for %s = %q, want default folder", name, entry.Folder)
+		}
+	}
+}
+
+func TestAccountPoolStoredEntryKeepsFlatNameInDefaultFolder(t *testing.T) {
+	if got := accountPoolFolderFromStoredEntry("token_+27630204011_1778642950.json", "token"); got != defaultAccountPoolFolder() {
+		t.Fatalf("folder = %q, want default folder", got)
+	}
+}
+
+func TestEnsureAccountPoolSQLiteFoldersInferredMigratesFlatNameToDefaultFolder(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+
+	name := "token_+27630204011_1778642950.json"
+	data := []byte(`{"type":"codex","email":"user@example.com"}`)
+	if err := h.upsertAccountPoolArchiveFile(name, data); err != nil {
+		t.Fatalf("failed to seed account pool entry: %v", err)
+	}
+
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		t.Fatalf("failed to open sqlite database: %v", err)
+	}
+	if _, err = db.Exec(`UPDATE account_pool_entries SET folder = ? WHERE name = ?`, "token", name); err != nil {
+		_ = db.Close()
+		t.Fatalf("failed to seed legacy inferred folder: %v", err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatalf("failed to close sqlite database: %v", err)
+	}
+
+	if err = h.ensureAccountPoolSQLiteFoldersInferred(); err != nil {
+		t.Fatalf("ensureAccountPoolSQLiteFoldersInferred failed: %v", err)
+	}
+
+	db, err = h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		t.Fatalf("failed to reopen sqlite database: %v", err)
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			t.Fatalf("failed to close sqlite database: %v", errClose)
+		}
+	}()
+	var folder string
+	if err = db.QueryRow(`SELECT folder FROM account_pool_entries WHERE name = ?`, name).Scan(&folder); err != nil {
+		t.Fatalf("failed to read migrated folder: %v", err)
+	}
+	if folder != defaultAccountPoolFolder() {
+		t.Fatalf("folder = %q, want default folder", folder)
+	}
+}
+
+func TestEnsureAccountPoolSQLiteFoldersInferredMigratesDefaultFolderPrefix(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+
+	name := defaultAccountPoolFolder() + "/token_+27630204011_1778642950.json"
+	data := []byte(`{"type":"codex","email":"user@example.com"}`)
+	if err := h.upsertAccountPoolArchiveFile(name, data); err != nil {
+		t.Fatalf("failed to seed account pool entry: %v", err)
+	}
+
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		t.Fatalf("failed to open sqlite database: %v", err)
+	}
+	if _, err = db.Exec(`UPDATE account_pool_entries SET folder = ? WHERE name = ?`, "codex", name); err != nil {
+		_ = db.Close()
+		t.Fatalf("failed to seed legacy inferred folder: %v", err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatalf("failed to close sqlite database: %v", err)
+	}
+
+	if err = h.ensureAccountPoolSQLiteFoldersInferred(); err != nil {
+		t.Fatalf("ensureAccountPoolSQLiteFoldersInferred failed: %v", err)
+	}
+
+	db, err = h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		t.Fatalf("failed to reopen sqlite database: %v", err)
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			t.Fatalf("failed to close sqlite database: %v", errClose)
+		}
+	}()
+	var folder string
+	if err = db.QueryRow(`SELECT folder FROM account_pool_entries WHERE name = ?`, name).Scan(&folder); err != nil {
+		t.Fatalf("failed to read migrated folder: %v", err)
+	}
+	if folder != defaultAccountPoolFolder() {
+		t.Fatalf("folder = %q, want default folder", folder)
+	}
+}
+
+func TestEnsureAccountPoolSQLiteSingleAccountFoldersDefaultMovesSingletonFolders(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+
+	seed := map[string][]byte{
+		"lonely/user.json": []byte(`{"type":"codex","email":"lonely@example.com"}`),
+		"pair/a.json":      []byte(`{"type":"codex","email":"a@example.com"}`),
+		"pair/b.json":      []byte(`{"type":"codex","email":"b@example.com"}`),
+	}
+	if err := h.upsertAccountPoolArchiveFiles([]accountPoolArchiveFile{
+		{Name: "lonely/user.json", Data: seed["lonely/user.json"], Folder: "lonely"},
+		{Name: "pair/a.json", Data: seed["pair/a.json"], Folder: "pair"},
+		{Name: "pair/b.json", Data: seed["pair/b.json"], Folder: "pair"},
+	}); err != nil {
+		t.Fatalf("failed to seed account pool entries: %v", err)
+	}
+
+	if err := h.ensureAccountPoolSQLiteSingleAccountFoldersDefault(); err != nil {
+		t.Fatalf("ensureAccountPoolSQLiteSingleAccountFoldersDefault failed: %v", err)
+	}
+
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		t.Fatalf("failed to open sqlite database: %v", err)
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			t.Fatalf("failed to close sqlite database: %v", errClose)
+		}
+	}()
+	var movedFolder string
+	if err = db.QueryRow(`SELECT folder FROM account_pool_entries WHERE name = ?`, "user.json").Scan(&movedFolder); err != nil {
+		t.Fatalf("failed to read moved singleton entry: %v", err)
+	}
+	if movedFolder != defaultAccountPoolFolder() {
+		t.Fatalf("moved singleton folder = %q, want default folder", movedFolder)
+	}
+	var pairCount int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM account_pool_entries WHERE folder = ?`, "pair").Scan(&pairCount); err != nil {
+		t.Fatalf("failed to read pair count: %v", err)
+	}
+	if pairCount != 2 {
+		t.Fatalf("pair count = %d, want 2", pairCount)
+	}
+}
+
+func TestRepairAccountPoolUnsupportedEntriesInfersCodexType(t *testing.T) {
+	entries := map[string][]byte{
+		"codex-missing-type.json": []byte(`{"email":"user@example.com","refresh_token":"refresh","access_token":"access"}`),
+	}
+	repaired, changed, stats := repairAccountPoolUnsupportedEntries(entries)
+	if !changed {
+		t.Fatal("expected repair to change entries")
+	}
+	if stats.InferredCodex != 1 {
+		t.Fatalf("InferredCodex = %d, want 1", stats.InferredCodex)
+	}
+	if got := gjson.GetBytes(repaired["codex-missing-type.json"], "type").String(); got != "codex" {
+		t.Fatalf("type = %q, want codex", got)
+	}
+}
+
 func TestDeleteAccountPoolEntries_RemovesOnlyArchiveEntries(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
@@ -261,90 +669,6 @@ func TestDeleteAccountPoolEntries_RemovesOnlyArchiveEntries(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(authDir, removeName)); err != nil {
 		t.Fatalf("expected auth file to remain after account pool delete: %v", err)
-	}
-}
-
-func TestWriteAccountPoolToAuthFiles_AppendsInBatch(t *testing.T) {
-	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
-
-	authDir := t.TempDir()
-	manager := coreauth.NewManager(nil, nil, nil)
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-
-	files := []accountPoolArchiveFile{
-		{Name: "folder/alpha.json", Data: []byte(`{"type":"codex","email":"alpha@example.com"}`), Folder: "folder"},
-		{Name: "folder/beta.json", Data: []byte(`{"type":"claude","email":"beta@example.com"}`), Folder: "folder"},
-	}
-	if err := h.upsertAccountPoolArchiveFiles(files); err != nil {
-		t.Fatalf("failed to seed account pool entries: %v", err)
-	}
-
-	body := bytes.NewBufferString(`{"mode":"append","names":["folder/alpha.json","folder/beta.json"]}`)
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/account-pool/write-auth-files", body)
-	ctx.Request.Header.Set("Content-Type", "application/json")
-
-	h.WriteAccountPoolToAuthFiles(ctx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
-	}
-	for _, name := range []string{"alpha.json", "beta.json"} {
-		if _, err := os.Stat(filepath.Join(authDir, name)); err != nil {
-			t.Fatalf("expected auth file %s to exist: %v", name, err)
-		}
-	}
-	if got := len(manager.List()); got != 2 {
-		t.Fatalf("expected 2 auth records, got %d", got)
-	}
-}
-
-func TestWriteAccountPoolToAuthFiles_OverwriteDeletesExistingAuthFiles(t *testing.T) {
-	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
-
-	authDir := t.TempDir()
-	manager := coreauth.NewManager(nil, nil, nil)
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-
-	oldContent := []byte(`{"type":"codex","email":"old@example.com"}`)
-	if err := os.WriteFile(filepath.Join(authDir, "old.json"), oldContent, 0o600); err != nil {
-		t.Fatalf("failed to seed old auth file: %v", err)
-	}
-	oldAuth, err := h.buildAuthFromFileData(filepath.Join(authDir, "old.json"), oldContent)
-	if err != nil {
-		t.Fatalf("failed to build old auth: %v", err)
-	}
-	manager.UpsertMany(context.Background(), []*coreauth.Auth{oldAuth})
-
-	if err := h.upsertAccountPoolArchiveFiles([]accountPoolArchiveFile{
-		{Name: "new.json", Data: []byte(`{"type":"claude","email":"new@example.com"}`)},
-	}); err != nil {
-		t.Fatalf("failed to seed account pool entry: %v", err)
-	}
-
-	body := bytes.NewBufferString(`{"mode":"overwrite","names":["new.json"]}`)
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/account-pool/write-auth-files", body)
-	ctx.Request.Header.Set("Content-Type", "application/json")
-
-	h.WriteAccountPoolToAuthFiles(ctx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
-	}
-	if _, err := os.Stat(filepath.Join(authDir, "old.json")); !os.IsNotExist(err) {
-		t.Fatalf("expected old auth file to be removed, stat err: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(authDir, "new.json")); err != nil {
-		t.Fatalf("expected new auth file to exist: %v", err)
-	}
-	auths := manager.List()
-	if len(auths) != 1 || authEmail(auths[0]) != "new@example.com" {
-		t.Fatalf("expected only new auth record, got %#v", auths)
 	}
 }
 
