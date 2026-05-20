@@ -486,6 +486,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth, includeHash bool) gin.
 	}
 	auth.EnsureIndex()
 	runtimeOnly := isRuntimeOnlyAuth(auth)
+	if h.isAccountPoolSyntheticAuth(auth) {
+		return nil
+	}
 	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
 		return nil
 	}
@@ -828,6 +831,13 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	if all := c.Query("all"); all == "true" || all == "1" || all == "*" {
+		if h.authManager != nil {
+			for _, auth := range h.authManager.List() {
+				if h.isAccountPoolSyntheticAuth(auth) {
+					h.authManager.Remove(auth.ID)
+				}
+			}
+		}
 		entries, err := os.ReadDir(h.cfg.AuthDir)
 		if err != nil {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -982,13 +992,26 @@ func (h *Handler) readAccountPoolUploadData(fileName string, data []byte) ([]str
 		return readAccountPoolFilesFromArchive(data, filepath.Base(name), folder)
 	}
 	if uploaded, failures, files, ok := readAccountPoolFilesFromSub2JSON(data, folder); ok {
+		if folder == defaultAccountPoolFolder() {
+			if altFolder := accountPoolFolderFromUploadName(rawName); altFolder != folder {
+				if uploadedAlt, failuresAlt, filesAlt, okAlt := readAccountPoolFilesFromSub2JSON(data, altFolder); okAlt {
+					return uploadedAlt, failuresAlt, filesAlt, nil
+				}
+			}
+		}
 		return uploaded, failures, files, nil
+	}
+	uploadFolder := folder
+	if uploadFolder == defaultAccountPoolFolder() {
+		if altFolder := accountPoolFolderFromUploadName(rawName); altFolder != "" && altFolder != defaultAccountPoolFolder() {
+			uploadFolder = altFolder
+		}
 	}
 	if _, err := h.buildAuthFromFileData(name, data); err != nil {
 		return nil, nil, nil, err
 	}
-	entryName := accountPoolEntryNameForFolder(folder, filepath.Base(name))
-	return []string{entryName}, nil, []accountPoolArchiveFile{{Name: entryName, Data: data, Folder: folder}}, nil
+	entryName := accountPoolEntryNameForFolder(uploadFolder, filepath.Base(name))
+	return []string{entryName}, nil, []accountPoolArchiveFile{{Name: entryName, Data: data, Folder: uploadFolder}}, nil
 }
 
 func isAccountPoolUploadName(name string) bool {
@@ -1272,6 +1295,7 @@ func readAccountPoolFilesFromSub2JSON(data []byte, folder string) ([]string, []a
 				log.WithField("folder", folder).Warn(warning)
 			}
 		}
+		file.Name = accountPoolEntryNameForFolder(folder, file.Name)
 		uploaded = append(uploaded, file.Name)
 		archiveFiles = append(archiveFiles, file)
 	}
@@ -1690,9 +1714,41 @@ func (h *Handler) writeAuthFileWithArchive(ctx context.Context, name string, dat
 	if err != nil {
 		return err
 	}
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
-		return fmt.Errorf("failed to write file: %w", errWrite)
+	if errMkdir := os.MkdirAll(filepath.Dir(dst), 0o700); errMkdir != nil {
+		return fmt.Errorf("failed to create auth dir: %w", errMkdir)
 	}
+	tmp, errTmp := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+"-*.tmp")
+	if errTmp != nil {
+		return fmt.Errorf("failed to create temporary auth file: %w", errTmp)
+	}
+	tmpName := tmp.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			if errRemove := os.Remove(tmpName); errRemove != nil && !os.IsNotExist(errRemove) {
+				log.WithError(errRemove).Debug("failed to remove temporary auth file")
+			}
+		}
+	}()
+	if _, errWrite := tmp.Write(data); errWrite != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to write temporary auth file: %w", errWrite)
+	}
+	if errChmod := tmp.Chmod(0o600); errChmod != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to chmod temporary auth file: %w", errChmod)
+	}
+	if errSync := tmp.Sync(); errSync != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to sync temporary auth file: %w", errSync)
+	}
+	if errClose := tmp.Close(); errClose != nil {
+		return fmt.Errorf("failed to close temporary auth file: %w", errClose)
+	}
+	if errRename := os.Rename(tmpName, dst); errRename != nil {
+		return fmt.Errorf("failed to replace auth file atomically: %w", errRename)
+	}
+	cleanupTmp = false
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
 		return err
 	}
@@ -4206,26 +4262,7 @@ func (h *Handler) WriteAccountPoolEntriesToAuthFiles(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	if req.Overwrite {
-		entries, errRead := os.ReadDir(h.cfg.AuthDir)
-		if errRead != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", errRead)})
-			return
-		}
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".json") {
-				continue
-			}
-			full := filepath.Join(h.cfg.AuthDir, e.Name())
-			if errRemove := os.Remove(full); errRemove != nil && !os.IsNotExist(errRemove) {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to delete auth file %s: %v", e.Name(), errRemove)})
-				return
-			}
-			if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": errDel.Error()})
-				return
-			}
-			h.removeAuthRuntime(full)
-		}
+		log.Warn("account pool write requested with overwrite=true; preserving existing auth files during online reload")
 	}
 
 	uploaded := make([]string, 0, len(names))
@@ -4912,15 +4949,40 @@ func (h *Handler) removeAuthRuntime(id string) {
 	if id == "" {
 		return
 	}
-	if auth, ok := h.authManager.GetByID(id); ok {
-		h.authManager.Remove(auth.ID)
+	removeByID := func(targetID string) bool {
+		targetID = strings.TrimSpace(targetID)
+		if targetID == "" {
+			return false
+		}
+		if auth, ok := h.authManager.GetByID(targetID); ok {
+			h.authManager.Remove(auth.ID)
+			return true
+		}
+		return false
+	}
+	if removeByID(id) {
 		return
 	}
 	authID := h.authIDForPath(id)
-	if authID == "" {
+	if removeByID(authID) {
 		return
 	}
-	h.authManager.Remove(authID)
+	cleaned := filepath.Clean(id)
+	base := filepath.Base(cleaned)
+	if base == "." || base == string(filepath.Separator) {
+		base = ""
+	}
+	if base != "" {
+		if removeByID(base) {
+			return
+		}
+	}
+	if authID != "" && authID != id {
+		authIDBase := filepath.Base(filepath.Clean(authID))
+		if authIDBase != "" && authIDBase != "." {
+			_ = removeByID(authIDBase)
+		}
+	}
 }
 
 func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
