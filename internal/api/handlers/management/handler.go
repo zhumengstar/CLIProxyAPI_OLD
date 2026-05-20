@@ -84,6 +84,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		accountPoolUsage.Configure(filepath.Join(cfg.AuthDir, "account-pool-usage.sqlite"))
 	}
 	h.startAttemptCleanup()
+	h.startAccountPoolAutoAppend()
 	return h
 }
 

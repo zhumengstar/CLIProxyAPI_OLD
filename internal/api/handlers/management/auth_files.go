@@ -58,6 +58,11 @@ const (
 	geminiCLIVersion      = "v1internal"
 )
 
+const (
+	accountPoolAutoAppendInterval        = 5 * time.Minute
+	accountPoolHighQuotaRemainingPercent = 20.0
+)
+
 type callbackForwarder struct {
 	provider string
 	server   *http.Server
@@ -858,13 +863,17 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 					full = abs
 				}
 			}
+			targetAuth := h.findAuthForDelete(name)
+			if targetAuth == nil {
+				targetAuth = h.findAuthForDelete(full)
+			}
 			if err = os.Remove(full); err == nil {
 				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
 					c.JSON(500, gin.H{"error": errDel.Error()})
 					return
 				}
 				deleted++
-				h.removeAuthRuntime(full)
+				h.markAuthDeletedFromDisk(ctx, targetAuth)
 			}
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
@@ -4042,31 +4051,6 @@ func (h *Handler) deleteAllAuthFilesForOverwrite(ctx context.Context) error {
 	if h == nil || h.authManager == nil {
 		return nil
 	}
-	auths := h.authManager.List()
-	ids := make([]string, 0, len(auths))
-	syntheticIDs := make([]string, 0)
-	for _, auth := range auths {
-		if auth == nil || strings.TrimSpace(auth.ID) == "" {
-			continue
-		}
-		if h.isAccountPoolSyntheticAuth(auth) {
-			syntheticIDs = append(syntheticIDs, auth.ID)
-			continue
-		}
-		ids = append(ids, auth.ID)
-	}
-	if len(ids) > 0 {
-		if _, failures := h.authManager.DeleteAuthFiles(ctx, ids); len(failures) > 0 {
-			messages := make([]string, 0, len(failures))
-			for _, failure := range failures {
-				if failure != nil {
-					messages = append(messages, failure.Error())
-				}
-			}
-			return fmt.Errorf("failed to delete existing auth files: %s", strings.Join(messages, "; "))
-		}
-	}
-
 	if strings.TrimSpace(h.cfg.AuthDir) == "" {
 		return nil
 	}
@@ -4089,12 +4073,6 @@ func (h *Handler) deleteAllAuthFilesForOverwrite(ctx context.Context) error {
 		if errRemove := os.Remove(filepath.Join(h.cfg.AuthDir, name)); errRemove != nil && !os.IsNotExist(errRemove) {
 			return fmt.Errorf("failed to remove stale auth file %s: %w", name, errRemove)
 		}
-	}
-	if len(ids) > 0 {
-		h.authManager.RemoveAuths(ids)
-	}
-	if len(syntheticIDs) > 0 {
-		h.authManager.RemoveAuths(syntheticIDs)
 	}
 	return nil
 }
@@ -4484,9 +4462,8 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	if errPath != nil {
 		return "", http.StatusBadRequest, errPath
 	}
-	targetID := ""
-	if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
-		targetID = strings.TrimSpace(targetAuth.ID)
+	targetAuth := h.findAuthForDelete(name)
+	if targetAuth != nil {
 		if path := strings.TrimSpace(authAttribute(targetAuth, "path")); path != "" {
 			targetPath = path
 		}
@@ -4505,11 +4482,7 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
 		return name, http.StatusInternalServerError, errDeleteRecord
 	}
-	if targetID != "" {
-		h.removeAuthRuntime(targetID)
-	} else {
-		h.removeAuthRuntime(targetPath)
-	}
+	h.markAuthDeletedFromDisk(ctx, targetAuth)
 	return name, http.StatusOK, nil
 }
 
@@ -4939,6 +4912,28 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *Handler) markAuthDeletedFromDisk(ctx context.Context, auth *coreauth.Auth) {
+	if h == nil || h.authManager == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	next := auth.Clone()
+	next.Status = coreauth.StatusDisabled
+	next.Disabled = true
+	next.StatusMessage = "removed via management api"
+	next.UpdatedAt = time.Now()
+	if next.Attributes == nil {
+		next.Attributes = make(map[string]string)
+	}
+	if next.Metadata == nil {
+		next.Metadata = make(map[string]any)
+	}
+	next.Attributes["deleted_from_disk"] = "true"
+	next.Metadata["deleted_from_disk"] = true
+	if _, err := h.authManager.Update(coreauth.WithSkipPersist(ctx), next); err != nil {
+		log.WithError(err).Debugf("failed to mark auth %s as deleted from disk", next.ID)
+	}
 }
 
 func (h *Handler) removeAuthRuntime(id string) {
