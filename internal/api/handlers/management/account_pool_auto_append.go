@@ -3,9 +3,7 @@ package management
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -192,8 +190,7 @@ func (h *Handler) existingAuthContentHashes() map[string]struct{} {
 		if errRead != nil || len(bytes.TrimSpace(data)) == 0 {
 			continue
 		}
-		sum := sha256.Sum256(bytes.TrimSpace(data))
-		out[hex.EncodeToString(sum[:])] = struct{}{}
+		out[hashAccountPoolContent(data)] = struct{}{}
 	}
 	return out
 }

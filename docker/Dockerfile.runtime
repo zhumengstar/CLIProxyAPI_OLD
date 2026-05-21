@@ -1,0 +1,14 @@
+FROM alpine:3.23
+
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /CLIProxyAPI
+
+COPY CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
+RUN chmod +x /CLIProxyAPI/CLIProxyAPI
+
+EXPOSE 8317
+
+ENV TZ=Asia/Shanghai
+
+CMD ["/CLIProxyAPI/CLIProxyAPI", "-config", "/CLIProxyAPI/config.yaml", "-local-model"]
