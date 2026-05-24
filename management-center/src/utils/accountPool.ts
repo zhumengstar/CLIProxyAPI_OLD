@@ -108,6 +108,7 @@ const ACCOUNT_POOL_FILE_STORAGE_KEYS = [
   'usage_cache_read_tokens',
   'usage_cache_creation_tokens',
   'usage_total_tokens',
+  'usage_total_usd',
   'usage_last_used_at',
   'id_token',
 ] as const;
@@ -237,6 +238,7 @@ export const writeAccountPoolRecords = (records: AccountPoolRecord[]) => {
       usage_cache_read_tokens: record.file.usage_cache_read_tokens,
       usage_cache_creation_tokens: record.file.usage_cache_creation_tokens,
       usage_total_tokens: record.file.usage_total_tokens,
+      usage_total_usd: record.file.usage_total_usd,
       usage_last_used_at: record.file.usage_last_used_at,
     },
     hash: record.hash,

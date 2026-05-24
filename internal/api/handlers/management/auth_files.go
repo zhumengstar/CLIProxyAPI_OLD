@@ -372,10 +372,22 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	}
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
+	seenEmails := make(map[string]struct{}, len(auths))
 	for _, auth := range auths {
-		if entry := h.buildAuthFileEntry(auth, includeHash); entry != nil {
-			files = append(files, entry)
+		entry := h.buildAuthFileEntry(auth, includeHash)
+		if entry == nil {
+			continue
 		}
+		if email, _ := entry["email"].(string); email != "" {
+			key := normalizeAccountPoolEmail(email)
+			if key != "" {
+				if _, ok := seenEmails[key]; ok {
+					continue
+				}
+				seenEmails[key] = struct{}{}
+			}
+		}
+		files = append(files, entry)
 	}
 	sort.Slice(files, func(i, j int) bool {
 		nameI, _ := files[i]["name"].(string)
@@ -441,6 +453,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, includeHash bool) {
 		return
 	}
 	files := make([]gin.H, 0)
+	seenEmails := make(map[string]struct{})
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -457,6 +470,13 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, includeHash bool) {
 			if data, errRead := os.ReadFile(full); errRead == nil {
 				typeValue := gjson.GetBytes(data, "type").String()
 				emailValue := gjson.GetBytes(data, "email").String()
+				emailKey := normalizeAccountPoolEmail(emailValue)
+				if emailKey != "" {
+					if _, ok := seenEmails[emailKey]; ok {
+						continue
+					}
+					seenEmails[emailKey] = struct{}{}
+				}
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
 				if includeHash {
@@ -665,6 +685,14 @@ func authEmail(auth *coreauth.Auth) string {
 		}
 	}
 	return ""
+}
+
+func normalizeAccountPoolEmail(email string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return ""
+	}
+	return email
 }
 
 func authAttribute(auth *coreauth.Auth, key string) string {
@@ -2906,6 +2934,10 @@ func dedupeAccountPoolEntries(entries map[string][]byte) map[string][]byte {
 	seen := make(map[string]string, len(candidates))
 	for _, item := range candidates {
 		keys := accountPoolIdentityKeys(item.data)
+		email := normalizeAccountPoolEmail(firstAccountPoolJSONValue(bytes.TrimSpace(item.data), "email", "account_email", "service_email", "user_email", "login_email", "account.email", "user.email", "profile.email", "oauth.email"))
+		if email != "" {
+			keys = append([]string{"email|" + email}, keys...)
+		}
 		duplicate := false
 		for _, key := range keys {
 			if existingName, ok := seen[key]; ok && !strings.EqualFold(existingName, item.name) {
@@ -3619,6 +3651,9 @@ func applyAccountPoolUsageSummary(entry gin.H, summary accountPoolUsageSummary) 
 	entry["usage_total_tokens"] = summary.TotalTokens
 	if summary.LastUsedAt != "" {
 		entry["usage_last_used_at"] = summary.LastUsedAt
+	}
+	if summary.TotalUSD > 0 {
+		entry["usage_total_usd"] = summary.TotalUSD
 	}
 }
 

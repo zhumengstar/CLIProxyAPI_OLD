@@ -118,6 +118,7 @@ export type AccountPoolUsageSummary = {
   cache_read_tokens?: number;
   cache_creation_tokens?: number;
   total_tokens?: number;
+  total_usd?: number;
   last_used_at?: string;
 };
 export type AccountPoolUsageTotals = {

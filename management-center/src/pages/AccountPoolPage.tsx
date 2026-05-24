@@ -680,6 +680,16 @@ const formatUsageMetric = (value: number | undefined): string => {
   return usageMetricNumberFormatter.format(Math.round(value));
 };
 
+const usdNumberFormatter = new Intl.NumberFormat(undefined, {
+  minimumFractionDigits: 4,
+  maximumFractionDigits: 4,
+});
+
+const formatUSDMetric = (value: number | undefined): string => {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return '$0.0000';
+  return `$${usdNumberFormatter.format(value)}`;
+};
+
 const parseJsonObject = (rawText: string | undefined): Record<string, unknown> | null => {
   if (!rawText) return null;
   try {
@@ -782,7 +792,7 @@ const getUsageMetricForSort = (
   fileContentCache: Record<string, string>,
   summaryByEmail: Map<string, AccountPoolUsageSummary>,
   summaryByAuthID: Map<string, AccountPoolUsageSummary>,
-  key: 'requests' | 'successes' | 'total_tokens' | 'failures'
+  key: 'requests' | 'successes' | 'total_tokens' | 'failures' | 'total_usd'
 ): number | null => {
   const entryValue = readFiniteNumber(file[`usage_${key}`]);
   if (entryValue !== null) return entryValue;
@@ -1277,6 +1287,7 @@ export function AccountPoolPage() {
       { value: 'requests_desc', label: t('account_pool.sort_requests_desc', { defaultValue: '请求最多' }) },
       { value: 'success_desc', label: t('account_pool.sort_success_desc', { defaultValue: '成功最多' }) },
       { value: 'token_desc', label: t('account_pool.sort_token_desc', { defaultValue: 'Token 最多' }) },
+      { value: 'usd_desc', label: t('account_pool.sort_usd_desc', { defaultValue: '刀数最多' }) },
       { value: 'failure_desc', label: t('account_pool.sort_failure_desc', { defaultValue: '失败最多' }) },
       { value: 'folder_time_desc', label: t('account_pool.sort_folder_time_desc', { defaultValue: '文件夹时间最新' }) },
       { value: 'folder_time_asc', label: t('account_pool.sort_folder_time_asc', { defaultValue: '文件夹时间最早' }) },
@@ -1377,7 +1388,7 @@ export function AccountPoolPage() {
     (
       left: AuthFileItem,
       right: AuthFileItem,
-      key: 'requests' | 'successes' | 'total_tokens' | 'failures'
+      key: 'requests' | 'successes' | 'total_tokens' | 'failures' | 'total_usd'
     ): number => {
       const leftValue = getUsageMetricForSort(
         left,
@@ -1462,6 +1473,9 @@ export function AccountPoolPage() {
           if (diff !== 0) return diff;
         } else if (sortMode === 'token_desc') {
           const diff = compareUsageMetric(left, right, 'total_tokens');
+          if (diff !== 0) return diff;
+        } else if (sortMode === 'usd_desc') {
+          const diff = compareUsageMetric(left, right, 'total_usd');
           if (diff !== 0) return diff;
         } else if (sortMode === 'failure_desc') {
           const diff = compareUsageMetric(left, right, 'failures');
@@ -2488,6 +2502,12 @@ export function AccountPoolPage() {
                   {t('account_pool.usage_total_tokens', { defaultValue: 'Token' })}
                 </span>
                 <strong className={styles.usageMetricValue}>{formatUsageMetric(usageSummary?.total_tokens)}</strong>
+              </div>
+              <div className={styles.usageMetric}>
+                <span className={styles.usageMetricLabel}>
+                  {t('account_pool.usage_total_usd', { defaultValue: '刀数' })}
+                </span>
+                <strong className={styles.usageMetricValue}>{formatUSDMetric(usageSummary?.total_usd)}</strong>
               </div>
               <div className={styles.usageMetric}>
                 <span className={styles.usageMetricLabel}>

@@ -134,24 +134,25 @@ type accountPoolUsageRecord struct {
 }
 
 type accountPoolUsageSummary struct {
-	Key                 string `json:"key"`
-	ServiceEmail        string `json:"service_email,omitempty"`
-	AuthID              string `json:"auth_id,omitempty"`
-	AuthIndex           string `json:"auth_index,omitempty"`
-	AuthType            string `json:"auth_type,omitempty"`
-	Provider            string `json:"provider,omitempty"`
-	Model               string `json:"model,omitempty"`
-	Alias               string `json:"alias,omitempty"`
-	Requests            int64  `json:"requests"`
-	Successes           int64  `json:"successes"`
-	Failures            int64  `json:"failures"`
-	InputTokens         int64  `json:"input_tokens,omitempty"`
-	OutputTokens        int64  `json:"output_tokens,omitempty"`
-	CachedTokens        int64  `json:"cached_tokens,omitempty"`
-	CacheReadTokens     int64  `json:"cache_read_tokens,omitempty"`
-	CacheCreationTokens int64  `json:"cache_creation_tokens,omitempty"`
-	TotalTokens         int64  `json:"total_tokens,omitempty"`
-	LastUsedAt          string `json:"last_used_at,omitempty"`
+	Key                 string  `json:"key"`
+	ServiceEmail        string  `json:"service_email,omitempty"`
+	AuthID              string  `json:"auth_id,omitempty"`
+	AuthIndex           string  `json:"auth_index,omitempty"`
+	AuthType            string  `json:"auth_type,omitempty"`
+	Provider            string  `json:"provider,omitempty"`
+	Model               string  `json:"model,omitempty"`
+	Alias               string  `json:"alias,omitempty"`
+	Requests            int64   `json:"requests"`
+	Successes           int64   `json:"successes"`
+	Failures            int64   `json:"failures"`
+	InputTokens         int64   `json:"input_tokens,omitempty"`
+	OutputTokens        int64   `json:"output_tokens,omitempty"`
+	CachedTokens        int64   `json:"cached_tokens,omitempty"`
+	CacheReadTokens     int64   `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens,omitempty"`
+	TotalTokens         int64   `json:"total_tokens,omitempty"`
+	TotalUSD            float64 `json:"total_usd,omitempty"`
+	LastUsedAt          string  `json:"last_used_at,omitempty"`
 }
 
 type accountPoolUsageTotals struct {
@@ -283,6 +284,7 @@ func (r *accountPoolUsageRecorder) HandleUsage(ctx context.Context, record usage
 	summary.CacheReadTokens += item.CacheReadTokens
 	summary.CacheCreationTokens += item.CacheCreationTokens
 	summary.TotalTokens += item.TotalTokens
+	summary.TotalUSD += accountPoolUsageUSD(item.Model, item.InputTokens, item.OutputTokens, item.CachedTokens, item.CacheReadTokens, item.CacheCreationTokens)
 	if summary.ServiceEmail == "" {
 		summary.ServiceEmail = item.ServiceEmail
 	}
@@ -599,6 +601,13 @@ func accountPoolUsageIdentifierVariants(value string) []string {
 	return out
 }
 
+func boolToInt64(value bool) int64 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 func mergeAccountPoolUsageSummary(target *accountPoolUsageSummary, source accountPoolUsageSummary) {
 	if target == nil {
 		return
@@ -623,9 +632,13 @@ func mergeAccountPoolUsageSummary(target *accountPoolUsageSummary, source accoun
 	}
 	if target.Model == "" {
 		target.Model = source.Model
+	} else if source.Model != "" && target.Model != source.Model {
+		target.Model = "mixed"
 	}
 	if target.Alias == "" {
 		target.Alias = source.Alias
+	} else if source.Alias != "" && target.Alias != source.Alias {
+		target.Alias = "mixed"
 	}
 	target.Requests += source.Requests
 	target.Successes += source.Successes
@@ -636,8 +649,50 @@ func mergeAccountPoolUsageSummary(target *accountPoolUsageSummary, source accoun
 	target.CacheReadTokens += source.CacheReadTokens
 	target.CacheCreationTokens += source.CacheCreationTokens
 	target.TotalTokens += source.TotalTokens
+	target.TotalUSD += source.TotalUSD
 	if compareUsageTime(source.LastUsedAt, target.LastUsedAt) > 0 {
 		target.LastUsedAt = source.LastUsedAt
+	}
+}
+
+func accountPoolUsageUSD(model string, inputTokens, outputTokens, cachedTokens, cacheReadTokens, cacheCreationTokens int64) float64 {
+	price := accountPoolGPTModelPrice(model)
+	cacheTokens := cachedTokens
+	if cacheTokens <= 0 {
+		cacheTokens = cacheReadTokens
+	}
+	uncachedInputTokens := inputTokens - cacheTokens
+	if uncachedInputTokens < 0 {
+		uncachedInputTokens = 0
+	}
+	return (float64(uncachedInputTokens)*price.inputPerMillion +
+		float64(cacheTokens)*price.cacheReadPerMillion +
+		float64(cacheCreationTokens)*price.cacheWritePerMillion +
+		float64(outputTokens)*price.outputPerMillion) / 1_000_000
+}
+
+type accountPoolModelPrice struct {
+	inputPerMillion      float64
+	outputPerMillion     float64
+	cacheReadPerMillion  float64
+	cacheWritePerMillion float64
+}
+
+func accountPoolGPTModelPrice(model string) accountPoolModelPrice {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "gpt-5.5", "mixed":
+		return accountPoolModelPrice{inputPerMillion: 5, outputPerMillion: 30, cacheReadPerMillion: 0.5}
+	case "gpt-5.2", "gpt-5.3-codex":
+		return accountPoolModelPrice{inputPerMillion: 1.75, outputPerMillion: 14, cacheReadPerMillion: 0.175}
+	case "gpt-5.4":
+		return accountPoolModelPrice{inputPerMillion: 2.5, outputPerMillion: 15, cacheReadPerMillion: 0.25}
+	case "gpt-5.4-mini":
+		return accountPoolModelPrice{inputPerMillion: 0.75, outputPerMillion: 4.5, cacheReadPerMillion: 0.075}
+	case "gpt-image-2":
+		return accountPoolModelPrice{inputPerMillion: 5, outputPerMillion: 10, cacheReadPerMillion: 1.25}
+	default:
+		// Default to the current primary GPT model pricing used by NewAPI.
+		return accountPoolModelPrice{inputPerMillion: 5, outputPerMillion: 30, cacheReadPerMillion: 0.5}
 	}
 }
 
@@ -857,6 +912,46 @@ ORDER BY id ASC`)
 		return fmt.Errorf("failed to close account pool usage record rows: %w", errRows)
 	}
 	r.records = records
+	recomputedSummaries := make(map[string]*accountPoolUsageSummary)
+	for _, item := range records {
+		key := accountPoolUsageSummaryKey(item)
+		summary := recomputedSummaries[key]
+		if summary == nil {
+			summary = &accountPoolUsageSummary{
+				Key:          key,
+				ServiceEmail: item.ServiceEmail,
+				AuthID:       item.AuthID,
+				AuthIndex:    item.AuthIndex,
+				AuthType:     item.AuthType,
+				Provider:     item.Provider,
+				Model:        item.Model,
+				Alias:        item.Alias,
+			}
+			recomputedSummaries[key] = summary
+		}
+		itemSummary := accountPoolUsageSummary{
+			Key:                 key,
+			ServiceEmail:        item.ServiceEmail,
+			AuthID:              item.AuthID,
+			AuthIndex:           item.AuthIndex,
+			AuthType:            item.AuthType,
+			Provider:            item.Provider,
+			Model:               item.Model,
+			Alias:               item.Alias,
+			Requests:            1,
+			Successes:           boolToInt64(item.Success),
+			Failures:            boolToInt64(!item.Success),
+			InputTokens:         item.InputTokens,
+			OutputTokens:        item.OutputTokens,
+			CachedTokens:        item.CachedTokens,
+			CacheReadTokens:     item.CacheReadTokens,
+			CacheCreationTokens: item.CacheCreationTokens,
+			TotalTokens:         item.TotalTokens,
+			TotalUSD:            accountPoolUsageUSD(item.Model, item.InputTokens, item.OutputTokens, item.CachedTokens, item.CacheReadTokens, item.CacheCreationTokens),
+			LastUsedAt:          item.RequestedAt,
+		}
+		mergeAccountPoolUsageSummary(summary, itemSummary)
+	}
 
 	summaryRows, err := db.Query(`
 SELECT key, service_email, auth_id, auth_index, auth_type, provider, model, alias,
@@ -893,6 +988,9 @@ FROM account_pool_usage_summaries`)
 			return fmt.Errorf("failed to scan account pool usage summary: %w", errScan)
 		}
 		summary := item
+		if recomputed := recomputedSummaries[item.Key]; recomputed != nil {
+			summary.TotalUSD = recomputed.TotalUSD
+		}
 		summaries[item.Key] = &summary
 	}
 	if errRows := summaryRows.Close(); errRows != nil {
