@@ -18,10 +18,6 @@ pgstore/*
 gitstore/*
 objectstore/*
 
-# Static assets
-static/*
-!static/management.html
-
 # Authentication data
 auths/*
 !auths/.gitkeep

@@ -1,0 +1,28 @@
+services:
+  cli-proxy-api:
+    image: cliproxy2-api:main
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: main
+        COMMIT: ${COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    container_name: cli-proxy-api
+    environment:
+      DEPLOY: docker
+      MANAGEMENT_STATIC_PATH: /CLIProxyAPI/static
+    ports:
+      - "127.0.0.1:8317:8317"
+    volumes:
+      - ./config.yaml:/CLIProxyAPI/config.yaml
+      - ./auths:/root/.cli-proxy-api
+      - ./logs:/CLIProxyAPI/logs
+      - ./static:/CLIProxyAPI/static
+    restart: unless-stopped
+    networks:
+      - entry-nginx_default
+
+networks:
+  entry-nginx_default:
+    external: true
