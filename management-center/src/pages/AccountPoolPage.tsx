@@ -14,7 +14,9 @@ import {
   type AccountCheckResult,
 } from '@/stores';
 import {
+  apiCallApi,
   authFilesApi,
+  getApiCallErrorMessage,
   type AccountPoolCheckResultPatch,
   type AccountPoolImportJob,
   type AccountPoolUsageSummary,
@@ -30,26 +32,32 @@ import {
 import type { AuthFileItem, AuthFilesResponse } from '@/types/authFile';
 import { downloadBlob } from '@/utils/download';
 import { formatUnixTimestamp } from '@/utils/format';
-import { getStatusFromError, normalizePlanType } from '@/utils/quota';
+import {
+  CODEX_REQUEST_HEADERS,
+  getStatusFromError,
+  normalizeAuthIndex,
+  normalizePlanType,
+  resolveCodexChatgptAccountId,
+} from '@/utils/quota';
 import { createZipBlob } from '@/utils/zip';
 import {
   ACCOUNT_POOL_UPDATED_EVENT,
   buildAccountPoolFileContentCache,
-  deleteAccountPoolRecordsByName,
   isRuntimeOnlyAuthPoolFile,
-  readAccountPoolRecords,
   refreshAccountPoolFromServer,
   uniqueAccountPoolRecords,
   type AccountPoolSyncProgress,
   type AccountPoolRecord,
 } from '@/utils/accountPool';
+import {
+  getAccountPoolEffectiveStatusCode,
+  getAccountPoolErrorSummaryLabel,
+} from '@/utils/accountPoolStatus';
 import styles from './AccountPoolPage.module.scss';
 
-const ACCOUNT_POOL_CHECK_CONCURRENCY_STORAGE_KEY = 'cli-proxy-account-pool-check-concurrency';
-const ACCOUNT_POOL_LOCAL_PUSH_SESSION_KEY = 'cli-proxy-account-pool-local-push-signature';
-const ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY = 'cli-proxy-account-pool-import-job';
 const MIN_ACCOUNT_POOL_CHECK_CONCURRENCY = 1;
-const DEFAULT_ACCOUNT_POOL_CHECK_CONCURRENCY = 50;
+const MAX_ACCOUNT_POOL_CHECK_CONCURRENCY = 5;
+const DEFAULT_ACCOUNT_POOL_CHECK_CONCURRENCY = 2;
 const MIN_ACCOUNT_POOL_PAGE_SIZE = 1;
 const MAX_ACCOUNT_POOL_PAGE_SIZE = 200;
 const DEFAULT_ACCOUNT_POOL_PAGE_SIZE = 100;
@@ -62,7 +70,11 @@ const DEFAULT_ACCOUNT_POOL_QUOTA_FILTER = 'all';
 const LOW_ACCOUNT_POOL_QUOTA_PERCENT = 20;
 const ACCOUNT_POOL_CHECK_RETRY_ATTEMPTS = 2;
 const ACCOUNT_POOL_CHECK_RETRY_DELAY_MS = 700;
+const ACCOUNT_POOL_REAL_REQUEST_MODEL = 'gpt-5.4-mini';
+const ACCOUNT_POOL_CODEX_RESPONSES_URL = 'https://chatgpt.com/backend-api/codex/responses';
 const ACCOUNT_POOL_IMPORT_ARCHIVE_EXTENSIONS = ['.zip', '.tar', '.tar.gz', '.tgz', '.gz'];
+type AccountPoolImportKind = 'files' | 'folder';
+
 type AccountPoolWriteAction =
   | 'overwrite-current'
   | 'append-current';
@@ -641,12 +653,12 @@ const matchesCheckStatusFilter = (status: string | undefined, filter: string): b
 };
 
 const matchesStatusCodeFilter = (
-  statusCode: number | undefined,
+  result: AccountCheckResult | undefined,
   filter: string
 ): boolean => {
   if (filter === DEFAULT_ACCOUNT_POOL_CHECK_STATUS_FILTER || !filter.startsWith('code:')) return true;
   const code = Number(filter.slice('code:'.length));
-  return Number.isFinite(code) && statusCode === code;
+  return Number.isFinite(code) && getAccountPoolEffectiveStatusCode(result) === code;
 };
 
 const matchesQuotaFilter = (
@@ -690,6 +702,67 @@ const formatUSDMetric = (value: number | undefined): string => {
   return `$${usdNumberFormatter.format(value)}`;
 };
 
+const formatAccountCostMetric = (value: unknown): string => {
+  const cost = readFiniteNumber(value);
+  if (cost === null || cost <= 0) return '-';
+  return `¥${cost.toFixed(cost >= 1 ? 2 : 3)}`;
+};
+
+const formatCostPerUSDMetric = (cost: unknown, totalUSD: unknown): string => {
+  const costValue = readFiniteNumber(cost);
+  const usdValue = readFiniteNumber(totalUSD);
+  if (costValue === null || costValue <= 0 || usdValue === null || usdValue <= 0) return '-';
+  const value = costValue / usdValue;
+  return `¥${value.toFixed(value >= 1 ? 2 : 3)}/刀`;
+};
+
+const formatDurationSeconds = (seconds: number): string => {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '0分钟';
+  const totalMinutes = Math.floor(seconds / 60);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}天${hours}小时`;
+  if (hours > 0) return `${hours}小时${minutes}分钟`;
+  return `${minutes}分钟`;
+};
+
+const formatAccountLifetime = (
+  startedAt: number | null,
+  stoppedAt?: number | null,
+  lifetimeSeconds?: unknown,
+  activeSince?: unknown
+): string => {
+  const serverSeconds = readFiniteNumber(lifetimeSeconds);
+  if (serverSeconds !== null && serverSeconds >= 0) {
+    const activeSinceAt = parseDateValue(activeSince);
+    const shouldAccumulateActiveWindow =
+      stoppedAt === null &&
+      activeSinceAt !== null &&
+      Number.isFinite(activeSinceAt) &&
+      activeSinceAt > 0;
+    const activeWindowSeconds = shouldAccumulateActiveWindow
+      ? Math.max(0, Math.floor((Date.now() - activeSinceAt) / 1000))
+      : 0;
+    return formatDurationSeconds(serverSeconds + activeWindowSeconds);
+  }
+  if (startedAt === null || !Number.isFinite(startedAt) || startedAt <= 0) return '-';
+  const endAt = stoppedAt !== null && stoppedAt !== undefined && Number.isFinite(stoppedAt) && stoppedAt > 0
+    ? stoppedAt
+    : Date.now();
+  const diffMs = endAt - startedAt;
+  return formatDurationSeconds(Math.floor(diffMs / 1000));
+};
+
+const getAccountCostValue = (file: AuthFileItem): unknown =>
+  file.account_cost ?? file.accountCost ??
+  (file.metadata && typeof file.metadata === 'object' && !Array.isArray(file.metadata)
+    ? (file.metadata as Record<string, unknown>).account_cost
+    : undefined) ??
+  (file.attributes && typeof file.attributes === 'object' && !Array.isArray(file.attributes)
+    ? (file.attributes as Record<string, unknown>).account_cost
+    : undefined);
+
 const parseJsonObject = (rawText: string | undefined): Record<string, unknown> | null => {
   if (!rawText) return null;
   try {
@@ -707,6 +780,61 @@ const firstNonEmptyString = (...values: unknown[]): string => {
     }
   }
   return '';
+};
+
+
+const getSourceChannelValue = (file: AuthFileItem): string => {
+  const metadata = isRecord(file.metadata) ? file.metadata : null;
+  const attributes = isRecord(file.attributes) ? file.attributes : null;
+  const value = firstNonEmptyString(
+    file.source_channel,
+    file.sourceChannel,
+    metadata?.source_channel,
+    attributes?.source_channel
+  );
+  return value || '-';
+};
+
+const patchCachedAccountPoolContent = (
+  rawText: string | undefined,
+  fields: { account_cost: number; source_channel: string }
+): string | undefined => {
+  const parsed = parseJsonObject(rawText);
+  if (!parsed) return rawText;
+  if (fields.account_cost > 0) {
+    parsed.account_cost = fields.account_cost;
+  } else {
+    delete parsed.account_cost;
+  }
+  if (fields.source_channel) {
+    parsed.source_channel = fields.source_channel;
+  } else {
+    delete parsed.source_channel;
+  }
+  return JSON.stringify(parsed);
+};
+
+const isAccountInvalid = (file: AuthFileItem, checkResult?: AccountCheckResult): boolean => {
+  const status = String(checkResult?.status ?? file.check_status ?? file.checkStatus ?? '').toLowerCase();
+  if (checkResult?.realRequestOk === false) return true;
+  if (status === 'error') return true;
+  if (status === 'success') return checkResult?.realRequestOk !== true;
+  if (status === 'loading') return false;
+  if (file.disabled || file.unavailable) return true;
+  const statusText = String(file.status ?? '').toLowerCase();
+  if (['disabled', 'unavailable', 'invalid', 'error', 'failed'].includes(statusText)) return true;
+  const message = String(
+    checkResult?.message ?? file.check_message ?? file.checkMessage ?? file.statusMessage ?? file['status_message'] ?? ''
+  ).toLowerCase();
+  return /失效|无效|失败|错误|过期|登录|认证|invalid|expired|unauthorized|forbidden|failed|error/.test(message);
+};
+
+const getAccountLifetimeStoppedAt = (file: AuthFileItem, checkResult?: AccountCheckResult): number | null => {
+  const persistedStoppedAt = parseDateValue(file.account_stopped_at ?? file.accountStoppedAt);
+  if (persistedStoppedAt !== null) return persistedStoppedAt;
+  if (!isAccountInvalid(file, checkResult)) return null;
+  if (typeof checkResult?.checkedAt === 'number' && Number.isFinite(checkResult.checkedAt)) return checkResult.checkedAt;
+  return parseDateValue(file.check_checked_at ?? file.checkCheckedAt);
 };
 
 const getAccountPoolEmail = (
@@ -806,16 +934,10 @@ const clampAccountPoolPageSize = (value: number): number =>
   Math.min(MAX_ACCOUNT_POOL_PAGE_SIZE, Math.max(MIN_ACCOUNT_POOL_PAGE_SIZE, Math.round(value)));
 
 const clampAccountPoolCheckConcurrency = (value: number): number =>
-  Math.max(MIN_ACCOUNT_POOL_CHECK_CONCURRENCY, Math.round(value));
-
-const readStoredCheckConcurrency = (): number => {
-  if (typeof window === 'undefined') return DEFAULT_ACCOUNT_POOL_CHECK_CONCURRENCY;
-  const raw = window.localStorage.getItem(ACCOUNT_POOL_CHECK_CONCURRENCY_STORAGE_KEY);
-  if (!raw) return DEFAULT_ACCOUNT_POOL_CHECK_CONCURRENCY;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return DEFAULT_ACCOUNT_POOL_CHECK_CONCURRENCY;
-  return clampAccountPoolCheckConcurrency(parsed);
-};
+  Math.min(
+    MAX_ACCOUNT_POOL_CHECK_CONCURRENCY,
+    Math.max(MIN_ACCOUNT_POOL_CHECK_CONCURRENCY, Math.round(value))
+  );
 
 const readAccountPoolRemoteHash = (file: AuthFileItem): string => {
   const value =
@@ -930,6 +1052,78 @@ const fetchQuotaForAccountPool = async (
   }
 };
 
+const makeAccountPoolModelRequestError = (message: string, statusCode?: number): Error & { statusCode?: number } => {
+  const error = new Error(message) as Error & { statusCode?: number };
+  if (typeof statusCode === 'number') {
+    error.statusCode = statusCode;
+  }
+  return error;
+};
+
+const formatRealRequestErrorMessage = (err: unknown, t: ReturnType<typeof useTranslation>['t']): string => {
+  const status = getAccountPoolCheckErrorStatus(err);
+  const message = err instanceof Error ? err.message : t('common.unknown_error');
+  if (status === 401) {
+    return `模型请求 401 未认证：${message}`;
+  }
+  if (status) {
+    return `模型请求 ${status}：${message}`;
+  }
+  return `模型请求失败：${message}`;
+};
+
+const requestCodexModelForAccountPool = async (
+  file: AuthFileItem,
+  t: ReturnType<typeof useTranslation>['t'],
+  parentSignal?: AbortSignal
+): Promise<void> => {
+  const rawAuthIndex = file['auth_index'] ?? file.authIndex;
+  const authIndex = normalizeAuthIndex(rawAuthIndex);
+  if (!authIndex) {
+    throw makeAccountPoolModelRequestError(t('codex_quota.missing_auth_index'));
+  }
+
+  const requestHeader: Record<string, string> = {
+    ...CODEX_REQUEST_HEADERS,
+  };
+  const accountId = resolveCodexChatgptAccountId(file);
+  if (accountId) {
+    requestHeader['Chatgpt-Account-Id'] = accountId;
+  }
+
+  const result = await apiCallApi.request(
+    {
+      authIndex,
+      authName: file.name,
+      method: 'POST',
+      url: ACCOUNT_POOL_CODEX_RESPONSES_URL,
+      header: requestHeader,
+      data: JSON.stringify({
+        model: ACCOUNT_POOL_REAL_REQUEST_MODEL,
+        input: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'input_text',
+                text: 'ping',
+              },
+            ],
+          },
+        ],
+        instructions: 'Reply with pong only.',
+        stream: true,
+        store: false,
+      }),
+    },
+    { signal: parentSignal }
+  );
+
+  if (result.statusCode < 200 || result.statusCode >= 300) {
+    throw makeAccountPoolModelRequestError(getApiCallErrorMessage(result), result.statusCode);
+  }
+};
+
 const compareOptionalTime = (
   left: number | null,
   right: number | null,
@@ -1002,6 +1196,11 @@ export function AccountPoolPage() {
   const [downloading, setDownloading] = useState(false);
   const [importingPool, setImportingPool] = useState(false);
   const [importJob, setImportJob] = useState<AccountPoolImportJob | null>(null);
+  const [importMetaOpen, setImportMetaOpen] = useState(false);
+  const [importMetaKind, setImportMetaKind] = useState<AccountPoolImportKind>('files');
+  const [importSourceChannel, setImportSourceChannel] = useState('');
+  const [importAccountCost, setImportAccountCost] = useState('');
+  const [importOverwriteMetadata, setImportOverwriteMetadata] = useState(false);
   const [activeWriteAction, setActiveWriteAction] = useState<AccountPoolWriteAction | null>(null);
   const [deletingPoolEntries, setDeletingPoolEntries] = useState(false);
   const [error, setError] = useState('');
@@ -1019,7 +1218,7 @@ export function AccountPoolPage() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(DEFAULT_ACCOUNT_POOL_PAGE_SIZE);
   const [pageSizeInput, setPageSizeInput] = useState(String(DEFAULT_ACCOUNT_POOL_PAGE_SIZE));
-  const [checkConcurrency, setCheckConcurrency] = useState(readStoredCheckConcurrency);
+  const [checkConcurrency, setCheckConcurrency] = useState(DEFAULT_ACCOUNT_POOL_CHECK_CONCURRENCY);
   const [checkConcurrencyInput, setCheckConcurrencyInput] = useState(String(checkConcurrency));
   const [selectedNames, setSelectedNames] = useState<string[]>([]);
   const [usageSummaries, setUsageSummaries] = useState<AccountPoolUsageSummary[]>([]);
@@ -1034,37 +1233,69 @@ export function AccountPoolPage() {
   const [configViewerContent, setConfigViewerContent] = useState('');
   const [configViewerLoading, setConfigViewerLoading] = useState(false);
   const [configViewerError, setConfigViewerError] = useState('');
+  const [accountMetaEditorOpen, setAccountMetaEditorOpen] = useState(false);
+  const [accountMetaEditorName, setAccountMetaEditorName] = useState('');
+  const [accountMetaEditorCost, setAccountMetaEditorCost] = useState('');
+  const [accountMetaEditorSourceChannel, setAccountMetaEditorSourceChannel] = useState('');
+  const [savingAccountMeta, setSavingAccountMeta] = useState(false);
   const [resumedPendingCheck, setResumedPendingCheck] = useState(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const importFolderInputRef = useRef<HTMLInputElement | null>(null);
   const pendingCheckResultUpdatesRef = useRef<Map<string, AccountPoolCheckResultPatch>>(new Map());
   const checkResultFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flushingCheckResultsRef = useRef(false);
+  const checkResultFlushPromiseRef = useRef<Promise<boolean> | null>(null);
   const initialRefreshStartedRef = useRef(false);
 
-  const flushRemoteCheckResults = useCallback(async () => {
-    if (flushingCheckResultsRef.current) return;
-    const updates = Array.from(pendingCheckResultUpdatesRef.current.values());
-    if (updates.length === 0) return;
-    pendingCheckResultUpdatesRef.current.clear();
-    flushingCheckResultsRef.current = true;
-    try {
-      await authFilesApi.updateAccountPoolCheckResults(updates);
-    } catch (err) {
-      updates.forEach((update) => {
-        pendingCheckResultUpdatesRef.current.set(update.name, update);
-      });
-      if (!checkResultFlushTimerRef.current) {
-        checkResultFlushTimerRef.current = setTimeout(() => {
-          checkResultFlushTimerRef.current = null;
-          void flushRemoteCheckResults();
-        }, 2000);
-      }
-      console.warn('failed to persist account pool check results', err);
-    } finally {
-      flushingCheckResultsRef.current = false;
+  const flushRemoteCheckResults = useCallback(async (): Promise<boolean> => {
+    if (checkResultFlushTimerRef.current) {
+      clearTimeout(checkResultFlushTimerRef.current);
+      checkResultFlushTimerRef.current = null;
     }
-  }, []);
+    if (checkResultFlushPromiseRef.current) {
+      return checkResultFlushPromiseRef.current;
+    }
+    const runFlush = async (): Promise<boolean> => {
+      flushingCheckResultsRef.current = true;
+      try {
+        for (;;) {
+          const updates = Array.from(pendingCheckResultUpdatesRef.current.values());
+          if (updates.length === 0) return true;
+          pendingCheckResultUpdatesRef.current.clear();
+          try {
+            const response = await authFilesApi.updateAccountPoolCheckResults(updates);
+            if (response.auto_appended && response.auto_appended > 0) {
+              showNotification(
+                `已自动追加 ${response.auto_appended} 个检测通过且额度高的账号到认证文件`,
+                'success'
+              );
+            }
+          } catch (err) {
+            updates.forEach((update) => {
+              pendingCheckResultUpdatesRef.current.set(update.name, update);
+            });
+            if (!checkResultFlushTimerRef.current) {
+              checkResultFlushTimerRef.current = setTimeout(() => {
+                checkResultFlushTimerRef.current = null;
+                void flushRemoteCheckResults();
+              }, 2000);
+            }
+            console.warn('failed to persist account pool check results', err);
+            return false;
+          }
+        }
+      } finally {
+        flushingCheckResultsRef.current = false;
+      }
+    };
+    const promise = runFlush().finally(() => {
+      if (checkResultFlushPromiseRef.current === promise) {
+        checkResultFlushPromiseRef.current = null;
+      }
+    });
+    checkResultFlushPromiseRef.current = promise;
+    return promise;
+  }, [showNotification]);
 
   const scheduleRemoteCheckResultFlush = useCallback(() => {
     if (checkResultFlushTimerRef.current) return;
@@ -1077,15 +1308,22 @@ export function AccountPoolPage() {
   const queueRemoteCheckResult = useCallback(
     (file: AuthFileItem, result: AccountCheckResult, contentHash?: string) => {
       if (!file.name || result.status === 'loading') return;
+      const persistedStatus =
+        result.status === 'success' && result.realRequestOk !== true ? 'error' : result.status;
       pendingCheckResultUpdatesRef.current.set(file.name, {
         name: file.name,
         content_hash: contentHash,
         result: {
-          status: result.status,
+          status: persistedStatus,
           message: result.message,
           plan: result.plan,
           quotaLines: result.quotaLines,
           quotaRemainingPercent: result.quotaRemainingPercent,
+          quotaOk: result.quotaOk,
+          realRequestOk: result.realRequestOk,
+          realRequestError: result.realRequestError,
+          realRequestStatusCode: result.realRequestStatusCode,
+          requestedModel: result.requestedModel,
           statusCode: result.statusCode,
           checkedAt: result.checkedAt,
         },
@@ -1118,54 +1356,15 @@ export function AccountPoolPage() {
     return nextRecords;
   }, [hydrateRemoteCheckResults, pruneCheckResults]);
 
-  const hydrateStoredPool = useCallback(() => {
-    const storedRecords = applyRecords(readAccountPoolRecords());
-    setLoading(false);
-    return storedRecords;
-  }, [applyRecords]);
-
-  const pushLocalAccountPoolToServer = useCallback(async (records: AccountPoolRecord[]) => {
-    if (typeof window === 'undefined') return;
-    const localRecordsWithContent = uniqueAccountPoolRecords(records).filter(
-      (record) => record.content && record.file.name
-    );
-    if (localRecordsWithContent.length === 0) return;
-
-    const remoteResponse = await authFilesApi.listAccountPoolEntries();
-    const remoteHashes = new Set(
-      (remoteResponse.files || [])
-        .map(readAccountPoolRemoteHash)
-        .filter(Boolean)
-    );
-    const remoteNames = new Set((remoteResponse.files || []).map((file) => file.name).filter(Boolean));
-    const recordsWithContent = localRecordsWithContent.filter(
-      (record) => !remoteHashes.has(record.hash) && !remoteNames.has(record.file.name)
-    );
-    if (recordsWithContent.length === 0) return;
-
-    const signature = recordsWithContent.map((record) => `${record.file.name}:${record.hash}`).join('|');
-    if (window.sessionStorage.getItem(ACCOUNT_POOL_LOCAL_PUSH_SESSION_KEY) === signature) return;
-
-    const blob = createZipBlob(
-      recordsWithContent.map((record) => ({
-        name: record.file.name,
-        text: record.content ?? '',
-      }))
-    );
-    const file = new File([blob], 'account-pool-local-cache.zip', { type: 'application/zip' });
-    await authFilesApi.uploadAccountPoolFiles([file]);
-    window.sessionStorage.setItem(ACCOUNT_POOL_LOCAL_PUSH_SESSION_KEY, signature);
-  }, []);
-
   const loadLazyRemotePool = useCallback(
-    async (storedRecords: AccountPoolRecord[]) => {
+    async () => {
       try {
         const response = await authFilesApi.listAccountPoolEntries({ includeHash: false });
         const remoteFiles = (response.files || []).filter(
           (file) => file && file.name && !isRuntimeOnlyAuthPoolFile(file)
         );
         if (remoteFiles.length === 0) return;
-        const lazyRecords = buildLazyAccountPoolRecords(remoteFiles, storedRecords);
+        const lazyRecords = buildLazyAccountPoolRecords(remoteFiles, []);
         applyRecords(lazyRecords);
         setFolderInfos(response.folders || []);
       } catch {
@@ -1175,28 +1374,43 @@ export function AccountPoolPage() {
     [applyRecords]
   );
 
-  const refreshPool = useCallback(async (showLoading = true) => {
-    if (showLoading) {
-      setLoading(true);
+  const refreshAccountPoolDerivedState = useCallback(async () => {
+    const [usageResponse, folderResponse] = await Promise.allSettled([
+      authFilesApi.getAccountPoolUsageRecords({ summaryOnly: true }),
+      authFilesApi.listAccountPoolEntries(),
+    ]);
+    if (usageResponse.status === 'fulfilled') {
+      setUsageSummaries(usageResponse.value.summaries);
     }
-    setError('');
-    setSyncProgress(null);
-    const storedRecords = hydrateStoredPool();
-    try {
-      await pushLocalAccountPoolToServer(storedRecords);
-      await loadLazyRemotePool(storedRecords);
-      const mergedRecords = await refreshAccountPoolFromServer(checkConcurrency, setSyncProgress);
-      applyRecords(mergedRecords);
-      setSyncProgress(null);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : t('notification.refresh_failed');
-      setError(message);
-    } finally {
+    if (folderResponse.status === 'fulfilled') {
+      setFolderInfos(folderResponse.value.folders || []);
+    }
+  }, []);
+
+  const refreshPool = useCallback(
+    async (showLoading = true) => {
       if (showLoading) {
-        setLoading(false);
+        setLoading(true);
       }
-    }
-  }, [applyRecords, checkConcurrency, hydrateStoredPool, loadLazyRemotePool, pushLocalAccountPoolToServer, t]);
+      setError('');
+      setSyncProgress(null);
+      try {
+        await loadLazyRemotePool();
+        const mergedRecords = await refreshAccountPoolFromServer(checkConcurrency, setSyncProgress);
+        applyRecords(mergedRecords);
+        await refreshAccountPoolDerivedState();
+        setSyncProgress(null);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : t('notification.refresh_failed');
+        setError(message);
+      } finally {
+        if (showLoading) {
+          setLoading(false);
+        }
+      }
+    },
+    [applyRecords, checkConcurrency, loadLazyRemotePool, refreshAccountPoolDerivedState, t]
+  );
 
   const loadFolderInfos = useCallback(async () => {
     try {
@@ -1215,7 +1429,6 @@ export function AccountPoolPage() {
         const nextJob = await authFilesApi.getAccountPoolImport(jobId);
         setImportJob(nextJob);
         if (isAccountPoolImportDone(nextJob)) {
-          window.localStorage.removeItem(ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY);
           await refreshPool(false);
           await loadFolderInfos();
           showNotification(
@@ -1237,17 +1450,9 @@ export function AccountPoolPage() {
   }, [loadFolderInfos, refreshPool, showNotification]);
 
   useEffect(() => {
-    const jobId = window.localStorage.getItem(ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY);
-    if (jobId) {
-      void pollAccountPoolImportJob(jobId);
-    }
-  }, [pollAccountPoolImportJob]);
-
-  useEffect(() => {
-    hydrateStoredPool();
     if (!initialRefreshStartedRef.current) {
       initialRefreshStartedRef.current = true;
-      void refreshPool();
+      void refreshPool(true);
     }
 
     const handleAccountPoolUpdated = (event: Event) => {
@@ -1259,7 +1464,7 @@ export function AccountPoolPage() {
 
     window.addEventListener(ACCOUNT_POOL_UPDATED_EVENT, handleAccountPoolUpdated);
     return () => window.removeEventListener(ACCOUNT_POOL_UPDATED_EVENT, handleAccountPoolUpdated);
-  }, [applyRecords, hydrateStoredPool, refreshPool]);
+  }, [applyRecords, refreshPool]);
 
   const loadUsageSummaries = useCallback(async () => {
     try {
@@ -1422,7 +1627,7 @@ export function AccountPoolPage() {
         if (!matchesPlanFilter(file, fileContentCache, checkResult?.plan, planFilter)) return false;
         if (!matchesCheckStatusFilter(checkResult?.status, checkStatusFilter)) return false;
         if (!matchesCheckStatusFilter(checkResult?.status, quickStatusFilter)) return false;
-        if (!matchesStatusCodeFilter(checkResult?.statusCode, quickStatusFilter)) return false;
+        if (!matchesStatusCodeFilter(checkResult, quickStatusFilter)) return false;
         if (!matchesQuotaFilter(checkResult, quotaFilter)) return false;
         if (!term) return true;
         return [file.name, getFileType(file), folder, sourceModel, folderInfo?.source_info, file.statusMessage, file.status]
@@ -1516,18 +1721,6 @@ export function AccountPoolPage() {
   const selectedSet = useMemo(() => new Set(selectedNames), [selectedNames]);
   const folderTotalTokensByName = useMemo(() => {
     const totals = new Map<string, number>();
-    files.forEach((file) => {
-      const folder = getFileFolder(file);
-      const value =
-        getUsageMetricForSort(
-          file,
-          fileContentCache,
-          usageSummaryByEmail,
-          usageSummaryByAuthID,
-          'total_tokens'
-        ) ?? 0;
-      totals.set(folder, (totals.get(folder) ?? 0) + value);
-    });
     folderInfos.forEach((info) => {
       const folder = normalizeFolderName(info.folder);
       const value = readFiniteNumber(info.total_tokens);
@@ -1536,7 +1729,18 @@ export function AccountPoolPage() {
       }
     });
     return totals;
-  }, [fileContentCache, files, folderInfos, usageSummaryByAuthID, usageSummaryByEmail]);
+  }, [folderInfos]);
+  const folderTotalUSDByName = useMemo(() => {
+    const totals = new Map<string, number>();
+    folderInfos.forEach((info) => {
+      const folder = normalizeFolderName(info.folder);
+      const value = readFiniteNumber(info.total_usd);
+      if (value !== null) {
+        totals.set(folder, value);
+      }
+    });
+    return totals;
+  }, [folderInfos]);
   const folderGroups = useMemo(() => {
     const groups = new Map<string, AuthFileItem[]>();
     filteredFiles.forEach((file) => {
@@ -1548,21 +1752,15 @@ export function AccountPoolPage() {
     return Array.from(groups.entries())
       .map(([folder, items]) => {
         const byCode = new Map<number, number>();
+        const errorLabels = new Map<string, number>();
         let successCount = 0;
         let checkingCount = 0;
         let unchecked = 0;
         let unsupported = 0;
-        let unknownError = 0;
-        let totalTokens = 0;
+        let totalCost = 0;
         items.forEach((file) => {
-          totalTokens +=
-            getUsageMetricForSort(
-              file,
-              fileContentCache,
-              usageSummaryByEmail,
-              usageSummaryByAuthID,
-              'total_tokens'
-            ) ?? 0;
+          const accountCost = readFiniteNumber(getAccountCostValue(file));
+          if (accountCost !== null && accountCost > 0) totalCost += accountCost;
           const result = checkResults[file.name];
           if (result?.status === 'loading') {
             checkingCount += 1;
@@ -1576,9 +1774,10 @@ export function AccountPoolPage() {
             unsupported += 1;
             return;
           }
-          if (typeof result.statusCode === 'number') {
-            byCode.set(result.statusCode, (byCode.get(result.statusCode) ?? 0) + 1);
-            if (result.statusCode >= 200 && result.statusCode < 300) {
+          const effectiveStatusCode = getAccountPoolEffectiveStatusCode(result);
+          if (typeof effectiveStatusCode === 'number') {
+            byCode.set(effectiveStatusCode, (byCode.get(effectiveStatusCode) ?? 0) + 1);
+            if (effectiveStatusCode >= 200 && effectiveStatusCode < 300) {
               successCount += 1;
             }
             return;
@@ -1588,7 +1787,8 @@ export function AccountPoolPage() {
             return;
           }
           if (result.status === 'error') {
-            unknownError += 1;
+            const label = getAccountPoolErrorSummaryLabel(result);
+            errorLabels.set(label, (errorLabels.get(label) ?? 0) + 1);
           } else {
             unchecked += 1;
           }
@@ -1603,8 +1803,13 @@ export function AccountPoolPage() {
             checking: checkingCount,
             unchecked,
             unsupported,
-            unknownError,
-            totalTokens: folderTotalTokensByName.get(folder) ?? totalTokens,
+            errorLabels: Array.from(errorLabels.entries()).sort(([leftLabel, leftCount], [rightLabel, rightCount]) => {
+              if (rightCount !== leftCount) return rightCount - leftCount;
+              return leftLabel.localeCompare(rightLabel);
+            }),
+            totalTokens: folderTotalTokensByName.get(folder) ?? 0,
+            totalUSD: folderTotalUSDByName.get(folder) ?? 0,
+            totalCost,
           },
         };
       })
@@ -1629,6 +1834,7 @@ export function AccountPoolPage() {
     filteredFiles,
     folderInfoByName,
     folderTotalTokensByName,
+    folderTotalUSDByName,
     sortMode,
     usageSummaryByAuthID,
     usageSummaryByEmail,
@@ -1679,10 +1885,10 @@ export function AccountPoolPage() {
 
   const statusCodeStats = useMemo(() => {
     const byCode = new Map<number, number>();
+    const errorLabels = new Map<string, number>();
     let checkingCount = 0;
     let unchecked = 0;
     let unsupported = 0;
-    let unknownError = 0;
 
     for (const file of statusStatsSourceFiles) {
       const result = checkResults[file.name];
@@ -1698,12 +1904,14 @@ export function AccountPoolPage() {
         unsupported += 1;
         continue;
       }
-      if (typeof result.statusCode === 'number') {
-        byCode.set(result.statusCode, (byCode.get(result.statusCode) ?? 0) + 1);
+      const effectiveStatusCode = getAccountPoolEffectiveStatusCode(result);
+      if (typeof effectiveStatusCode === 'number') {
+        byCode.set(effectiveStatusCode, (byCode.get(effectiveStatusCode) ?? 0) + 1);
         continue;
       }
       if (result.status === 'error') {
-        unknownError += 1;
+        const label = getAccountPoolErrorSummaryLabel(result);
+        errorLabels.set(label, (errorLabels.get(label) ?? 0) + 1);
       } else {
         unchecked += 1;
       }
@@ -1714,7 +1922,10 @@ export function AccountPoolPage() {
       checking: checkingCount,
       unchecked,
       unsupported,
-      unknownError,
+      errorLabels: Array.from(errorLabels.entries()).sort(([leftLabel, leftCount], [rightLabel, rightCount]) => {
+        if (rightCount !== leftCount) return rightCount - leftCount;
+        return leftLabel.localeCompare(rightLabel);
+      }),
     };
   }, [checkResults, statusStatsSourceFiles]);
 
@@ -1804,9 +2015,6 @@ export function AccountPoolPage() {
     const next = clampAccountPoolCheckConcurrency(value);
     setCheckConcurrency(next);
     setCheckConcurrencyInput(String(next));
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem(ACCOUNT_POOL_CHECK_CONCURRENCY_STORAGE_KEY, String(next));
-    }
   };
 
   const handleCheckConcurrencyChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -1821,9 +2029,6 @@ export function AccountPoolPage() {
 
     const next = clampAccountPoolCheckConcurrency(parsed);
     setCheckConcurrency(next);
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem(ACCOUNT_POOL_CHECK_CONCURRENCY_STORAGE_KEY, String(next));
-    }
   };
 
   const toggleOne = (name: string, checked: boolean) => {
@@ -1880,53 +2085,75 @@ export function AccountPoolPage() {
     });
   };
 
-  const readAccountPoolFileContent = async (name: string): Promise<string> => {
-    const cachedContent = fileContentCache[name];
-    if (cachedContent) return cachedContent;
-
-    try {
-      return await authFilesApi.downloadAccountPoolText(name);
-    } catch (accountPoolErr) {
-      try {
-        return await authFilesApi.downloadText(name);
-      } catch {
-        throw accountPoolErr;
-      }
-    }
-  };
-
-  const openConfigViewer = async (file: AuthFileItem) => {
-    setConfigViewerOpen(true);
-    setConfigViewerName(file.name);
-    setConfigViewerContent('');
-    setConfigViewerError('');
-    setConfigViewerLoading(true);
-    try {
-      const rawContent = await readAccountPoolFileContent(file.name);
-      let displayContent = rawContent;
-      try {
-        displayContent = JSON.stringify(JSON.parse(rawContent), null, 2);
-      } catch {
-        // Keep non-JSON content readable instead of failing the viewer.
-      }
-      setConfigViewerContent(displayContent);
-      setFileContentCache((current) => ({
-        ...current,
-        [file.name]: rawContent,
-      }));
-    } catch (err) {
-      setConfigViewerError(err instanceof Error ? err.message : '读取配置失败');
-    } finally {
-      setConfigViewerLoading(false);
-    }
-  };
-
   const closeConfigViewer = () => {
     setConfigViewerOpen(false);
     setConfigViewerName('');
     setConfigViewerContent('');
     setConfigViewerError('');
     setConfigViewerLoading(false);
+  };
+
+  const openAccountMetaEditor = (file: AuthFileItem) => {
+    setAccountMetaEditorName(file.name);
+    const cost = readFiniteNumber(getAccountCostValue(file));
+    setAccountMetaEditorCost(cost !== null && cost > 0 ? String(cost) : '');
+    const sourceChannel = getSourceChannelValue(file);
+    setAccountMetaEditorSourceChannel(sourceChannel === '-' ? '' : sourceChannel);
+    setAccountMetaEditorOpen(true);
+  };
+
+  const closeAccountMetaEditor = () => {
+    if (savingAccountMeta) return;
+    setAccountMetaEditorOpen(false);
+    setAccountMetaEditorName('');
+    setAccountMetaEditorCost('');
+    setAccountMetaEditorSourceChannel('');
+  };
+
+  const saveAccountMetaEditor = async () => {
+    const name = accountMetaEditorName.trim();
+    if (!name) return;
+    const costText = accountMetaEditorCost.trim();
+    const cost = costText ? Number(costText) : 0;
+    if (!Number.isFinite(cost) || cost < 0) {
+      showNotification('账号成本必须是大于等于 0 的数字', 'error');
+      return;
+    }
+
+    setSavingAccountMeta(true);
+    try {
+      const sourceChannel = accountMetaEditorSourceChannel.trim();
+      const fields = {
+        account_cost: cost,
+        source_channel: sourceChannel,
+      };
+      await authFilesApi.patchFields(name, fields);
+      setFiles((current) =>
+        current.map((file) =>
+          file.name === name
+            ? {
+                ...file,
+                account_cost: cost > 0 ? cost : undefined,
+                source_channel: sourceChannel || undefined,
+              }
+            : file
+        )
+      );
+      setFileContentCache((current) => ({
+        ...current,
+        [name]: patchCachedAccountPoolContent(current[name], fields) ?? current[name],
+      }));
+      showNotification('账号成本和渠道来源已保存', 'success');
+      setAccountMetaEditorOpen(false);
+      setAccountMetaEditorName('');
+      setAccountMetaEditorCost('');
+      setAccountMetaEditorSourceChannel('');
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : t('common.unknown_error');
+      showNotification(`保存账号信息失败：${message}`, 'error');
+    } finally {
+      setSavingAccountMeta(false);
+    }
   };
 
   const downloadAccountPoolFiles = async (targets: AuthFileItem[], label: string) => {
@@ -1968,10 +2195,13 @@ export function AccountPoolPage() {
         return;
       }
       const uploadPayload = await buildAccountPoolFolderUploadFiles(importable);
-      const result = await authFilesApi.uploadAccountPoolFiles(uploadPayload);
+      const result = await authFilesApi.uploadAccountPoolFiles(uploadPayload, {
+        sourceChannel: importSourceChannel.trim(),
+        accountCost: importAccountCost.trim(),
+        overwriteMetadata: importOverwriteMetadata,
+      });
       if (result.job?.id) {
         setImportJob(result.job);
-        window.localStorage.setItem(ACCOUNT_POOL_IMPORT_JOB_STORAGE_KEY, result.job.id);
         showNotification(`账号池后台导入已开始：${result.job.total} 个上传包`, 'success');
         void pollAccountPoolImportJob(result.job.id);
         if (skipped > 0) {
@@ -2008,6 +2238,27 @@ export function AccountPoolPage() {
       );
     } finally {
       setImportingPool(false);
+    }
+  };
+
+  const openImportMeta = (kind: AccountPoolImportKind) => {
+    if (importingPool) return;
+    setImportMetaKind(kind);
+    setImportMetaOpen(true);
+  };
+
+  const closeImportMeta = () => {
+    if (importingPool) return;
+    setImportMetaOpen(false);
+  };
+
+  const startImportWithMetadata = () => {
+    if (importingPool) return;
+    setImportMetaOpen(false);
+    if (importMetaKind === 'folder') {
+      importFolderInputRef.current?.click();
+    } else {
+      importInputRef.current?.click();
     }
   };
 
@@ -2086,8 +2337,7 @@ export function AccountPoolPage() {
         backendDeleteFailed = err instanceof Error ? err.message : t('common.unknown_error');
       }
 
-      const nextRecords = deleteAccountPoolRecordsByName(names);
-      applyRecords(nextRecords);
+      await refreshPool(false);
       const deletedNames = new Set(names);
       const deletedEmails = new Set(
         targets
@@ -2301,18 +2551,12 @@ export function AccountPoolPage() {
         if (signal?.aborted || isRunCancelled(runId)) {
           throw new DOMException('Account pool check aborted', 'AbortError');
         }
+        let quotaSummary: ReturnType<typeof getQuotaSummary> | null = null;
+        let detectedPlan: string | undefined;
         try {
           const quota = await fetchQuotaForAccountPool(config, file, t, signal);
-          const quotaSummary = getQuotaSummary(quota, t);
-          return {
-            status: 'success',
-            message: t('account_pool.check_success'),
-            plan: getDetectedPlan(quota),
-            quotaLines: quotaSummary.lines,
-            quotaRemainingPercent: quotaSummary.remainingPercent,
-            statusCode: 200,
-            checkedAt: Date.now(),
-          };
+          quotaSummary = getQuotaSummary(quota, t);
+          detectedPlan = getDetectedPlan(quota);
         } catch (err: unknown) {
           if (isAbortError(err) || signal?.aborted || isRunCancelled(runId)) {
             throw err;
@@ -2325,17 +2569,77 @@ export function AccountPoolPage() {
             break;
           }
           await sleep(ACCOUNT_POOL_CHECK_RETRY_DELAY_MS * (attempt + 1));
+          continue;
+        }
+
+        try {
+          await requestCodexModelForAccountPool(file, t, signal);
+          return {
+            status: 'success',
+            message: t('account_pool.check_success'),
+            plan: detectedPlan,
+            quotaLines: quotaSummary.lines,
+            quotaRemainingPercent: quotaSummary.remainingPercent,
+            quotaOk: true,
+            realRequestOk: true,
+            requestedModel: ACCOUNT_POOL_REAL_REQUEST_MODEL,
+            statusCode: 200,
+            checkedAt: Date.now(),
+          };
+        } catch (err: unknown) {
+          if (isAbortError(err) || signal?.aborted || isRunCancelled(runId)) {
+            throw err;
+          }
+          const status = getAccountPoolCheckErrorStatus(err);
+          const message = formatRealRequestErrorMessage(err, t);
+          return {
+            status: 'error',
+            message: '模型检测请求失败',
+            plan: detectedPlan,
+            quotaLines: quotaSummary.lines,
+            quotaRemainingPercent: quotaSummary.remainingPercent,
+            quotaOk: true,
+            realRequestOk: false,
+            realRequestError: message,
+            realRequestStatusCode: status,
+            requestedModel: ACCOUNT_POOL_REAL_REQUEST_MODEL,
+            checkedAt: Date.now(),
+          };
         }
       }
 
       const message = lastError instanceof Error ? lastError.message : t('common.unknown_error');
       const status = getAccountPoolCheckErrorStatus(lastError);
-      return {
-        status: 'error',
-        message: status ? `${status}: ${message}` : message,
-        statusCode: status,
-        checkedAt: Date.now(),
-      };
+
+      try {
+        await requestCodexModelForAccountPool(file, t, signal);
+        return {
+          status: 'success',
+          message: '模型请求可用（额度接口不可访问）',
+          quotaOk: false,
+          realRequestOk: true,
+          requestedModel: ACCOUNT_POOL_REAL_REQUEST_MODEL,
+          statusCode: 200,
+          realRequestError: status ? `额度请求 ${status}：${message}` : `额度请求失败：${message}`,
+          checkedAt: Date.now(),
+        };
+      } catch (err: unknown) {
+        if (isAbortError(err) || signal?.aborted || isRunCancelled(runId)) {
+          throw err;
+        }
+        const realRequestStatus = getAccountPoolCheckErrorStatus(err);
+        return {
+          status: 'error',
+          message: status ? `额度请求 ${status}：${message}` : `额度请求失败：${message}`,
+          quotaOk: false,
+          realRequestOk: false,
+          realRequestError: formatRealRequestErrorMessage(err, t),
+          realRequestStatusCode: realRequestStatus,
+          requestedModel: ACCOUNT_POOL_REAL_REQUEST_MODEL,
+          statusCode: status,
+          checkedAt: Date.now(),
+        };
+      }
     };
 
     let cursor = 0;
@@ -2372,7 +2676,10 @@ export function AccountPoolPage() {
         Array.from({ length: Math.min(checkConcurrency, checkTargets.length) }, () => worker())
       );
       if (signal?.aborted || isRunCancelled(runId)) return;
-      await flushRemoteCheckResults();
+      const persisted = await flushRemoteCheckResults();
+      if (persisted) {
+        await refreshPool(false);
+      }
       const summary = finishCheck(runId);
       if (!summary) return;
       showNotification(
@@ -2385,7 +2692,10 @@ export function AccountPoolPage() {
       );
     } catch {
       if (signal?.aborted || isRunCancelled(runId)) return;
-      await flushRemoteCheckResults();
+      const persisted = await flushRemoteCheckResults();
+      if (persisted) {
+        await refreshPool(false);
+      }
       const summary = finishCheck(runId);
       if (summary) {
         showNotification(
@@ -2455,6 +2765,23 @@ export function AccountPoolPage() {
       ? formatUnixTimestamp(Math.round(checkResult.checkedAt / 1000))
       : '';
     const quotaDetails = (checkResult?.quotaLines ?? []).map(parseQuotaDetail);
+    const quotaAccessLabel = checkResult?.quotaOk === true
+      ? '额度接口：可访问'
+      : checkResult?.quotaOk === false
+        ? '额度接口：不可访问'
+        : '';
+    const realRequestLabel = checkResult?.realRequestOk === true
+      ? `真实请求：${checkResult.requestedModel ?? ACCOUNT_POOL_REAL_REQUEST_MODEL} 可用`
+      : checkResult?.realRequestOk === false
+        ? (checkResult.realRequestStatusCode === 401
+            ? `真实请求：${checkResult.requestedModel ?? ACCOUNT_POOL_REAL_REQUEST_MODEL} 401 未认证`
+            : `真实请求：${checkResult.requestedModel ?? ACCOUNT_POOL_REAL_REQUEST_MODEL} 不可用`)
+        : '';
+    const accountStartedAt =
+      parseDateValue(file.account_started_at ?? file.accountStartedAt) ??
+      getRegistrationTime(file, fileContentCache, savedAtByName);
+    const accountStoppedAt = getAccountLifetimeStoppedAt(file, checkResult);
+    const accountInvalid = accountStoppedAt !== null;
     const showStatusMessage =
       Boolean(statusMessage) &&
       (!checkResult || (checkResult.status !== 'success' && checkResult.status !== 'loading'));
@@ -2470,21 +2797,48 @@ export function AccountPoolPage() {
             ariaLabel={file.name}
           />
           <div className={styles.cardMain}>
-            <button
-              type="button"
-              className={styles.fileNameButton}
-              onClick={() => void openConfigViewer(file)}
-              title="查看账号配置"
-            >
-              {file.name}
-            </button>
+            <span className={styles.fileName} title={file.name}>{file.name}</span>
             <div className={styles.metaRow}>
               <span className={styles.typeBadge}>{type}</span>
               <span className={styles.folderBadge}>{folder}</span>
               {planLabel && <span className={styles.planBadge}>{planLabel}</span>}
               {modifiedLabel && <span className={styles.muted}>{modifiedLabel}</span>}
+              <Button
+                variant="secondary"
+                size="sm"
+                title="编辑账号成本和渠道来源"
+                onClick={() => openAccountMetaEditor(file)}
+              >
+                编辑成本/来源
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                title={`请求 ${ACCOUNT_POOL_REAL_REQUEST_MODEL}，并按真实请求结果更新可用状态`}
+                onClick={() => void detectAccounts([file])}
+                loading={checking && checkResult?.status === 'loading'}
+                disabled={checking}
+              >
+                请求大模型
+              </Button>
             </div>
             <div className={styles.usageMetricRow}>
+              <div className={styles.usageMetric}>
+                <span className={styles.usageMetricLabel}>成本</span>
+                <strong className={styles.usageMetricValue}>{formatAccountCostMetric(getAccountCostValue(file))}</strong>
+              </div>
+              <div className={styles.usageMetric}>
+                <span className={styles.usageMetricLabel}>每刀成本</span>
+                <strong className={styles.usageMetricValue}>{formatCostPerUSDMetric(getAccountCostValue(file), usageSummary?.total_usd)}</strong>
+              </div>
+              <div className={styles.usageMetric}>
+                <span className={styles.usageMetricLabel}>渠道来源</span>
+                <strong className={styles.usageMetricValue}>{getSourceChannelValue(file)}</strong>
+              </div>
+              <div className={styles.usageMetric}>
+                <span className={styles.usageMetricLabel}>存活{accountInvalid ? '（已停止）' : ''}</span>
+                <strong className={styles.usageMetricValue}>{formatAccountLifetime(accountStartedAt, accountStoppedAt, file.account_lifetime_seconds ?? file.accountLifetimeSeconds, file.account_lifetime_active_since ?? file.accountLifetimeActiveSince)}</strong>
+              </div>
               <div className={styles.usageMetric}>
                 <span className={styles.usageMetricLabel}>
                   {t('account_pool.usage_requests', { defaultValue: '请求' })}
@@ -2535,6 +2889,8 @@ export function AccountPoolPage() {
                 {checkResult.status === 'loading' ? t('account_pool.checking') : checkResult.message}
               </span>
               {planLabel && <span className={styles.checkPlanPill}>{planLabel}</span>}
+              {quotaAccessLabel && <span className={styles.checkPlanPill}>{quotaAccessLabel}</span>}
+              {realRequestLabel && <span className={styles.checkPlanPill}>{realRequestLabel}</span>}
               {checkedAtLabel && <span className={styles.checkTime}>{checkedAtLabel}</span>}
             </div>
             {quotaDetails.length > 0 && (
@@ -2607,19 +2963,20 @@ export function AccountPoolPage() {
               <strong>{count}</strong>
             </button>
           ))}
-          {displayedStatusCodeStats.unknownError > 0 && (
+          {displayedStatusCodeStats.errorLabels.map(([label, count]) => (
             <button
               type="button"
               className={`${styles.statPill} ${styles.statPillError} ${
                 quickStatusFilter === 'error' ? styles.statPillActive : ''
               }`}
-              title="未知错误：检测过程抛出了错误，但没有拿到明确的 HTTP 状态码。"
+              key={`error-${label}`}
+              title={`${label}：检测失败，未拿到明确 HTTP 状态码。`}
               onClick={() => applyStatusFilter('error')}
             >
-              {t('account_pool.stat_unknown_error', { defaultValue: '未知错误' })}
-              <strong>{displayedStatusCodeStats.unknownError}</strong>
+              {label}
+              <strong>{count}</strong>
             </button>
-          )}
+          ))}
           {displayedStatusCodeStats.unsupported > 0 && (
             <button
               type="button"
@@ -2707,7 +3064,7 @@ export function AccountPoolPage() {
               variant="secondary"
               size="sm"
               title="重新加载账号池"
-              onClick={() => void refreshPool()}
+              onClick={() => void refreshPool(true)}
               loading={loading}
             >
               刷新
@@ -2716,7 +3073,7 @@ export function AccountPoolPage() {
               variant="secondary"
               size="sm"
               title="导入 JSON、Sub2 文件、解压文件夹或压缩包，系统会自动识别类型"
-              onClick={() => importInputRef.current?.click()}
+              onClick={() => openImportMeta('files')}
               loading={importingPool}
               disabled={importingPool}
             >
@@ -2726,7 +3083,7 @@ export function AccountPoolPage() {
               variant="secondary"
               size="sm"
               title="导入已经解压出来的文件夹，系统会自动过滤并识别 Sub2/CPA JSON"
-              onClick={() => importFolderInputRef.current?.click()}
+              onClick={() => openImportMeta('folder')}
               loading={importingPool}
               disabled={importingPool}
             >
@@ -2951,6 +3308,7 @@ export function AccountPoolPage() {
                   className={styles.checkConcurrencyInput}
                   type="number"
                   min={MIN_ACCOUNT_POOL_CHECK_CONCURRENCY}
+                  max={MAX_ACCOUNT_POOL_CHECK_CONCURRENCY}
                   step={1}
                   value={checkConcurrencyInput}
                   disabled={checking}
@@ -3099,6 +3457,14 @@ export function AccountPoolPage() {
                       总 Token
                       <strong>{formatUsageMetric(group.stats.totalTokens)}</strong>
                     </span>
+                    <span className={`${styles.folderStatusPill} ${styles.folderTokenPill}`}>
+                      总刀数
+                      <strong>{formatUSDMetric(group.stats.totalUSD)}</strong>
+                    </span>
+                    <span className={`${styles.folderStatusPill} ${styles.folderTokenPill}`}>
+                      每刀成本
+                      <strong>{formatCostPerUSDMetric(group.stats.totalCost, group.stats.totalUSD)}</strong>
+                    </span>
                     {group.stats.checking > 0 && (
                       <span className={`${styles.folderStatusPill} ${styles.folderStatusChecking}`}>
                         检测中
@@ -3117,12 +3483,16 @@ export function AccountPoolPage() {
                         <strong>{group.stats.unsupported}</strong>
                       </span>
                     )}
-                    {group.stats.unknownError > 0 && (
-                      <span className={`${styles.folderStatusPill} ${styles.folderStatusError}`}>
-                        错误
-                        <strong>{group.stats.unknownError}</strong>
+                    {group.stats.errorLabels.slice(0, 2).map(([label, count]) => (
+                      <span
+                        className={`${styles.folderStatusPill} ${styles.folderStatusError}`}
+                        key={`error-${label}`}
+                        title={`${label}：检测失败，未拿到明确 HTTP 状态码。`}
+                      >
+                        {label}
+                        <strong>{count}</strong>
                       </span>
-                    )}
+                    ))}
                   </div>
                   <div className={styles.folderHeaderActions}>
                     <Button
@@ -3198,6 +3568,61 @@ export function AccountPoolPage() {
       </Card>
     </div>
     <Modal
+      open={importMetaOpen}
+      onClose={closeImportMeta}
+      title="导入账号池"
+      width={520}
+      closeDisabled={importingPool}
+      footer={
+        <>
+          <Button variant="secondary" onClick={closeImportMeta} disabled={importingPool}>
+            取消
+          </Button>
+          <Button onClick={startImportWithMetadata} loading={importingPool}>
+            选择{importMetaKind === 'folder' ? '文件夹' : '文件'}
+          </Button>
+        </>
+      }
+    >
+      <div className={styles.sourceEditor}>
+        <div className={styles.sourceEditorFolder}>
+          <span>批量写入</span>
+          <strong>来源 / 成本</strong>
+        </div>
+        <label className={styles.sourceEditorField}>
+          <span>渠道来源</span>
+          <input
+            value={importSourceChannel}
+            onChange={(event) => setImportSourceChannel(event.target.value)}
+            placeholder="例如 plus / 供应商A / 渠道1，留空则不写入"
+            disabled={importingPool}
+          />
+        </label>
+        <label className={styles.sourceEditorField}>
+          <span>账号成本</span>
+          <input
+            type="number"
+            min="0"
+            step="0.001"
+            inputMode="decimal"
+            value={importAccountCost}
+            onChange={(event) => setImportAccountCost(event.target.value)}
+            placeholder="例如 2.5，留空则不写入"
+            disabled={importingPool}
+          />
+        </label>
+        <label className={styles.sourceEditorCheckbox}>
+          <input
+            type="checkbox"
+            checked={importOverwriteMetadata}
+            onChange={(event) => setImportOverwriteMetadata(event.target.checked)}
+            disabled={importingPool}
+          />
+          <span>覆盖文件里已有的来源和成本</span>
+        </label>
+      </div>
+    </Modal>
+    <Modal
       open={sourceEditorOpen}
       onClose={closeSourceEditor}
       title="设置来源"
@@ -3236,6 +3661,52 @@ export function AccountPoolPage() {
             placeholder="可填写批次、渠道、备注或其他来源说明"
             disabled={savingSourceInfo}
             rows={4}
+          />
+        </label>
+      </div>
+    </Modal>
+    <Modal
+      open={accountMetaEditorOpen}
+      onClose={closeAccountMetaEditor}
+      title="编辑账号信息"
+      width={520}
+      closeDisabled={savingAccountMeta}
+      footer={
+        <>
+          <Button variant="secondary" onClick={closeAccountMetaEditor} disabled={savingAccountMeta}>
+            取消
+          </Button>
+          <Button onClick={() => void saveAccountMetaEditor()} loading={savingAccountMeta}>
+            保存
+          </Button>
+        </>
+      }
+    >
+      <div className={styles.sourceEditor}>
+        <div className={styles.sourceEditorFolder}>
+          <span>账号</span>
+          <strong title={accountMetaEditorName}>{accountMetaEditorName}</strong>
+        </div>
+        <label className={styles.sourceEditorField}>
+          <span>账号成本</span>
+          <input
+            type="number"
+            min="0"
+            step="0.001"
+            inputMode="decimal"
+            value={accountMetaEditorCost}
+            onChange={(event) => setAccountMetaEditorCost(event.target.value)}
+            placeholder="例如 0.15"
+            disabled={savingAccountMeta}
+          />
+        </label>
+        <label className={styles.sourceEditorField}>
+          <span>渠道来源</span>
+          <input
+            value={accountMetaEditorSourceChannel}
+            onChange={(event) => setAccountMetaEditorSourceChannel(event.target.value)}
+            placeholder="例如 plus / 供应商A / 渠道1"
+            disabled={savingAccountMeta}
           />
         </label>
       </div>

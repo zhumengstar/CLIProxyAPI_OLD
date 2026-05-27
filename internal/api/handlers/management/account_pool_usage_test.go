@@ -129,3 +129,63 @@ func TestAccountPoolUsageIdentityForSessionBackfillsUsername(t *testing.T) {
 		t.Fatalf("identity = (%q, %q), want (42, admin)", userID, username)
 	}
 }
+
+func TestSummaryForAccountPoolEntryDeduplicatesMatchedRecordKeys(t *testing.T) {
+	recorder := &accountPoolUsageRecorder{
+		records: []accountPoolUsageRecord{
+			{
+				ID:           "1",
+				RequestedAt:  "2026-05-24T12:00:00Z",
+				ServiceEmail: "user@example.com",
+				AuthID:       "folder/account.json",
+				AuthIndex:    "account.json",
+				Success:      true,
+				Model:        "gpt-5.5",
+				InputTokens:  1000,
+				OutputTokens: 10,
+				TotalTokens:  1010,
+			},
+		},
+		summaries: map[string]*accountPoolUsageSummary{
+			"email:user@example.com": {
+				Key:          "email:user@example.com",
+				ServiceEmail: "user@example.com",
+				AuthID:       "folder/account.json",
+				AuthIndex:    "account.json",
+				Requests:     1,
+				Successes:    1,
+				InputTokens:  1000,
+				OutputTokens: 10,
+				TotalTokens:  1010,
+			},
+			"auth_id:folder/account.json": {
+				Key:         "auth_id:folder/account.json",
+				AuthID:      "folder/account.json",
+				Requests:    1,
+				Successes:   1,
+				InputTokens: 1000,
+				TotalTokens: 1010,
+			},
+			"auth_index:account.json": {
+				Key:         "auth_index:account.json",
+				AuthIndex:   "account.json",
+				Requests:    1,
+				Successes:   1,
+				InputTokens: 1000,
+				TotalTokens: 1010,
+			},
+		},
+	}
+
+	summary := recorder.SummaryForAccountPoolEntry("folder/account.json", "user@example.com")
+
+	if summary.Requests != 1 || summary.Successes != 1 {
+		t.Fatalf("request totals = (%d, %d), want (1, 1)", summary.Requests, summary.Successes)
+	}
+	if summary.InputTokens != 1000 || summary.TotalTokens != 1010 {
+		t.Fatalf("token totals = (%d, %d), want (1000, 1010)", summary.InputTokens, summary.TotalTokens)
+	}
+	if summary.TotalUSD <= 0 {
+		t.Fatalf("total usd = %f, want positive value", summary.TotalUSD)
+	}
+}

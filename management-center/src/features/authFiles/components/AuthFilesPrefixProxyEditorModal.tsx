@@ -131,6 +131,34 @@ export function AuthFilesPrefixProxyEditorModal(props: AuthFilesPrefixProxyEdito
                   disabled={disableControls || editor.saving || !editor.json}
                   onChange={(e) => onChange('priority', e.target.value)}
                 />
+                <Input
+                  label="账号成本"
+                  type="number"
+                  step="0.001"
+                  min="0"
+                  inputMode="decimal"
+                  value={editor.accountCost}
+                  placeholder="例如 0.15"
+                  hint="按人民币/账号记录；留空或 0 表示不设置"
+                  disabled={disableControls || editor.saving || !editor.json}
+                  onChange={(e) => onChange('accountCost', e.target.value)}
+                />
+                <Input
+                  label="渠道来源"
+                  value={editor.sourceChannel}
+                  placeholder="例如 plus / 供应商A / 渠道1"
+                  hint="账号来源备注，可自由填写"
+                  disabled={disableControls || editor.saving || !editor.json}
+                  onChange={(e) => onChange('sourceChannel', e.target.value)}
+                />
+                <Input
+                  label="计时开始"
+                  value={editor.accountStartedAt}
+                  placeholder="例如 2026-05-25T12:00:00Z"
+                  hint="用于计算账号存活时间；留空则回退到注册/导入时间"
+                  disabled={disableControls || editor.saving || !editor.json}
+                  onChange={(e) => onChange('accountStartedAt', e.target.value)}
+                />
                 <div className="form-group">
                   <label>{t('auth_files.headers_label')}</label>
                   <textarea

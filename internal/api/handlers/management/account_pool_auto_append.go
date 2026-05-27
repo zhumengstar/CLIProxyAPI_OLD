@@ -13,6 +13,9 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
+
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 type accountPoolAutoAppendCandidate struct {
@@ -54,6 +57,7 @@ func (h *Handler) appendHighQuotaAccountPoolEntries(ctx context.Context) (int, i
 		return 0, 0, err
 	}
 	existingHashes := h.existingAuthContentHashes()
+	existingIdentities := h.existingAuthAccountIdentities()
 	usedNames := h.existingAuthFileNames()
 	added := 0
 	skipped := 0
@@ -69,6 +73,13 @@ func (h *Handler) appendHighQuotaAccountPoolEntries(ctx context.Context) (int, i
 				continue
 			}
 		}
+		candidateIdentity := accountPoolAuthIdentityFromData(candidate.Data)
+		if candidateIdentity != "" {
+			if _, ok := existingIdentities[candidateIdentity]; ok {
+				skipped++
+				continue
+			}
+		}
 		targetName := filepath.Base(candidate.Name)
 		if targetName == "." || targetName == "" {
 			targetName = "account.json"
@@ -80,6 +91,9 @@ func (h *Handler) appendHighQuotaAccountPoolEntries(ctx context.Context) (int, i
 		if candidate.Hash != "" {
 			existingHashes[candidate.Hash] = struct{}{}
 		}
+		if candidateIdentity != "" {
+			existingIdentities[candidateIdentity] = struct{}{}
+		}
 		usedNames[strings.ToLower(targetName)] = 1
 		added++
 	}
@@ -89,6 +103,9 @@ func (h *Handler) appendHighQuotaAccountPoolEntries(ctx context.Context) (int, i
 func (h *Handler) highQuotaAccountPoolCandidates() ([]accountPoolAutoAppendCandidate, error) {
 	if h == nil || h.cfg == nil {
 		return nil, nil
+	}
+	if accountPoolPGEnabled() {
+		return h.highQuotaAccountPoolCandidatesPostgres(context.Background())
 	}
 	accountPoolDBMu.Lock()
 	defer accountPoolDBMu.Unlock()
@@ -130,17 +147,19 @@ func (h *Handler) highQuotaAccountPoolCandidates() ([]accountPoolAutoAppendCandi
 		if len(entryData) == 0 {
 			continue
 		}
-		if contentHash == "" {
-			contentHash = hashAccountPoolContent(entryData)
+		rawContentHash := strings.TrimSpace(contentHash)
+		if rawContentHash == "" {
+			rawContentHash = hashAccountPoolContent(entryData)
 		}
-		if checkContentHash = strings.TrimSpace(checkContentHash); checkContentHash != "" && contentHash != "" && checkContentHash != contentHash {
+		if checkContentHash = strings.TrimSpace(checkContentHash); checkContentHash != "" && rawContentHash != "" && checkContentHash != rawContentHash {
 			continue
 		}
 		quota, checkedAt, ok := highQuotaRemainingFromCheck(rawCheck)
 		if !ok || quota <= accountPoolHighQuotaRemainingPercent {
 			continue
 		}
-		candidates = append(candidates, accountPoolAutoAppendCandidate{Name: name, Data: append([]byte(nil), entryData...), Hash: contentHash, Quota: quota, CheckedAt: checkedAt})
+		authData := stripAccountPoolStateForAuthFile(entryData)
+		candidates = append(candidates, accountPoolAutoAppendCandidate{Name: name, Data: authData, Hash: hashAccountPoolContent(authData), Quota: quota, CheckedAt: checkedAt})
 	}
 	if errRows := rows.Err(); errRows != nil {
 		return nil, fmt.Errorf("failed to read account pool high quota candidates: %w", errRows)
@@ -170,6 +189,9 @@ func highQuotaRemainingFromCheck(raw string) (float64, int64, bool) {
 	if status != "" && status != "ok" && status != "success" && status != "healthy" {
 		return 0, 0, false
 	}
+	if !result.RealRequestOK {
+		return 0, 0, false
+	}
 	return *result.QuotaRemainingPercent, result.CheckedAt, true
 }
 
@@ -193,6 +215,84 @@ func (h *Handler) existingAuthContentHashes() map[string]struct{} {
 		out[hashAccountPoolContent(data)] = struct{}{}
 	}
 	return out
+}
+
+func (h *Handler) existingAuthAccountIdentities() map[string]struct{} {
+	out := make(map[string]struct{})
+	if h == nil {
+		return out
+	}
+	if h.cfg != nil && strings.TrimSpace(h.cfg.AuthDir) != "" {
+		entries, err := os.ReadDir(h.cfg.AuthDir)
+		if err == nil {
+			for _, entry := range entries {
+				if entry == nil || entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+					continue
+				}
+				data, errRead := os.ReadFile(filepath.Join(h.cfg.AuthDir, entry.Name()))
+				if errRead != nil || len(bytes.TrimSpace(data)) == 0 {
+					continue
+				}
+				if identity := accountPoolAuthIdentityFromData(data); identity != "" {
+					out[identity] = struct{}{}
+				}
+			}
+		}
+	}
+	if h.authManager != nil {
+		for _, auth := range h.authManager.List() {
+			if auth == nil {
+				continue
+			}
+			if identity := accountPoolAuthIdentityFromAuth(auth); identity != "" {
+				out[identity] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+func accountPoolAuthIdentityFromData(data []byte) string {
+	for _, path := range []string{"account_id", "metadata.account_id", "metadata.chatgpt_account_id", "attributes.account_id", "attributes.chatgpt_account_id"} {
+		if value := strings.TrimSpace(gjson.GetBytes(data, path).String()); value != "" {
+			return "account:" + strings.ToLower(value)
+		}
+	}
+	for _, path := range []string{"email", "metadata.email", "attributes.email"} {
+		if value := strings.TrimSpace(gjson.GetBytes(data, path).String()); value != "" {
+			return "email:" + strings.ToLower(value)
+		}
+	}
+	return ""
+}
+
+func accountPoolAuthIdentityFromAuth(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	for _, key := range []string{"account_id", "chatgpt_account_id"} {
+		if auth.Attributes != nil {
+			if value := strings.TrimSpace(auth.Attributes[key]); value != "" {
+				return "account:" + strings.ToLower(value)
+			}
+		}
+		if auth.Metadata != nil {
+			if value := strings.TrimSpace(fmt.Sprint(auth.Metadata[key])); value != "" && value != "<nil>" {
+				return "account:" + strings.ToLower(value)
+			}
+		}
+	}
+	if auth.Attributes != nil {
+		if value := strings.TrimSpace(auth.Attributes["email"]); value != "" {
+			return "email:" + strings.ToLower(value)
+		}
+	}
+	if auth.Metadata != nil {
+		if value := strings.TrimSpace(fmt.Sprint(auth.Metadata["email"])); value != "" && value != "<nil>" {
+			return "email:" + strings.ToLower(value)
+		}
+	}
+	return ""
 }
 
 func (h *Handler) existingAuthFileNames() map[string]int {

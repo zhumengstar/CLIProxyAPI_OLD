@@ -85,6 +85,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	}
 	h.startAttemptCleanup()
 	h.startAccountPoolAutoAppend()
+	h.startAccountPoolAutoCheck()
 	return h
 }
 

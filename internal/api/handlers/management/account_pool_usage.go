@@ -341,6 +341,38 @@ func (r *accountPoolUsageRecorder) identityForSession(sessionID string) (userID 
 	return userID, username
 }
 
+func (r *accountPoolUsageRecorder) refreshFromStoreIfNewer() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if strings.TrimSpace(r.dbPath) == "" {
+		return
+	}
+	db, err := r.openDBLocked()
+	if err != nil || db == nil {
+		if err != nil {
+			log.WithError(err).Debug("failed to open account pool usage database for refresh")
+		}
+		return
+	}
+	var persistedCount int
+	var persistedMaxID uint64
+	if err = db.QueryRow(`SELECT COUNT(*), COALESCE(MAX(id), 0) FROM account_pool_usage_records`).Scan(&persistedCount, &persistedMaxID); err != nil {
+		_ = db.Close()
+		log.WithError(err).Debug("failed to inspect persisted account pool usage record count")
+		return
+	}
+	_ = db.Close()
+	if persistedCount <= len(r.records) && persistedMaxID <= r.nextID {
+		return
+	}
+	if err = r.loadLocked(); err != nil {
+		log.WithError(err).Warn("failed to refresh account pool usage database")
+	}
+}
+
 func (r *accountPoolUsageRecorder) List(limit int) []accountPoolUsageRecord {
 	records, _ := r.ListPage(limit, 0)
 	return records
@@ -350,6 +382,7 @@ func (r *accountPoolUsageRecorder) ListPage(limit int, offset int) ([]accountPoo
 	if r == nil {
 		return nil, 0
 	}
+	r.refreshFromStoreIfNewer()
 	if offset < 0 {
 		offset = 0
 	}
@@ -477,11 +510,12 @@ func (r *accountPoolUsageRecorder) Summaries() []accountPoolUsageSummary {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if len(r.summaries) == 0 {
+	summaries := r.recomputeSummariesLocked()
+	if len(summaries) == 0 {
 		return nil
 	}
-	out := make([]accountPoolUsageSummary, 0, len(r.summaries))
-	for _, item := range r.summaries {
+	out := make([]accountPoolUsageSummary, 0, len(summaries))
+	for _, item := range summaries {
 		if item == nil {
 			continue
 		}
@@ -499,6 +533,54 @@ func (r *accountPoolUsageRecorder) Summaries() []accountPoolUsageSummary {
 	return out
 }
 
+func (r *accountPoolUsageRecorder) recomputeSummariesLocked() map[string]*accountPoolUsageSummary {
+	if r == nil {
+		return nil
+	}
+	if len(r.records) == 0 {
+		return r.summaries
+	}
+	summaries := make(map[string]*accountPoolUsageSummary)
+	seenRecords := make(map[string]struct{}, len(r.records))
+	for _, record := range r.records {
+		recordKey := strings.TrimSpace(record.ID)
+		if recordKey == "" {
+			recordKey = strings.Join([]string{
+				record.RequestedAt,
+				record.RequestID,
+				record.SessionID,
+				record.ServiceEmail,
+				record.AuthID,
+				record.AuthIndex,
+				strconv.FormatInt(record.InputTokens, 10),
+				strconv.FormatInt(record.OutputTokens, 10),
+				strconv.FormatInt(record.TotalTokens, 10),
+			}, "|")
+		}
+		if _, ok := seenRecords[recordKey]; ok {
+			continue
+		}
+		seenRecords[recordKey] = struct{}{}
+		key := accountPoolUsageSummaryKey(record)
+		summary := summaries[key]
+		if summary == nil {
+			summary = &accountPoolUsageSummary{
+				Key:          key,
+				ServiceEmail: record.ServiceEmail,
+				AuthID:       record.AuthID,
+				AuthIndex:    record.AuthIndex,
+				AuthType:     record.AuthType,
+				Provider:     record.Provider,
+				Model:        record.Model,
+				Alias:        record.Alias,
+			}
+			summaries[key] = summary
+		}
+		mergeAccountPoolUsageSummary(summary, accountPoolUsageSummaryFromRecord(record))
+	}
+	return summaries
+}
+
 func (r *accountPoolUsageRecorder) SummaryForAccountPoolEntry(name string, email string) accountPoolUsageSummary {
 	if r == nil {
 		return accountPoolUsageSummary{}
@@ -507,33 +589,82 @@ func (r *accountPoolUsageRecorder) SummaryForAccountPoolEntry(name string, email
 	if len(candidates) == 0 {
 		return accountPoolUsageSummary{}
 	}
+	matchers := make(map[string]struct{}, len(candidates))
+	for _, key := range candidates {
+		matchers[key] = struct{}{}
+	}
 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	seen := make(map[string]struct{}, len(candidates))
 	var total accountPoolUsageSummary
-	for _, key := range candidates {
-		summary := r.summaries[key]
-		if summary == nil {
+	seenRecords := make(map[string]struct{}, len(r.records))
+	for _, record := range r.records {
+		if !accountPoolUsageRecordMatches(record, matchers) {
 			continue
 		}
-		if _, ok := seen[summary.Key]; ok {
+		recordKey := strings.TrimSpace(record.ID)
+		if recordKey == "" {
+			recordKey = strings.Join([]string{
+				record.RequestedAt,
+				record.RequestID,
+				record.SessionID,
+				record.ServiceEmail,
+				record.AuthID,
+				record.AuthIndex,
+				strconv.FormatInt(record.InputTokens, 10),
+				strconv.FormatInt(record.OutputTokens, 10),
+				strconv.FormatInt(record.TotalTokens, 10),
+			}, "|")
+		}
+		if _, ok := seenRecords[recordKey]; ok {
 			continue
 		}
-		seen[summary.Key] = struct{}{}
-		mergeAccountPoolUsageSummary(&total, *summary)
+		seenRecords[recordKey] = struct{}{}
+		mergeAccountPoolUsageSummary(&total, accountPoolUsageSummaryFromRecord(record))
+	}
+	if total.Key == "" && len(candidates) > 0 {
+		total.Key = candidates[0]
 	}
 	return total
+}
+
+func accountPoolUsageSummaryFromRecord(item accountPoolUsageRecord) accountPoolUsageSummary {
+	summary := accountPoolUsageSummary{
+		Key:                 accountPoolUsageSummaryKey(item),
+		ServiceEmail:        item.ServiceEmail,
+		AuthID:              item.AuthID,
+		AuthIndex:           item.AuthIndex,
+		AuthType:            item.AuthType,
+		Provider:            item.Provider,
+		Model:               item.Model,
+		Alias:               item.Alias,
+		Requests:            1,
+		InputTokens:         item.InputTokens,
+		OutputTokens:        item.OutputTokens,
+		CachedTokens:        item.CachedTokens,
+		CacheReadTokens:     item.CacheReadTokens,
+		CacheCreationTokens: item.CacheCreationTokens,
+		TotalTokens:         item.TotalTokens,
+		TotalUSD:            accountPoolUsageUSD(item.Model, item.InputTokens, item.OutputTokens, item.CachedTokens, item.CacheReadTokens, item.CacheCreationTokens),
+		LastUsedAt:          item.RequestedAt,
+	}
+	if item.Success {
+		summary.Successes = 1
+	} else {
+		summary.Failures = 1
+	}
+	return summary
 }
 
 func (r *accountPoolUsageRecorder) Totals() accountPoolUsageTotals {
 	if r == nil {
 		return accountPoolUsageTotals{}
 	}
+	r.refreshFromStoreIfNewer()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var totals accountPoolUsageTotals
-	for _, item := range r.summaries {
+	for _, item := range r.recomputeSummariesLocked() {
 		if item == nil {
 			continue
 		}
@@ -861,10 +992,10 @@ func (r *accountPoolUsageRecorder) loadLocked() error {
 	r.nextID = maxID
 
 	rows, err := db.Query(`
-SELECT id, requested_at, request_id, request_path, session_id, newapi_user_id, username,
-	provider, model, alias, service_email, auth_id, auth_index, auth_type, success, status_code,
-	latency_ms, input_tokens, output_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
-	total_tokens, request_params
+SELECT id, COALESCE(requested_at, ''), COALESCE(request_id, ''), COALESCE(request_path, ''), COALESCE(session_id, ''), COALESCE(newapi_user_id, ''), COALESCE(username, ''),
+	COALESCE(provider, ''), COALESCE(model, ''), COALESCE(alias, ''), COALESCE(service_email, ''), COALESCE(auth_id, ''), COALESCE(auth_index, ''), COALESCE(auth_type, ''), COALESCE(success, 0), COALESCE(status_code, 0),
+	COALESCE(latency_ms, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(cached_tokens, 0), COALESCE(cache_read_tokens, 0), COALESCE(cache_creation_tokens, 0),
+	COALESCE(total_tokens, 0), COALESCE(request_params, '')
 FROM account_pool_usage_records
 ORDER BY id ASC`)
 	if err != nil {
@@ -954,9 +1085,9 @@ ORDER BY id ASC`)
 	}
 
 	summaryRows, err := db.Query(`
-SELECT key, service_email, auth_id, auth_index, auth_type, provider, model, alias,
-	requests, successes, failures, input_tokens, output_tokens, cached_tokens, cache_read_tokens,
-	cache_creation_tokens, total_tokens, last_used_at
+SELECT key, COALESCE(service_email, ''), COALESCE(auth_id, ''), COALESCE(auth_index, ''), COALESCE(auth_type, ''), COALESCE(provider, ''), COALESCE(model, ''), COALESCE(alias, ''),
+	COALESCE(requests, 0), COALESCE(successes, 0), COALESCE(failures, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(cached_tokens, 0), COALESCE(cache_read_tokens, 0),
+	COALESCE(cache_creation_tokens, 0), COALESCE(total_tokens, 0), COALESCE(last_used_at, '')
 FROM account_pool_usage_summaries`)
 	if err != nil {
 		return fmt.Errorf("failed to query account pool usage summaries: %w", err)
@@ -1001,6 +1132,9 @@ FROM account_pool_usage_summaries`)
 }
 
 func (r *accountPoolUsageRecorder) persistUsageLocked(record accountPoolUsageRecord, summary accountPoolUsageSummary) error {
+	if ok, err := persistAccountPoolUsageToPostgres(context.Background(), record, summary); ok || err != nil {
+		return err
+	}
 	db, err := r.openDBLocked()
 	if err != nil || db == nil {
 		return err
@@ -1556,6 +1690,34 @@ func (h *Handler) GetAccountPoolUsageRecords(c *gin.Context) {
 			offset = (parsed - 1) * limit
 		}
 	}
+	if records, summaries, totals, total, ok, err := accountPoolUsageFromPostgres(c.Request.Context(), limit, offset, summaryOnly); err == nil && ok {
+		if summaryOnly {
+			c.JSON(http.StatusOK, gin.H{
+				"records":   []accountPoolUsageRecord{},
+				"summaries": summaries,
+				"totals":    totals,
+				"total":     0,
+				"limit":     0,
+				"offset":    0,
+				"source":    "postgres",
+			})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"records":   records,
+			"summaries": summaries,
+			"totals":    totals,
+			"total":     total,
+			"limit":     limit,
+			"offset":    offset,
+			"source":    "postgres",
+		})
+		return
+	} else if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	accountPoolUsage.refreshFromStoreIfNewer()
 	if summaryOnly {
 		c.JSON(http.StatusOK, gin.H{
 			"records":   []accountPoolUsageRecord{},

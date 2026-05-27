@@ -373,6 +373,10 @@ func (s *Server) setupRoutes() {
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	s.engine.HEAD("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/admin", s.serveManagementControlPanel)
+	s.engine.HEAD("/admin", s.serveManagementControlPanel)
+	s.engine.GET("/admin/", s.serveManagementControlPanel)
+	s.engine.HEAD("/admin/", s.serveManagementControlPanel)
 	s.engine.GET("/assets/*filepath", s.serveManagementAsset)
 	s.engine.HEAD("/assets/*filepath", s.serveManagementAsset)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)

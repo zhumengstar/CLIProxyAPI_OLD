@@ -1309,7 +1309,8 @@
 }
 
 .sourceEditorFolder span,
-.sourceEditorField span {
+.sourceEditorField span,
+.sourceEditorCheckbox span {
   color: var(--text-tertiary);
   font-size: 12px;
   font-weight: 800;
@@ -1328,6 +1329,18 @@
 .sourceEditorField {
   display: grid;
   gap: 7px;
+}
+
+.sourceEditorCheckbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sourceEditorCheckbox input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary-color);
 }
 
 .sourceEditorField input,
