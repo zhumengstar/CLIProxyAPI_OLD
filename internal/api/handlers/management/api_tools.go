@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -162,7 +163,9 @@ func (h *Handler) APICall(c *gin.Context) {
 		}
 		if auth != nil && token == "" {
 			if tokenErr != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
+				message := sanitizeAPICallErrorMessage(tokenErr)
+				log.WithError(tokenErr).Warn("management APICall auth token refresh failed")
+				c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed", "message": message})
 				return
 			}
 			c.JSON(http.StatusBadRequest, gin.H{"error": "auth token not found"})
@@ -203,8 +206,9 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
-		log.WithError(errDo).Debug("management APICall request failed")
-		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
+		message := sanitizeAPICallErrorMessage(errDo)
+		log.WithError(errDo).Warn("management APICall request failed")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed", "message": message})
 		return
 	}
 	defer func() {
@@ -224,6 +228,27 @@ func (h *Handler) APICall(c *gin.Context) {
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+var apiCallSecretFieldPattern = regexp.MustCompile(`(?i)("?(?:access_token|refresh_token|id_token|api_key|authorization|cookie|session_id)"?\s*[:=]\s*"?)([^",\s}]+)`)
+var apiCallAuthorizationPattern = regexp.MustCompile(`(?i)(authorization"?\s*[:=]\s*"?bearer\s+)([A-Za-z0-9._~+/=-]+)`)
+var apiCallBearerPattern = regexp.MustCompile(`(?i)(bearer\s+)([A-Za-z0-9._~+/=-]+)`)
+
+func sanitizeAPICallErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.TrimSpace(err.Error())
+	if message == "" {
+		return ""
+	}
+	message = apiCallAuthorizationPattern.ReplaceAllString(message, "${1}[redacted]")
+	message = apiCallSecretFieldPattern.ReplaceAllString(message, "${1}[redacted]")
+	message = apiCallBearerPattern.ReplaceAllString(message, "${1}[redacted]")
+	if len(message) > 2000 {
+		message = strings.TrimSpace(message[:2000]) + "..."
+	}
+	return message
 }
 
 func firstNonEmptyString(values ...*string) string {

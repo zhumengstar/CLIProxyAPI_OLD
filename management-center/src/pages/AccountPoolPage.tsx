@@ -192,6 +192,12 @@ const getFileFolder = (file: AuthFileItem): string => {
   return normalizeFolderName(file.folder || file['source_folder']);
 };
 
+const getFileDisplayName = (file: AuthFileItem): string => {
+  const rawName = String(file.name || '').trim();
+  if (!rawName) return '';
+  return rawName.replace(/\\/g, '/').split('/').filter(Boolean).pop() || rawName;
+};
+
 const getFileModifiedLabel = (file: AuthFileItem): string => {
   const value = file.modified ?? file['modtime'] ?? file['updated_at'];
   if (typeof value === 'number' && Number.isFinite(value)) {
@@ -2085,6 +2091,22 @@ export function AccountPoolPage() {
     });
   };
 
+  const openConfigViewer = async (file: AuthFileItem) => {
+    setConfigViewerName(file.name);
+    setConfigViewerContent('');
+    setConfigViewerError('');
+    setConfigViewerOpen(true);
+    setConfigViewerLoading(true);
+    try {
+      const content = await authFilesApi.downloadText(file.name);
+      setConfigViewerContent(content);
+    } catch (error) {
+      setConfigViewerError(error instanceof Error ? error.message : t('notification.download_failed'));
+    } finally {
+      setConfigViewerLoading(false);
+    }
+  };
+
   const closeConfigViewer = () => {
     setConfigViewerOpen(false);
     setConfigViewerName('');
@@ -2750,7 +2772,6 @@ export function AccountPoolPage() {
   const renderPoolCard = (file: AuthFileItem) => {
     const checked = selectedSet.has(file.name);
     const type = getFileType(file);
-    const folder = getFileFolder(file);
     const modifiedLabel = getFileModifiedLabel(file);
     const statusMessage = String(file.statusMessage || file['status_message'] || '');
     const checkResult = checkResults[file.name];
@@ -2782,6 +2803,7 @@ export function AccountPoolPage() {
       getRegistrationTime(file, fileContentCache, savedAtByName);
     const accountStoppedAt = getAccountLifetimeStoppedAt(file, checkResult);
     const accountInvalid = accountStoppedAt !== null;
+    const displayName = getFileDisplayName(file);
     const showStatusMessage =
       Boolean(statusMessage) &&
       (!checkResult || (checkResult.status !== 'success' && checkResult.status !== 'loading'));
@@ -2794,13 +2816,19 @@ export function AccountPoolPage() {
           <SelectionCheckbox
             checked={checked}
             onChange={(value) => toggleOne(file.name, value)}
-            ariaLabel={file.name}
+            ariaLabel={displayName || file.name}
           />
           <div className={styles.cardMain}>
-            <span className={styles.fileName} title={file.name}>{file.name}</span>
+            <button
+              type="button"
+              className={styles.fileNameButton}
+              onClick={() => void openConfigViewer(file)}
+              title={displayName || file.name}
+            >
+              {displayName || file.name}
+            </button>
             <div className={styles.metaRow}>
               <span className={styles.typeBadge}>{type}</span>
-              <span className={styles.folderBadge}>{folder}</span>
               {planLabel && <span className={styles.planBadge}>{planLabel}</span>}
               {modifiedLabel && <span className={styles.muted}>{modifiedLabel}</span>}
               <Button

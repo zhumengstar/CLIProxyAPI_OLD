@@ -1,0 +1,1 @@
+import{a as e,n as t}from"./jsx-runtime-Bgu04q04.js";var n=e(t(),1),r=null,i=async()=>{r&&await r()},a=(e,t=!0)=>{let i=(0,n.useRef)(null);(0,n.useEffect)(()=>{let n=i.current;if(i.current=e??null,!t||!e){n&&r===n&&(r=null);return}return r=e,()=>{r===e&&(r=null)}},[t,e])};export{a as n,i as t};

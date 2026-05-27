@@ -1,0 +1,1 @@
+import{a as e,n as t}from"./jsx-runtime-Bgu04q04.js";var n=e(t(),1),r=(0,n.createContext)(null),i={current:{status:`current`,isCurrentLayer:!0,isAnimating:!1},stacked:{status:`stacked`,isCurrentLayer:!1,isAnimating:!1},exiting:{status:`exiting`,isCurrentLayer:!1,isAnimating:!1}};function a(){return(0,n.useContext)(r)}export{r as n,a as r,i as t};

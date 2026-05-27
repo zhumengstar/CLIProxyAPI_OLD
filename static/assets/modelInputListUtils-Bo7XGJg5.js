@@ -1,0 +1,1 @@
+var e=e=>!Array.isArray(e)||e.length===0?[{name:``,alias:``}]:e.map(e=>({name:e.name||``,alias:e.alias||``})),t=e=>e.filter(e=>e.name.trim()).map(e=>{let t={name:e.name.trim()},n=e.alias.trim();return n&&n!==t.name&&(t.alias=n),t});export{e as n,t};

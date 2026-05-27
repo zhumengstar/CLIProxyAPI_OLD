@@ -1002,6 +1002,33 @@
   word-break: break-all;
 }
 
+.fileNameButton {
+  width: 100%;
+  min-height: 54px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 750;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  text-align: left;
+  transition: color $transition-fast;
+}
+
+.fileNameButton:hover {
+  color: var(--primary-color);
+}
+
+.fileNameButton:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary-color) 35%, transparent);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
 .metaRow {
   display: flex;
   align-items: center;

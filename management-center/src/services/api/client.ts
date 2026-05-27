@@ -139,12 +139,12 @@ class ApiClient {
       const responseRecord = isRecord(responseData) ? responseData : null;
       const errorValue = responseRecord?.error;
       const message =
-        typeof errorValue === 'string'
-          ? errorValue
+        typeof responseRecord?.message === 'string'
+          ? responseRecord.message
           : isRecord(errorValue) && typeof errorValue.message === 'string'
             ? errorValue.message
-            : typeof responseRecord?.message === 'string'
-              ? responseRecord.message
+            : typeof errorValue === 'string'
+              ? errorValue
               : error.message || 'Request failed';
       const apiError = new Error(message) as ApiError;
       apiError.name = 'ApiError';

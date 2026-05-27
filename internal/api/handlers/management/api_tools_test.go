@@ -2,8 +2,10 @@ package management
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -265,5 +267,18 @@ func TestAuthByNameFindsAccountPoolEntryWithFolderPath(t *testing.T) {
 	}
 	if got.Provider != "codex" {
 		t.Fatalf("provider = %q, want codex", got.Provider)
+	}
+}
+
+func TestSanitizeAPICallErrorMessageRedactsSecrets(t *testing.T) {
+	t.Parallel()
+
+	got := sanitizeAPICallErrorMessage(errors.New(`token refresh failed: {"access_token":"access-secret","refresh_token":"refresh-secret","message":"unsupported_country_region_territory"} Authorization=Bearer abc123`))
+
+	if strings.Contains(got, "access-secret") || strings.Contains(got, "refresh-secret") || strings.Contains(got, "abc123") {
+		t.Fatalf("message still contains secret: %s", got)
+	}
+	if !strings.Contains(got, "unsupported_country_region_territory") {
+		t.Fatalf("message lost useful failure detail: %s", got)
 	}
 }

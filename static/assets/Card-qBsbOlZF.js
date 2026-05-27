@@ -1,0 +1,1 @@
+import{t as e}from"./jsx-runtime-Bgu04q04.js";var t=e();function n({title:e,extra:n,children:r,className:i}){return(0,t.jsxs)(`div`,{className:i?`card ${i}`:`card`,children:[(e||n)&&(0,t.jsxs)(`div`,{className:`card-header`,children:[(0,t.jsx)(`div`,{className:`title`,children:e}),n]}),r]})}export{n as t};
