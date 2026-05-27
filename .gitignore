@@ -20,6 +20,7 @@ objectstore/*
 
 # Static assets
 static/*
+!static/management.html
 
 # Authentication data
 auths/*

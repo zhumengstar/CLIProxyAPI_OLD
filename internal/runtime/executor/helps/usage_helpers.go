@@ -24,6 +24,7 @@ type UsageReporter struct {
 	authID      string
 	authIndex   string
 	authType    string
+	email       string
 	apiKey      string
 	source      string
 	reasoning   string
@@ -45,6 +46,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		apiKey:      apiKey,
 		source:      resolveUsageSource(auth, apiKey),
 		authType:    resolveUsageAuthType(auth),
+		email:       resolveUsageEmail(auth),
 		reasoning:   usage.ReasoningEffortFromContext(ctx),
 	}
 	if auth != nil {
@@ -166,6 +168,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		AuthID:          r.authID,
 		AuthIndex:       r.authIndex,
 		AuthType:        r.authType,
+		Email:           r.email,
 		ReasoningEffort: r.reasoning,
 		RequestedAt:     r.requestedAt,
 		Latency:         r.latency(),
@@ -220,6 +223,28 @@ func APIKeyFromContext(ctx context.Context) string {
 		default:
 			return fmt.Sprintf("%v", value)
 		}
+	}
+	return ""
+}
+
+func resolveUsageEmail(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if email, ok := auth.Metadata["email"].(string); ok {
+			if trimmed := strings.TrimSpace(email); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	kind, value := auth.AccountInfo()
+	if strings.EqualFold(strings.TrimSpace(kind), "oauth") {
+		value = strings.TrimSpace(value)
+		if idx := strings.Index(value, " ("); idx > 0 {
+			value = strings.TrimSpace(value[:idx])
+		}
+		return value
 	}
 	return ""
 }

@@ -19,6 +19,7 @@ type Record struct {
 	AuthID    string
 	AuthIndex string
 	AuthType  string
+	Email     string
 	Source    string
 	// ReasoningEffort stores the client-requested thinking level for request event logs.
 	ReasoningEffort string
