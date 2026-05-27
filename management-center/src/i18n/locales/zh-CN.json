@@ -1253,6 +1253,7 @@
     "usage_requests": "请求",
     "usage_successes": "成功",
     "usage_total_tokens": "Token",
+    "usage_total_usd": "刀数",
     "usage_failures": "失败",
     "overwrite_passed": "覆盖通过 ({{count}})",
     "overwrite_passed_title": "覆盖认证文件",

@@ -360,7 +360,14 @@ func (h *Handler) isAccountPoolSyntheticAuth(auth *coreauth.Auth) bool {
 	if sourcePath == "" {
 		return false
 	}
-	return filepath.Clean(sourcePath) == filepath.Clean(filepath.Join(h.cfg.AuthDir, ".account-pool", filepath.FromSlash(auth.FileName)))
+	resolved := filepath.Clean(filepath.Join(h.cfg.AuthDir, ".account-pool", filepath.FromSlash(auth.FileName)))
+	if filepath.Clean(sourcePath) == resolved {
+		return true
+	}
+	if strings.Contains(filepath.ToSlash(filepath.Clean(sourcePath)), "/.account-pool/") && filepath.Base(sourcePath) == filepath.Base(auth.FileName) {
+		return true
+	}
+	return false
 }
 
 func isCacheableOAuthRefreshFailure(err error) bool {

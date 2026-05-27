@@ -162,3 +162,146 @@ func TestPatchAuthFileFields_HeadersEmptyMapIsNoop(t *testing.T) {
 		t.Fatalf("metadata.headers.X-Kee = %#v, want %q", got, "1")
 	}
 }
+
+func TestPatchAuthFileFields_MetadataCostAndStartedAt(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:         "cost.json",
+		FileName:   "cost.json",
+		Provider:   "codex",
+		Attributes: map[string]string{"path": "/tmp/cost.json"},
+		Metadata:   map[string]any{"type": "codex"},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	body := `{"name":"cost.json","account_cost":0.15,"account_started_at":"2026-05-25T12:00:00Z"}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	updated, ok := manager.GetByID("cost.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got, _ := updated.Metadata["account_cost"].(float64); got != 0.15 {
+		t.Fatalf("metadata.account_cost = %#v, want 0.15", updated.Metadata["account_cost"])
+	}
+	if got := updated.Attributes["account_cost"]; got != "0.15" {
+		t.Fatalf("attrs account_cost = %q, want %q", got, "0.15")
+	}
+	if got, _ := updated.Metadata["account_started_at"].(string); got != "2026-05-25T12:00:00Z" {
+		t.Fatalf("metadata.account_started_at = %q", got)
+	}
+	if got := updated.Attributes["account_started_at"]; got != "2026-05-25T12:00:00Z" {
+		t.Fatalf("attrs account_started_at = %q", got)
+	}
+}
+
+func TestPatchAuthFileFields_UpdatesPoolOnlySQLiteEntry(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, coreauth.NewManager(nil, nil, nil))
+	name := "pool/cost.json"
+	if err := h.upsertAccountPoolArchiveFile(name, []byte(`{"type":"codex","email":"pool@example.com"}`)); err != nil {
+		t.Fatalf("failed to seed account pool archive: %v", err)
+	}
+
+	body := `{"name":"pool/cost.json","account_cost":0.2,"account_started_at":"2026-05-25T13:00:00Z","note":"ok"}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	entries, err := h.readAccountPoolArchive()
+	if err != nil {
+		t.Fatalf("failed to read account pool entries: %v", err)
+	}
+	data := entries[name]
+	if len(data) == 0 {
+		t.Fatalf("expected pool entry %s to exist", name)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(data, &obj); err != nil {
+		t.Fatalf("failed to unmarshal account pool entry: %v", err)
+	}
+	if got, _ := obj["account_cost"].(float64); got != 0.2 {
+		t.Fatalf("account_cost = %#v, want 0.2", obj["account_cost"])
+	}
+	if got, _ := obj["account_started_at"].(string); got != "2026-05-25T13:00:00Z" {
+		t.Fatalf("account_started_at = %q", got)
+	}
+	if got, _ := obj["note"].(string); got != "ok" {
+		t.Fatalf("note = %q", got)
+	}
+}
+
+func TestPatchAuthFileFields_PrefersPoolEntryWhenRuntimeAuthHasSameName(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	name := "pool-cost.json"
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       name,
+		FileName: name,
+		Provider: "codex",
+		Metadata: map[string]any{"account_cost": 9.9, "source_channel": "runtime"},
+	}); err != nil {
+		t.Fatalf("failed to register runtime auth: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	if err := h.upsertAccountPoolArchiveFile(name, []byte(`{"type":"codex","email":"pool@example.com","account_cost":0.2,"source_channel":"CPA"}`)); err != nil {
+		t.Fatalf("failed to seed account pool archive: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files?include_hash=true", nil)
+	ctx.Request = req
+	h.ListAccountPoolEntries(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	for _, file := range payload.Files {
+		if fileName, _ := file["name"].(string); fileName == name {
+			if got, _ := file["account_cost"].(float64); got != 0.2 {
+				t.Fatalf("account_cost = %#v, want 0.2", file["account_cost"])
+			}
+			if got, _ := file["source_channel"].(string); got != "CPA" {
+				t.Fatalf("source_channel = %q, want CPA", got)
+			}
+			return
+		}
+	}
+	t.Fatalf("did not find auth file %s in list response", name)
+}

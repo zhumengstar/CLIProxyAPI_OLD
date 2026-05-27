@@ -11,7 +11,15 @@ type AuthFileHeadersErrorKey =
   | 'auth_files.headers_invalid_object'
   | 'auth_files.headers_invalid_value';
 
-export type PrefixProxyEditorField = 'prefix' | 'proxyUrl' | 'priority' | 'note' | 'headersText';
+export type PrefixProxyEditorField =
+  | 'prefix'
+  | 'proxyUrl'
+  | 'priority'
+  | 'accountCost'
+  | 'accountStartedAt'
+  | 'sourceChannel'
+  | 'note'
+  | 'headersText';
 
 export type PrefixProxyEditorFieldValue = string;
 
@@ -27,7 +35,13 @@ export type PrefixProxyEditorState = {
   prefix: string;
   proxyUrl: string;
   priority: string;
+  accountCost: string;
+  accountStartedAt: string;
+  sourceChannel: string;
   note: string;
+  accountCostTouched: boolean;
+  accountStartedAtTouched: boolean;
+  sourceChannelTouched: boolean;
   noteTouched: boolean;
   headersText: string;
   headersTouched: boolean;
@@ -89,6 +103,20 @@ const parseHeadersText = (
 
 const normalizeTextField = (value: unknown): string =>
   typeof value === 'string' ? value.trim() : '';
+
+const normalizeNumberTextField = (value: unknown): string => {
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value === 'string') return value.trim();
+  return '';
+};
+
+const parseAccountCostValue = (value: string): number | undefined => {
+  const trimmed = value.trim();
+  if (!trimmed) return 0;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return parsed;
+};
 
 const hasKeys = (value: Record<string, unknown> | AuthFileFieldsPatch | null): boolean =>
   Boolean(value && Object.keys(value).length > 0);
@@ -189,11 +217,35 @@ const buildAuthFileFieldsPatch = (
     }
   }
 
+  if (editor.sourceChannelTouched) {
+    const originalSourceChannel = normalizeTextField(original.source_channel ?? original.sourceChannel);
+    const nextSourceChannel = editor.sourceChannel.trim();
+    if (nextSourceChannel !== originalSourceChannel) {
+      patch.source_channel = nextSourceChannel;
+    }
+  }
+
   if (editor.noteTouched) {
     const originalNote = normalizeTextField(original.note);
     const nextNote = editor.note.trim();
     if (nextNote !== originalNote) {
       patch.note = nextNote;
+    }
+  }
+
+  if (editor.accountCostTouched) {
+    const originalAccountCost = parseAccountCostValue(normalizeNumberTextField(original.account_cost));
+    const nextAccountCost = parseAccountCostValue(editor.accountCost);
+    if (nextAccountCost !== undefined && nextAccountCost !== (originalAccountCost ?? 0)) {
+      patch.account_cost = nextAccountCost;
+    }
+  }
+
+  if (editor.accountStartedAtTouched) {
+    const originalAccountStartedAt = normalizeTextField(original.account_started_at);
+    const nextAccountStartedAt = editor.accountStartedAt.trim();
+    if (nextAccountStartedAt !== originalAccountStartedAt) {
+      patch.account_started_at = nextAccountStartedAt;
     }
   }
 
@@ -252,6 +304,30 @@ const buildPrefixProxyUpdatedText = (
     }
   }
 
+  if (patch.account_cost !== undefined) {
+    if (patch.account_cost > 0) {
+      next.account_cost = patch.account_cost;
+    } else {
+      delete next.account_cost;
+    }
+  }
+
+  if (patch.account_started_at !== undefined) {
+    if (patch.account_started_at) {
+      next.account_started_at = patch.account_started_at;
+    } else {
+      delete next.account_started_at;
+    }
+  }
+
+  if (patch.source_channel !== undefined) {
+    if (patch.source_channel) {
+      next.source_channel = patch.source_channel;
+    } else {
+      delete next.source_channel;
+    }
+  }
+
   applyHeadersPatch(next, patch.headers);
 
   return JSON.stringify(next);
@@ -306,7 +382,13 @@ export function useAuthFilesPrefixProxyEditor(
       prefix: '',
       proxyUrl: '',
       priority: '',
+      accountCost: '',
+      accountStartedAt: '',
+      sourceChannel: '',
       note: '',
+      accountCostTouched: false,
+      accountStartedAtTouched: false,
+      sourceChannelTouched: false,
       noteTouched: false,
       headersText: '',
       headersTouched: false,
@@ -353,6 +435,9 @@ export function useAuthFilesPrefixProxyEditor(
       const prefix = typeof json.prefix === 'string' ? json.prefix : '';
       const proxyUrl = typeof json.proxy_url === 'string' ? json.proxy_url : '';
       const priority = parsePriorityValue(json.priority);
+      const accountCost = normalizeNumberTextField(json.account_cost);
+      const accountStartedAt = normalizeTextField(json.account_started_at);
+      const sourceChannel = normalizeTextField(json.source_channel);
       const note = typeof json.note === 'string' ? json.note : '';
       const headers = json.headers;
       let headersText = '';
@@ -374,7 +459,13 @@ export function useAuthFilesPrefixProxyEditor(
           prefix,
           proxyUrl,
           priority: priority !== undefined ? String(priority) : '',
+          accountCost,
+          accountStartedAt,
+          sourceChannel,
           note,
+          accountCostTouched: false,
+          accountStartedAtTouched: false,
+          sourceChannelTouched: false,
           noteTouched: false,
           headersText,
           headersTouched: false,
@@ -401,6 +492,9 @@ export function useAuthFilesPrefixProxyEditor(
       if (field === 'prefix') return { ...prev, prefix: String(value) };
       if (field === 'proxyUrl') return { ...prev, proxyUrl: String(value) };
       if (field === 'priority') return { ...prev, priority: String(value) };
+      if (field === 'accountCost') return { ...prev, accountCost: String(value), accountCostTouched: true };
+      if (field === 'accountStartedAt') return { ...prev, accountStartedAt: String(value), accountStartedAtTouched: true };
+      if (field === 'sourceChannel') return { ...prev, sourceChannel: String(value), sourceChannelTouched: true };
       if (field === 'note') return { ...prev, note: String(value), noteTouched: true };
       if (field === 'headersText') {
         const headersText = String(value);
@@ -442,11 +536,12 @@ export function useAuthFilesPrefixProxyEditor(
       await loadFiles();
       setPrefixProxyEditor(null);
     } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : '';
-      showNotification(`${t('notification.update_failed')}: ${errorMessage}`, 'error');
+      const errorMessage = err instanceof Error ? err.message : t('notification.update_failed');
+      const displayMessage = `${t('notification.update_failed')}: ${errorMessage}`;
+      showNotification(displayMessage, 'error');
       setPrefixProxyEditor((prev) => {
         if (!prev || prev.fileName !== name) return prev;
-        return { ...prev, saving: false };
+        return { ...prev, saving: false, error: displayMessage };
       });
     }
   };

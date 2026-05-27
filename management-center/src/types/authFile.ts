@@ -44,6 +44,10 @@ export interface AuthFileItem {
   checkQuotaRemainingPercent?: number;
   check_status_code?: number;
   checkStatusCode?: number;
+  check_real_request_ok?: boolean;
+  checkRealRequestOk?: boolean;
+  check_real_request_error?: string;
+  checkRealRequestError?: string;
   check_checked_at?: number | string;
   checkCheckedAt?: number | string;
   check_content_hash?: string;
@@ -52,6 +56,16 @@ export interface AuthFileItem {
   failed?: unknown;
   recent_requests?: RecentRequestBucket[];
   recentRequests?: RecentRequestBucket[];
+  account_cost?: number;
+  account_started_at?: string;
+  account_stopped_at?: string;
+  account_lifetime_seconds?: number;
+  source_channel?: string;
+  accountCost?: number;
+  accountStartedAt?: string;
+  accountStoppedAt?: string;
+  accountLifetimeSeconds?: number;
+  sourceChannel?: string;
   [key: string]: unknown;
 }
 
@@ -65,6 +79,7 @@ export interface AuthFilesResponse {
     count?: number;
     requests?: number;
     total_tokens?: number;
+    total_usd?: number;
     created_at?: string;
     updated_at?: string;
   }>;

@@ -14,12 +14,11 @@ import { apiCallApi, getApiCallErrorMessage } from '@/services/api';
 import type { ApiKeyEntry } from '@/types';
 import { buildHeaderObject, hasHeader } from '@/utils/headers';
 import { buildApiKeyEntry, buildOpenAIChatCompletionsEndpoint } from '@/components/providers/utils';
+import { selectCheapestOpenAIModelName } from '@/components/providers/openaiTestModel';
 import type { OpenAIEditOutletContext } from './AiProvidersOpenAIEditLayout';
 import type { KeyTestStatus } from '@/stores/useOpenAIEditDraftStore';
 import styles from './AiProvidersPage.module.scss';
 import layoutStyles from './AiProvidersEditLayout.module.scss';
-
-const OPENAI_TEST_TIMEOUT_MS = 30_000;
 
 const getErrorMessage = (err: unknown) => {
   if (err instanceof Error) return err.message;
@@ -202,7 +201,7 @@ export function AiProvidersOpenAIEditPage() {
         return false;
       }
 
-      const modelName = testModel.trim() || availableModels[0] || '';
+      const modelName = selectCheapestOpenAIModelName(form.modelEntries, availableModels);
       if (!modelName) {
         showNotification(t('notification.openai_test_model_required'), 'error');
         return false;
@@ -233,7 +232,7 @@ export function AiProvidersOpenAIEditPage() {
               max_tokens: 5,
             }),
           },
-          { timeout: OPENAI_TEST_TIMEOUT_MS }
+          { timeout: 0 }
         );
 
         if (result.statusCode < 200 || result.statusCode >= 300) {
@@ -244,19 +243,11 @@ export function AiProvidersOpenAIEditPage() {
         return true;
       } catch (err: unknown) {
         const message = getErrorMessage(err);
-        const errorCode =
-          typeof err === 'object' && err !== null && 'code' in err
-            ? String((err as { code?: string }).code)
-            : '';
-        const isTimeout = errorCode === 'ECONNABORTED' || message.toLowerCase().includes('timeout');
-        const errorMessage = isTimeout
-          ? t('ai_providers.openai_test_timeout', { seconds: OPENAI_TEST_TIMEOUT_MS / 1000 })
-          : message;
-        setDraftKeyTestStatus(keyIndex, { status: 'error', message: errorMessage });
+        setDraftKeyTestStatus(keyIndex, { status: 'error', message });
         return false;
       }
     },
-    [form.baseUrl, form.apiKeyEntries, form.headers, testModel, availableModels, t, setDraftKeyTestStatus, showNotification]
+    [form.baseUrl, form.apiKeyEntries, form.headers, form.modelEntries, availableModels, t, setDraftKeyTestStatus, showNotification]
   );
 
   const testSingleKey = useCallback(
@@ -294,7 +285,7 @@ export function AiProvidersOpenAIEditPage() {
       return;
     }
 
-    const modelName = testModel.trim() || availableModels[0] || '';
+    const modelName = selectCheapestOpenAIModelName(form.modelEntries, availableModels);
     if (!modelName) {
       const message = t('notification.openai_test_model_required');
       setTestStatus('error');
@@ -348,7 +339,7 @@ export function AiProvidersOpenAIEditPage() {
     isTestingKeys,
     form.baseUrl,
     form.apiKeyEntries,
-    testModel,
+    form.modelEntries,
     availableModels,
     t,
     setTestStatus,

@@ -28,12 +28,7 @@ export const ACCOUNT_POOL_UPDATED_EVENT = 'cli-proxy-account-pool-updated';
 const ACCOUNT_POOL_REFRESH_DEBOUNCE_MS = 400;
 const ACCOUNT_POOL_REFRESH_CONCURRENCY = 5;
 const ACCOUNT_POOL_DYNAMIC_TIMEOUT_MAX_MS = 10 * 60 * 1000;
-const ACCOUNT_POOL_LOCAL_CACHE_TTL_MS = 3 * 60 * 1000;
-
-type AccountPoolStoragePayload = {
-  cachedAt: number;
-  records: AccountPoolRecord[];
-};
+const LEGACY_ACCOUNT_POOL_STORAGE_KEYS = [ACCOUNT_POOL_STORAGE_KEY] as const;
 
 const getAccountPoolDynamicTimeout = (count: number, perItemMs = 140): number => {
   const safeCount = Math.max(0, Math.ceil(Number.isFinite(count) ? count : 0));
@@ -42,75 +37,6 @@ const getAccountPoolDynamicTimeout = (count: number, perItemMs = 140): number =>
     Math.max(REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS + safeCount * perItemMs)
   );
 };
-
-const ACCOUNT_POOL_FILE_STORAGE_KEYS = [
-  'id',
-  'auth_id',
-  'authId',
-  'auth_index',
-  'authIndex',
-  'name',
-  'type',
-  'provider',
-  'label',
-  'status',
-  'status_message',
-  'statusMessage',
-  'disabled',
-  'unavailable',
-  'runtime_only',
-  'runtimeOnly',
-  'source',
-  'folder',
-  'source_model',
-  'sourceModel',
-  'source_info',
-  'sourceInfo',
-  'size',
-  'modified',
-  'modtime',
-  'updated_at',
-  'updatedAt',
-  'last_refresh',
-  'lastRefresh',
-  'created_at',
-  'createdAt',
-  'email',
-  'service_email',
-  'account',
-  'account_type',
-  'priority',
-  'note',
-  'content_hash',
-  'contentHash',
-  'check_status',
-  'checkStatus',
-  'check_message',
-  'checkMessage',
-  'check_plan',
-  'checkPlan',
-  'check_quota_lines',
-  'checkQuotaLines',
-  'check_quota_remaining_percent',
-  'checkQuotaRemainingPercent',
-  'check_status_code',
-  'checkStatusCode',
-  'check_checked_at',
-  'checkCheckedAt',
-  'check_content_hash',
-  'checkContentHash',
-  'usage_requests',
-  'usage_successes',
-  'usage_failures',
-  'usage_input_tokens',
-  'usage_output_tokens',
-  'usage_cached_tokens',
-  'usage_cache_read_tokens',
-  'usage_cache_creation_tokens',
-  'usage_total_tokens',
-  'usage_last_used_at',
-  'id_token',
-] as const;
 
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 let syncInFlight: Promise<AccountPoolRecord[]> | null = null;
@@ -152,122 +78,17 @@ const hashText = async (value: string): Promise<string> => {
     .join('');
 };
 
-const compactAuthFileForAccountPool = (file: AuthFileItem): AuthFileItem => {
-  const compact: AuthFileItem = { name: file.name };
-  ACCOUNT_POOL_FILE_STORAGE_KEYS.forEach((key) => {
-    const value = (file as Record<string, unknown>)[key];
-    if (value === undefined || value === null) return;
-    if (typeof value === 'string' && !value.trim()) return;
-    (compact as Record<string, unknown>)[key] = value;
-  });
-  return compact;
-};
-
 export const readAccountPoolRecords = (): AccountPoolRecord[] => {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = window.localStorage.getItem(ACCOUNT_POOL_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as unknown;
-    if (Array.isArray(parsed)) {
-      window.localStorage.removeItem(ACCOUNT_POOL_STORAGE_KEY);
-      return [];
-    }
-    if (!parsed || typeof parsed !== 'object') return [];
-    const payload = parsed as Partial<AccountPoolStoragePayload>;
-    if (
-      typeof payload.cachedAt !== 'number' ||
-      Date.now() - payload.cachedAt > ACCOUNT_POOL_LOCAL_CACHE_TTL_MS
-    ) {
-      window.localStorage.removeItem(ACCOUNT_POOL_STORAGE_KEY);
-      return [];
-    }
-    if (!Array.isArray(payload.records)) return [];
-    return payload.records.reduce<AccountPoolRecord[]>((records, item) => {
-      if (!item || typeof item !== 'object') return records;
-      const record = item as Partial<AccountPoolRecord>;
-      if (!record.file || typeof record.file !== 'object') return records;
-      if (typeof record.hash !== 'string' || !record.hash.trim()) return records;
-      records.push({
-        file: record.file,
-        content: typeof record.content === 'string' ? record.content : undefined,
-        hash: record.hash,
-        savedAt: typeof record.savedAt === 'number' ? record.savedAt : 0,
-        sourceFingerprint:
-          typeof record.sourceFingerprint === 'string' ? record.sourceFingerprint : undefined,
-      });
-      return records;
-    }, []);
-  } catch {
-    return [];
+  if (typeof window !== 'undefined') {
+    LEGACY_ACCOUNT_POOL_STORAGE_KEYS.forEach((key) => window.localStorage.removeItem(key));
   }
+  return [];
 };
 
 export const writeAccountPoolRecords = (records: AccountPoolRecord[]) => {
-  if (typeof window === 'undefined') return;
-  const compactRecords = records.map((record) => ({
-    file: compactAuthFileForAccountPool(record.file),
-    hash: record.hash,
-    savedAt: record.savedAt,
-    sourceFingerprint: record.sourceFingerprint,
-  }));
-  const minimalRecords = records.map((record) => ({
-    file: {
-      name: record.file.name,
-      type: record.file.type,
-      provider: record.file.provider,
-      auth_index: record.file['auth_index'] ?? record.file.authIndex ?? record.file.name,
-      email: record.file.email,
-      content_hash: record.file['content_hash'] ?? record.file.contentHash,
-      check_status: record.file.check_status ?? record.file.checkStatus,
-      check_message: record.file.check_message ?? record.file.checkMessage,
-      check_plan: record.file.check_plan ?? record.file.checkPlan,
-      check_quota_lines: record.file.check_quota_lines ?? record.file.checkQuotaLines,
-      check_quota_remaining_percent:
-        record.file.check_quota_remaining_percent ?? record.file.checkQuotaRemainingPercent,
-      check_status_code: record.file.check_status_code ?? record.file.checkStatusCode,
-      check_checked_at: record.file.check_checked_at ?? record.file.checkCheckedAt,
-      check_content_hash: record.file.check_content_hash ?? record.file.checkContentHash,
-      usage_requests: record.file.usage_requests,
-      usage_successes: record.file.usage_successes,
-      usage_failures: record.file.usage_failures,
-      usage_input_tokens: record.file.usage_input_tokens,
-      usage_output_tokens: record.file.usage_output_tokens,
-      usage_cached_tokens: record.file.usage_cached_tokens,
-      usage_cache_read_tokens: record.file.usage_cache_read_tokens,
-      usage_cache_creation_tokens: record.file.usage_cache_creation_tokens,
-      usage_total_tokens: record.file.usage_total_tokens,
-      usage_last_used_at: record.file.usage_last_used_at,
-    },
-    hash: record.hash,
-    savedAt: record.savedAt,
-    sourceFingerprint: record.sourceFingerprint,
-  }));
-  const serialized = JSON.stringify({
-    cachedAt: Date.now(),
-    records: compactRecords,
-  } satisfies AccountPoolStoragePayload);
-  const minimalSerialized = JSON.stringify({
-    cachedAt: Date.now(),
-    records: minimalRecords,
-  } satisfies AccountPoolStoragePayload);
-  try {
-    window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, serialized);
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'QuotaExceededError') {
-      window.localStorage.removeItem(ACCOUNT_POOL_STORAGE_KEY);
-      try {
-        window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, serialized);
-      } catch {
-        try {
-          window.localStorage.setItem(ACCOUNT_POOL_STORAGE_KEY, minimalSerialized);
-        } catch {
-          window.localStorage.removeItem(ACCOUNT_POOL_STORAGE_KEY);
-        }
-      }
-      return;
-    }
-    throw err;
+  void records;
+  if (typeof window !== 'undefined') {
+    LEGACY_ACCOUNT_POOL_STORAGE_KEYS.forEach((key) => window.localStorage.removeItem(key));
   }
 };
 
@@ -306,17 +127,10 @@ const emitAccountPoolUpdated = (records: AccountPoolRecord[]) => {
 };
 
 export const deleteAccountPoolRecordsByName = (names: string[]): AccountPoolRecord[] => {
-  const nameSet = new Set(names.map((name) => name.trim()).filter(Boolean));
-  if (nameSet.size === 0) return uniqueAccountPoolRecords(readAccountPoolRecords());
-
-  const nextRecords = uniqueAccountPoolRecords(readAccountPoolRecords()).filter((record) => {
-    if (!nameSet.has(record.file.name)) return true;
-    return false;
-  });
-
-  writeAccountPoolRecords(nextRecords);
-  emitAccountPoolUpdated(nextRecords);
-  return nextRecords;
+  void names;
+  writeAccountPoolRecords([]);
+  emitAccountPoolUpdated([]);
+  return [];
 };
 
 const runWithConcurrency = async <T,>(
@@ -473,7 +287,7 @@ export const refreshAccountPoolFromServer = async (
     };
 
     reportProgress(true);
-    const storedRecords = uniqueAccountPoolRecords(readAccountPoolRecords());
+    const storedRecords: AccountPoolRecord[] = [];
     const listConfig = {
       params: { include_hash: true },
       timeout: getAccountPoolDynamicTimeout(storedRecords.length || 1000, 120),
@@ -506,7 +320,7 @@ export const refreshAccountPoolFromServer = async (
     reportProgress(true);
     const recordsByName = new Map<string, AccountPoolRecord>();
     const refreshedNames = new Set<string>();
-    const storedByName = new Map(storedRecords.map((record) => [record.file.name, record]));
+    const storedByName = new Map<string, AccountPoolRecord>();
 
     await runWithConcurrency(
       importedFiles,
@@ -585,11 +399,8 @@ export const refreshAccountPoolFromServer = async (
 
     progress.phase = 'saving';
     reportProgress(true);
-    const retainedStoredRecords = storedRecords.filter((record) => !refreshedNames.has(record.file.name));
-    const mergeCandidates = [
-      ...Array.from(recordsByName.values()),
-      ...retainedStoredRecords,
-    ];
+    const retainedStoredRecords: AccountPoolRecord[] = [];
+    const mergeCandidates = Array.from(recordsByName.values());
     const mergedRecords = uniqueAccountPoolRecords(mergeCandidates);
     progress.skipped = retainedStoredRecords.length;
     progress.deduped = Math.max(0, mergeCandidates.length - mergedRecords.length);

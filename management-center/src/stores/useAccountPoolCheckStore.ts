@@ -9,6 +9,11 @@ export type AccountCheckResult = {
   plan?: string;
   quotaLines?: string[];
   quotaRemainingPercent?: number;
+  quotaOk?: boolean;
+  realRequestOk?: boolean;
+  realRequestError?: string;
+  realRequestStatusCode?: number;
+  requestedModel?: string;
   statusCode?: number;
   checkedAt?: number;
 };
@@ -47,12 +52,10 @@ interface AccountPoolCheckState {
   clearResults: () => void;
 }
 
-const ACCOUNT_POOL_CHECK_RESULTS_STORAGE_KEY = 'cli-proxy-account-pool-check-results';
-const ACCOUNT_POOL_CHECK_PENDING_STORAGE_KEY = 'cli-proxy-account-pool-check-pending';
-const MAX_STORED_CHECK_MESSAGE_LENGTH = 180;
-const MAX_STORED_CHECK_QUOTA_LINES = 4;
-const MAX_STORED_CHECK_QUOTA_LINE_LENGTH = 120;
-const CHECK_RESULTS_STORAGE_LIMITS = [3000, 1500, 800, 400, 160];
+const LEGACY_ACCOUNT_POOL_CHECK_STORAGE_KEYS = [
+  'cli-proxy-account-pool-check-results',
+  'cli-proxy-account-pool-check-pending',
+];
 
 const emptySummary = (): AccountCheckSummary => ({
   total: 0,
@@ -65,132 +68,26 @@ const emptySummary = (): AccountCheckSummary => ({
 const createRunId = () => `account-pool-check-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const runAbortControllers = new Map<string, AbortController>();
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  value !== null && typeof value === 'object';
-
-const resolveStoredStatusCode = (value: Record<string, unknown>): number | undefined => {
-  if (typeof value.statusCode === 'number') return value.statusCode;
-  if (value.status === 'success') return 200;
-  if (typeof value.message !== 'string') return undefined;
-  const match = value.message.match(/^(\d{3})\s*:/);
-  if (!match) return undefined;
-  const code = Number(match[1]);
-  return Number.isFinite(code) ? code : undefined;
+export const normalizeAccountCheckResult = (result: AccountCheckResult): AccountCheckResult => {
+  if (result.status !== 'success' || result.realRequestOk !== false) return result;
+  const message = result.message?.trim();
+  return {
+    ...result,
+    status: 'error',
+    message: result.realRequestError
+      ? `模型检测请求失败: ${result.realRequestError}`
+      : message && message !== 'Check passed' && message !== '检测成功'
+        ? message
+        : '模型检测请求失败',
+  };
 };
 
-const readPersistedResults = (): Pick<AccountPoolCheckState, 'results' | 'resultHashes'> => {
-  if (typeof window === 'undefined') return { results: {}, resultHashes: {} };
+const clearLegacyPersistedResults = () => {
+  if (typeof window === 'undefined') return;
   try {
-    const raw = window.localStorage.getItem(ACCOUNT_POOL_CHECK_RESULTS_STORAGE_KEY);
-    if (!raw) return { results: {}, resultHashes: {} };
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isRecord(parsed)) return { results: {}, resultHashes: {} };
-
-    const results: Record<string, AccountCheckResult> = {};
-    if (isRecord(parsed.results)) {
-      Object.entries(parsed.results).forEach(([name, value]) => {
-        if (!isRecord(value)) return;
-        const status = value.status;
-        if (
-          status !== 'success' &&
-          status !== 'error' &&
-          status !== 'unsupported' &&
-          status !== 'idle'
-        ) {
-          return;
-        }
-        results[name] = {
-          status,
-          message: typeof value.message === 'string' ? value.message : undefined,
-          plan: typeof value.plan === 'string' ? value.plan : undefined,
-          quotaLines: Array.isArray(value.quotaLines)
-            ? value.quotaLines.filter((line): line is string => typeof line === 'string')
-            : undefined,
-          quotaRemainingPercent:
-            typeof value.quotaRemainingPercent === 'number' ? value.quotaRemainingPercent : undefined,
-          statusCode: resolveStoredStatusCode(value),
-          checkedAt: typeof value.checkedAt === 'number' ? value.checkedAt : undefined,
-        };
-      });
-    }
-
-    const resultHashes: Record<string, string> = {};
-    if (isRecord(parsed.resultHashes)) {
-      Object.entries(parsed.resultHashes).forEach(([name, value]) => {
-        if (typeof value === 'string' && value.trim()) {
-          resultHashes[name] = value;
-        }
-      });
-    }
-
-    return { results, resultHashes };
+    LEGACY_ACCOUNT_POOL_CHECK_STORAGE_KEYS.forEach((key) => window.localStorage.removeItem(key));
   } catch {
-    return { results: {}, resultHashes: {} };
-  }
-};
-
-const isStorageQuotaExceeded = (err: unknown): boolean => {
-  if (!(err instanceof DOMException)) return false;
-  return (
-    err.name === 'QuotaExceededError' ||
-    err.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
-    err.code === 22 ||
-    err.code === 1014
-  );
-};
-
-const compactCheckResultForStorage = (result: AccountCheckResult): AccountCheckResult => {
-  const compact: AccountCheckResult = { status: result.status };
-  if (result.message) {
-    compact.message = result.message.slice(0, MAX_STORED_CHECK_MESSAGE_LENGTH);
-  }
-  if (result.plan) compact.plan = result.plan;
-  if (typeof result.quotaRemainingPercent === 'number') {
-    compact.quotaRemainingPercent = result.quotaRemainingPercent;
-  }
-  if (typeof result.statusCode === 'number') compact.statusCode = result.statusCode;
-  if (typeof result.checkedAt === 'number') compact.checkedAt = result.checkedAt;
-  if (Array.isArray(result.quotaLines) && result.quotaLines.length > 0) {
-    compact.quotaLines = result.quotaLines
-      .slice(0, MAX_STORED_CHECK_QUOTA_LINES)
-      .map((line) => line.slice(0, MAX_STORED_CHECK_QUOTA_LINE_LENGTH));
-  }
-  return compact;
-};
-
-const buildCheckResultsStoragePayload = (
-  results: Record<string, AccountCheckResult>,
-  resultHashes: Record<string, string>,
-  maxResults?: number
-) => {
-  const entries = Object.entries(results)
-    .filter(([, result]) => result.status !== 'loading')
-    .sort((left, right) => (right[1].checkedAt ?? 0) - (left[1].checkedAt ?? 0));
-  const limitedEntries = typeof maxResults === 'number' ? entries.slice(0, maxResults) : entries;
-  const stableResults: Record<string, AccountCheckResult> = {};
-  const stableHashes: Record<string, string> = {};
-  limitedEntries.forEach(([name, result]) => {
-    stableResults[name] = compactCheckResultForStorage(result);
-    if (resultHashes[name]) stableHashes[name] = resultHashes[name];
-  });
-  return { results: stableResults, resultHashes: stableHashes };
-};
-
-const tryWriteCheckResultsPayload = (payload: {
-  results: Record<string, AccountCheckResult>;
-  resultHashes: Record<string, string>;
-}): boolean => {
-  try {
-    window.localStorage.setItem(ACCOUNT_POOL_CHECK_RESULTS_STORAGE_KEY, JSON.stringify(payload));
-    return true;
-  } catch (err) {
-    if (!isStorageQuotaExceeded(err)) return false;
-    try {
-      window.localStorage.removeItem(ACCOUNT_POOL_CHECK_RESULTS_STORAGE_KEY);
-    } catch {
-      // Ignore cleanup failures; the next smaller payload may still fit.
-    }
-    return false;
+    // Ignore browser storage failures; database state is authoritative.
   }
 };
 
@@ -198,73 +95,17 @@ const writePersistedResults = (
   results: Record<string, AccountCheckResult>,
   resultHashes: Record<string, string>
 ) => {
-  if (typeof window === 'undefined') return;
-  const fullPayload = buildCheckResultsStoragePayload(results, resultHashes);
-  if (tryWriteCheckResultsPayload(fullPayload)) return;
-
-  for (const limit of CHECK_RESULTS_STORAGE_LIMITS) {
-    if (tryWriteCheckResultsPayload(buildCheckResultsStoragePayload(results, resultHashes, limit))) {
-      return;
-    }
-  }
-
-  try {
-    window.localStorage.removeItem(ACCOUNT_POOL_CHECK_RESULTS_STORAGE_KEY);
-  } catch {
-    // The page should never crash because browser storage is full.
-  }
-};
-
-type PendingAccountPoolCheck = {
-  names: string[];
-  completed: string[];
-  startedAt: number;
-};
-
-const readPendingAccountPoolCheck = (): PendingAccountPoolCheck | null => {
-  if (typeof window === 'undefined') return null;
-  try {
-    const raw = window.localStorage.getItem(ACCOUNT_POOL_CHECK_PENDING_STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isRecord(parsed) || !Array.isArray(parsed.names)) return null;
-    const names = parsed.names.filter((name): name is string => typeof name === 'string' && Boolean(name.trim()));
-    if (names.length === 0) return null;
-    const completed = Array.isArray(parsed.completed)
-      ? parsed.completed.filter((name): name is string => typeof name === 'string' && Boolean(name.trim()))
-      : [];
-    return {
-      names: Array.from(new Set(names)),
-      completed: Array.from(new Set(completed)),
-      startedAt: typeof parsed.startedAt === 'number' ? parsed.startedAt : Date.now(),
-    };
-  } catch {
-    return null;
-  }
-};
-
-const writePendingAccountPoolCheck = (pending: PendingAccountPoolCheck) => {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(ACCOUNT_POOL_CHECK_PENDING_STORAGE_KEY, JSON.stringify(pending));
-  } catch {
-    // Pending state is best-effort; quota pressure must not interrupt checks.
-  }
-};
-
-const clearPendingAccountPoolCheck = () => {
-  if (typeof window === 'undefined') return;
-  window.localStorage.removeItem(ACCOUNT_POOL_CHECK_PENDING_STORAGE_KEY);
+  void results;
+  void resultHashes;
+  clearLegacyPersistedResults();
 };
 
 export const readPendingAccountPoolCheckNames = (): string[] => {
-  const pending = readPendingAccountPoolCheck();
-  if (!pending) return [];
-  const completed = new Set(pending.completed);
-  return pending.names.filter((name) => !completed.has(name));
+  clearLegacyPersistedResults();
+  return [];
 };
 
-const initialPersisted = readPersistedResults();
+clearLegacyPersistedResults();
 
 const readStringField = (file: AuthFileItem, ...keys: string[]): string => {
   for (const key of keys) {
@@ -315,7 +156,13 @@ const readRemoteCheckResult = (
   const checkHash = readStringField(file, 'check_content_hash', 'checkContentHash');
   if (contentHash && checkHash && contentHash !== checkHash) return null;
 
-  const result: AccountCheckResult = {
+  const realRequestOk =
+    typeof file.check_real_request_ok === 'boolean'
+      ? file.check_real_request_ok
+      : typeof file.checkRealRequestOk === 'boolean'
+        ? file.checkRealRequestOk
+        : undefined;
+  const result: AccountCheckResult = normalizeAccountCheckResult({
     status,
     message: readStringField(file, 'check_message', 'checkMessage') || undefined,
     plan: readStringField(file, 'check_plan', 'checkPlan') || undefined,
@@ -325,9 +172,16 @@ const readRemoteCheckResult = (
       'check_quota_remaining_percent',
       'checkQuotaRemainingPercent'
     ),
+    realRequestOk,
+    realRequestError: readStringField(file, 'check_real_request_error', 'checkRealRequestError') || undefined,
+    realRequestStatusCode: readNumberField(
+      file,
+      'check_real_request_status_code',
+      'checkRealRequestStatusCode'
+    ),
     statusCode: readNumberField(file, 'check_status_code', 'checkStatusCode'),
     checkedAt: readNumberField(file, 'check_checked_at', 'checkCheckedAt'),
-  };
+  });
   return { result, hash: checkHash || contentHash || undefined };
 };
 
@@ -336,8 +190,8 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
   activeNames: [],
   activePreviousResults: {},
   checking: false,
-  results: initialPersisted.results,
-  resultHashes: initialPersisted.resultHashes,
+  results: {},
+  resultHashes: {},
   summary: emptySummary(),
 
   beginCheck: (names) => {
@@ -346,7 +200,7 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
 
     const runId = createRunId();
     runAbortControllers.set(runId, new AbortController());
-    writePendingAccountPoolCheck({ names: uniqueNames, completed: [], startedAt: Date.now() });
+    clearLegacyPersistedResults();
     set((state) => {
       const nextResults = { ...state.results };
       const activePreviousResults: Record<string, AccountCheckResult | undefined> = {};
@@ -379,13 +233,12 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
 
     runAbortControllers.get(runId)?.abort();
     runAbortControllers.delete(runId);
-    clearPendingAccountPoolCheck();
+    clearLegacyPersistedResults();
     const summary = state.summary;
 
     set((current) => {
       const nextResults = { ...current.results };
       current.activeNames.forEach((name) => {
-        if (nextResults[name]?.status !== 'loading') return;
         const previous = current.activePreviousResults[name];
         if (previous) {
           nextResults[name] = previous;
@@ -441,13 +294,7 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
         summary: nextSummary
       };
       writePersistedResults(nextState.results, nextState.resultHashes);
-      const pending = readPendingAccountPoolCheck();
-      if (pending) {
-        writePendingAccountPoolCheck({
-          ...pending,
-          completed: Array.from(new Set([...pending.completed, name])),
-        });
-      }
+      clearLegacyPersistedResults();
       return nextState;
     });
   },
@@ -457,7 +304,7 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
     if (state.activeRunId !== runId) return null;
     const summary = state.summary;
     runAbortControllers.delete(runId);
-    clearPendingAccountPoolCheck();
+    clearLegacyPersistedResults();
     set({
       activeRunId: null,
       activeNames: [],
@@ -469,24 +316,38 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
   },
 
   hydrateResultsFromFiles: (files) => {
-    if (files.length === 0) return;
     set((state) => {
-      const nextResults = { ...state.results };
-      const nextHashes = { ...state.resultHashes };
-      let changed = false;
+      const nextResults: Record<string, AccountCheckResult> = {};
+      const nextHashes: Record<string, string> = {};
+      const seenNames = new Set<string>();
+
       files.forEach((file) => {
         if (!file.name) return;
-        if (nextResults[file.name]?.status === 'loading') return;
+        seenNames.add(file.name);
         const remote = readRemoteCheckResult(file);
-        if (!remote) return;
-        const existing = nextResults[file.name];
-        const existingTime = existing?.checkedAt ?? 0;
-        const remoteTime = remote.result.checkedAt ?? 0;
-        if (existing && existingTime > remoteTime) return;
-        nextResults[file.name] = remote.result;
-        if (remote.hash) nextHashes[file.name] = remote.hash;
-        changed = true;
+        if (remote) {
+          nextResults[file.name] = remote.result;
+          if (remote.hash) {
+            nextHashes[file.name] = remote.hash;
+          }
+        }
       });
+
+      // While a check is running, keep only in-flight loading markers for visible accounts.
+      // Finished/error/success results are re-hydrated exclusively from server check_* fields.
+      Object.entries(state.results).forEach(([name, result]) => {
+        if (result.status === 'loading' && seenNames.has(name)) {
+          nextResults[name] = result;
+          if (state.resultHashes[name]) nextHashes[name] = state.resultHashes[name];
+        }
+      });
+
+      const changed =
+        Object.keys(nextResults).length !== Object.keys(state.results).length ||
+        Object.keys(nextHashes).length !== Object.keys(state.resultHashes).length ||
+        Object.entries(nextResults).some(([name, result]) => state.results[name] !== result) ||
+        Object.entries(nextHashes).some(([name, hash]) => state.resultHashes[name] !== hash);
+
       if (!changed) return state;
       writePersistedResults(nextResults, nextHashes);
       return { results: nextResults, resultHashes: nextHashes };
@@ -505,12 +366,10 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
       const nextHashes: Record<string, string> = {};
       Object.entries(state.results).forEach(([name, result]) => {
         const hash = allowedHashes.get(name);
-        if (hash) {
+        if (hash && result.status === 'loading') {
           next[name] = result;
+          nextHashes[name] = hash;
         }
-      });
-      allowedHashes.forEach((hash, name) => {
-        nextHashes[name] = hash;
       });
       writePersistedResults(next, nextHashes);
       return { results: next, resultHashes: nextHashes };
@@ -519,7 +378,7 @@ export const useAccountPoolCheckStore = create<AccountPoolCheckState>((set, get)
 
   clearResults: () => {
     writePersistedResults({}, {});
-    clearPendingAccountPoolCheck();
+    clearLegacyPersistedResults();
     set({
       activeRunId: null,
       activeNames: [],

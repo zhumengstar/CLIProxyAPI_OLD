@@ -20,6 +20,10 @@ export type AuthFileFieldsPatch = {
   headers?: Record<string, string>;
   priority?: number;
   note?: string;
+  account_cost?: number;
+  account_started_at?: string;
+  account_stopped_at?: string;
+  source_channel?: string;
 };
 type AuthFileBatchFailure = { name: string; error: string };
 type AuthFileBatchUploadResponse = {
@@ -51,6 +55,11 @@ export type AccountPoolCheckResultPatch = {
     plan?: string;
     quotaLines?: string[];
     quotaRemainingPercent?: number;
+    quotaOk?: boolean;
+    realRequestOk?: boolean;
+    realRequestError?: string;
+    realRequestStatusCode?: number;
+    requestedModel?: string;
     statusCode?: number;
     checkedAt?: number;
   };
@@ -60,6 +69,8 @@ export type AccountPoolCheckResultsPatchResponse = {
   updated: number;
   skipped: number;
   missing?: string[];
+  auto_appended?: number;
+  auto_append_skipped?: number;
 };
 type AuthFileBatchUploadResult = {
   status: string;
@@ -67,6 +78,11 @@ type AuthFileBatchUploadResult = {
   files: string[];
   failed: AuthFileBatchFailure[];
   job?: AccountPoolImportJob;
+};
+type AccountPoolUploadOptions = {
+  sourceChannel?: string;
+  accountCost?: string;
+  overwriteMetadata?: boolean;
 };
 type AuthFileBatchDeleteResult = {
   status: string;
@@ -118,6 +134,7 @@ export type AccountPoolUsageSummary = {
   cache_read_tokens?: number;
   cache_creation_tokens?: number;
   total_tokens?: number;
+  total_usd?: number;
   last_used_at?: string;
 };
 export type AccountPoolUsageTotals = {
@@ -485,7 +502,7 @@ const buildAccountPoolResponseFromArchive = async (blob: Blob): Promise<AuthFile
   return { files, total: files.length } as AuthFilesResponse;
 };
 
-const buildAuthFilesFormData = (files: File[]): FormData => {
+const buildAuthFilesFormData = (files: File[], options?: AccountPoolUploadOptions): FormData => {
   const formData = new FormData();
   files.forEach((file) => {
     const relativePath =
@@ -494,6 +511,11 @@ const buildAuthFilesFormData = (files: File[]): FormData => {
         : '';
     formData.append('file', file, relativePath || file.name);
   });
+  const sourceChannel = options?.sourceChannel?.trim();
+  const accountCost = options?.accountCost?.trim();
+  if (sourceChannel) formData.append('source_channel', sourceChannel);
+  if (accountCost) formData.append('account_cost', accountCost);
+  if (options?.overwriteMetadata) formData.append('overwrite_metadata', 'true');
   return formData;
 };
 
@@ -839,12 +861,15 @@ export const authFilesApi = {
     return response;
   },
 
-  uploadAccountPoolFiles: async (files: File[]): Promise<AuthFileBatchUploadResult> => {
+  uploadAccountPoolFiles: async (
+    files: File[],
+    options?: AccountPoolUploadOptions
+  ): Promise<AuthFileBatchUploadResult> => {
     const requestedNames = files.map((file) => file.name);
     if (requestedNames.length === 0) {
       return { status: 'ok', uploaded: 0, files: [], failed: [] };
     }
-    const formData = buildAuthFilesFormData(files);
+    const formData = buildAuthFilesFormData(files, options);
     const config = {
       params: { async: true },
       timeout: getDynamicAuthFilesTimeout(files.length, { perItemMs: 220 }),
@@ -860,7 +885,7 @@ export const authFilesApi = {
       if (getStatusCode(err) !== 404) throw err;
       payload = await apiClient.postForm<AuthFileBatchUploadResponse>(
         '/account-pool',
-        buildAuthFilesFormData(files),
+        buildAuthFilesFormData(files, options),
         config
       );
     }

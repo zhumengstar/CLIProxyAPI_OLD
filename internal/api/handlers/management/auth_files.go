@@ -43,6 +43,7 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	_ "modernc.org/sqlite"
@@ -57,6 +58,79 @@ const (
 	geminiCLIEndpoint     = "https://cloudcode-pa.googleapis.com"
 	geminiCLIVersion      = "v1internal"
 )
+
+const (
+	accountPoolAutoAppendInterval        = 5 * time.Minute
+	accountPoolAutoCheckInterval         = 20 * time.Minute
+	accountPoolHighQuotaRemainingPercent = 20.0
+)
+
+var accountPoolStateAuthFileJSONPaths = []string{
+	"disabled",
+	"status",
+	"status_message",
+	"unavailable",
+	"last_error",
+	"error",
+	"failed",
+	"check_result",
+	"check_content_hash",
+	"check_updated_at",
+	"account_stopped_at",
+	"account_lifetime_seconds",
+	"account_lifetime_active_since",
+	"model_states",
+	"metadata.disabled",
+	"metadata.status",
+	"metadata.status_message",
+	"metadata.unavailable",
+	"metadata.last_error",
+	"metadata.error",
+	"metadata.failed",
+	"metadata.check_result",
+	"metadata.check_content_hash",
+	"metadata.check_updated_at",
+	"metadata.account_stopped_at",
+	"metadata.account_lifetime_seconds",
+	"metadata.model_states",
+	"attributes.disabled",
+	"attributes.status",
+	"attributes.status_message",
+	"attributes.unavailable",
+	"attributes.last_error",
+	"attributes.error",
+	"attributes.failed",
+	"attributes.check_result",
+	"attributes.check_content_hash",
+	"attributes.check_updated_at",
+	"attributes.account_stopped_at",
+	"attributes.account_lifetime_seconds",
+	"attributes.model_states",
+}
+
+var accountPoolRecoverableStateJSONPaths = []string{
+	"disabled",
+	"status",
+	"status_message",
+	"unavailable",
+	"last_error",
+	"error",
+	"failed",
+	"metadata.disabled",
+	"metadata.status",
+	"metadata.status_message",
+	"metadata.unavailable",
+	"metadata.last_error",
+	"metadata.error",
+	"metadata.failed",
+	"attributes.disabled",
+	"attributes.status",
+	"attributes.status_message",
+	"attributes.unavailable",
+	"attributes.last_error",
+	"attributes.error",
+	"attributes.failed",
+}
 
 type callbackForwarder struct {
 	provider string
@@ -81,6 +155,12 @@ type accountPoolArchiveFile struct {
 	Name   string
 	Data   []byte
 	Folder string
+}
+
+type accountPoolImportMetadata struct {
+	SourceChannel string
+	AccountCost   *float64
+	Overwrite     bool
 }
 
 type accountPoolImportJobStatus string
@@ -119,6 +199,20 @@ type accountPoolPendingUpload struct {
 	Name        string
 	DisplayName string
 	Data        []byte
+	Metadata    accountPoolImportMetadata
+}
+
+type accountPoolEditableFieldsPatch struct {
+	Name             string            `json:"name"`
+	Prefix           *string           `json:"prefix"`
+	ProxyURL         *string           `json:"proxy_url"`
+	Headers          map[string]string `json:"headers"`
+	Priority         *int              `json:"priority"`
+	Note             *string           `json:"note"`
+	AccountCost      *float64          `json:"account_cost"`
+	AccountStartedAt *string           `json:"account_started_at"`
+	AccountStoppedAt *string           `json:"account_stopped_at"`
+	SourceChannel    *string           `json:"source_channel"`
 }
 
 type accountPoolDBEntry struct {
@@ -141,14 +235,15 @@ type accountPoolDBFile struct {
 }
 
 type accountPoolFolderInfo struct {
-	Folder      string `json:"folder"`
-	SourceModel string `json:"source_model,omitempty"`
-	SourceInfo  string `json:"source_info,omitempty"`
-	Count       int    `json:"count,omitempty"`
-	Requests    int64  `json:"requests,omitempty"`
-	TotalTokens int64  `json:"total_tokens,omitempty"`
-	CreatedAt   string `json:"created_at,omitempty"`
-	UpdatedAt   string `json:"updated_at,omitempty"`
+	Folder      string  `json:"folder"`
+	SourceModel string  `json:"source_model,omitempty"`
+	SourceInfo  string  `json:"source_info,omitempty"`
+	Count       int     `json:"count,omitempty"`
+	Requests    int64   `json:"requests,omitempty"`
+	TotalTokens int64   `json:"total_tokens,omitempty"`
+	TotalUSD    float64 `json:"total_usd,omitempty"`
+	CreatedAt   string  `json:"created_at,omitempty"`
+	UpdatedAt   string  `json:"updated_at,omitempty"`
 }
 
 type accountPoolRepairStats struct {
@@ -164,6 +259,9 @@ type accountPoolCheckResultPayload struct {
 	Plan                  string   `json:"plan,omitempty"`
 	QuotaLines            []string `json:"quotaLines,omitempty"`
 	QuotaRemainingPercent *float64 `json:"quotaRemainingPercent,omitempty"`
+	RealRequestOK         bool     `json:"realRequestOk"`
+	RealRequestError      string   `json:"realRequestError,omitempty"`
+	RealRequestStatusCode int      `json:"realRequestStatusCode,omitempty"`
 	StatusCode            int      `json:"statusCode,omitempty"`
 	CheckedAt             int64    `json:"checkedAt,omitempty"`
 }
@@ -367,10 +465,22 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	}
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
+	seenEmails := make(map[string]struct{}, len(auths))
 	for _, auth := range auths {
-		if entry := h.buildAuthFileEntry(auth, includeHash); entry != nil {
-			files = append(files, entry)
+		entry := h.buildAuthFileEntry(auth, includeHash)
+		if entry == nil {
+			continue
 		}
+		if email, _ := entry["email"].(string); email != "" {
+			key := normalizeAccountPoolEmail(email)
+			if key != "" {
+				if _, ok := seenEmails[key]; ok {
+					continue
+				}
+				seenEmails[key] = struct{}{}
+			}
+		}
+		files = append(files, entry)
 	}
 	sort.Slice(files, func(i, j int) bool {
 		nameI, _ := files[i]["name"].(string)
@@ -436,6 +546,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, includeHash bool) {
 		return
 	}
 	files := make([]gin.H, 0)
+	seenEmails := make(map[string]struct{})
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -452,6 +563,13 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, includeHash bool) {
 			if data, errRead := os.ReadFile(full); errRead == nil {
 				typeValue := gjson.GetBytes(data, "type").String()
 				emailValue := gjson.GetBytes(data, "email").String()
+				emailKey := normalizeAccountPoolEmail(emailValue)
+				if emailKey != "" {
+					if _, ok := seenEmails[emailKey]; ok {
+						continue
+					}
+					seenEmails[emailKey] = struct{}{}
+				}
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
 				if includeHash {
@@ -472,6 +590,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, includeHash bool) {
 						fileData["note"] = trimmed
 					}
 				}
+				exposeAccountPoolEditableFields(fileData, data)
 			}
 
 			files = append(files, fileData)
@@ -486,6 +605,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth, includeHash bool) gin.
 	}
 	auth.EnsureIndex()
 	runtimeOnly := isRuntimeOnlyAuth(auth)
+	if h.isAccountPoolSyntheticAuth(auth) {
+		return nil
+	}
 	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
 		return nil
 	}
@@ -596,7 +718,76 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth, includeHash bool) gin.
 			}
 		}
 	}
+	exposeRuntimeAuthEditableFields(entry, auth)
+	if poolData, err := h.readAccountPoolArchiveEntry(name); err == nil && len(poolData) > 0 {
+		exposeAccountPoolEditableFields(entry, poolData)
+	}
 	return entry
+}
+
+func exposeRuntimeAuthEditableFields(entry gin.H, auth *coreauth.Auth) {
+	if entry == nil || auth == nil {
+		return
+	}
+	if cost := strings.TrimSpace(authAttribute(auth, "account_cost")); cost != "" {
+		if parsed, err := strconv.ParseFloat(cost, 64); err == nil {
+			entry["account_cost"] = parsed
+		} else {
+			entry["account_cost"] = cost
+		}
+	} else if auth.Metadata != nil {
+		if rawCost, ok := auth.Metadata["account_cost"]; ok {
+			switch v := rawCost.(type) {
+			case float64:
+				entry["account_cost"] = v
+			case int:
+				entry["account_cost"] = v
+			case string:
+				if parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+					entry["account_cost"] = parsed
+				} else if strings.TrimSpace(v) != "" {
+					entry["account_cost"] = strings.TrimSpace(v)
+				}
+			}
+		}
+	}
+	if sourceChannel := strings.TrimSpace(authAttribute(auth, "source_channel")); sourceChannel != "" {
+		entry["source_channel"] = sourceChannel
+	} else if auth.Metadata != nil {
+		if rawSourceChannel, ok := auth.Metadata["source_channel"].(string); ok {
+			if trimmed := strings.TrimSpace(rawSourceChannel); trimmed != "" {
+				entry["source_channel"] = trimmed
+			}
+		}
+	}
+	if startedAt := strings.TrimSpace(authAttribute(auth, "account_started_at")); startedAt != "" {
+		entry["account_started_at"] = startedAt
+	} else if auth.Metadata != nil {
+		if rawStartedAt, ok := auth.Metadata["account_started_at"].(string); ok {
+			if trimmed := strings.TrimSpace(rawStartedAt); trimmed != "" {
+				entry["account_started_at"] = trimmed
+			}
+		}
+	}
+}
+
+func exposeAccountPoolEditableFields(entry gin.H, data []byte) {
+	if entry == nil || len(data) == 0 {
+		return
+	}
+	if cost := firstAccountPoolJSONValue(data, "account_cost", "metadata.account_cost", "attributes.account_cost"); cost != "" {
+		if parsed, err := strconv.ParseFloat(cost, 64); err == nil {
+			entry["account_cost"] = parsed
+		} else {
+			entry["account_cost"] = cost
+		}
+	}
+	if sourceChannel := firstAccountPoolJSONValue(data, "source_channel", "metadata.source_channel", "attributes.source_channel", "channel_source", "source"); sourceChannel != "" {
+		entry["source_channel"] = sourceChannel
+	}
+	if startedAt := firstAccountPoolJSONValue(data, "account_started_at", "metadata.account_started_at", "attributes.account_started_at", "registered_at", "created_at"); startedAt != "" {
+		entry["account_started_at"] = startedAt
+	}
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
@@ -657,6 +848,14 @@ func authEmail(auth *coreauth.Auth) string {
 		}
 	}
 	return ""
+}
+
+func normalizeAccountPoolEmail(email string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return ""
+	}
+	return email
 }
 
 func authAttribute(auth *coreauth.Auth, key string) string {
@@ -828,6 +1027,13 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	if all := c.Query("all"); all == "true" || all == "1" || all == "*" {
+		if h.authManager != nil {
+			for _, auth := range h.authManager.List() {
+				if h.isAccountPoolSyntheticAuth(auth) {
+					h.authManager.Remove(auth.ID)
+				}
+			}
+		}
 		entries, err := os.ReadDir(h.cfg.AuthDir)
 		if err != nil {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -848,13 +1054,17 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 					full = abs
 				}
 			}
+			targetAuth := h.findAuthForDelete(name)
+			if targetAuth == nil {
+				targetAuth = h.findAuthForDelete(full)
+			}
 			if err = os.Remove(full); err == nil {
 				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
 					c.JSON(500, gin.H{"error": errDel.Error()})
 					return
 				}
 				deleted++
-				h.removeAuthRuntime(full)
+				h.markAuthDeletedFromDisk(ctx, targetAuth)
 			}
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
@@ -954,7 +1164,7 @@ func (h *Handler) storeUploadedAuthFiles(ctx context.Context, file *multipart.Fi
 	return []string{name}, nil, []accountPoolArchiveFile{{Name: name, Data: data}}, nil
 }
 
-func (h *Handler) readUploadedAccountPoolFiles(file *multipart.FileHeader) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
+func (h *Handler) readUploadedAccountPoolFiles(file *multipart.FileHeader, metadata accountPoolImportMetadata) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
 	if file == nil {
 		return nil, nil, nil, fmt.Errorf("no file uploaded")
 	}
@@ -967,10 +1177,10 @@ func (h *Handler) readUploadedAccountPoolFiles(file *multipart.FileHeader) ([]st
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to read uploaded file: %w", err)
 	}
-	return h.readAccountPoolUploadData(file.Filename, data)
+	return h.readAccountPoolUploadData(file.Filename, data, metadata)
 }
 
-func (h *Handler) readAccountPoolUploadData(fileName string, data []byte) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
+func (h *Handler) readAccountPoolUploadData(fileName string, data []byte, metadata accountPoolImportMetadata) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
 	rawName := normalizeUploadPath(fileName)
 	name := normalizeAccountPoolEntryName(rawName)
 	lowerName := strings.ToLower(name)
@@ -979,16 +1189,30 @@ func (h *Handler) readAccountPoolUploadData(fileName string, data []byte) ([]str
 	}
 	folder := accountPoolFolderFromUploadPath(rawName)
 	if isArchiveUploadName(lowerName) {
-		return readAccountPoolFilesFromArchive(data, filepath.Base(name), folder)
+		return readAccountPoolFilesFromArchive(data, filepath.Base(name), folder, metadata)
 	}
-	if uploaded, failures, files, ok := readAccountPoolFilesFromSub2JSON(data, folder); ok {
+	if uploaded, failures, files, ok := readAccountPoolFilesFromSub2JSON(data, folder, metadata); ok {
+		if folder == defaultAccountPoolFolder() {
+			if altFolder := accountPoolFolderFromUploadName(rawName); altFolder != folder {
+				if uploadedAlt, failuresAlt, filesAlt, okAlt := readAccountPoolFilesFromSub2JSON(data, altFolder, metadata); okAlt {
+					return uploadedAlt, failuresAlt, filesAlt, nil
+				}
+			}
+		}
 		return uploaded, failures, files, nil
+	}
+	uploadFolder := folder
+	if uploadFolder == defaultAccountPoolFolder() {
+		if altFolder := accountPoolFolderFromUploadName(rawName); altFolder != "" && altFolder != defaultAccountPoolFolder() {
+			uploadFolder = altFolder
+		}
 	}
 	if _, err := h.buildAuthFromFileData(name, data); err != nil {
 		return nil, nil, nil, err
 	}
-	entryName := accountPoolEntryNameForFolder(folder, filepath.Base(name))
-	return []string{entryName}, nil, []accountPoolArchiveFile{{Name: entryName, Data: data, Folder: folder}}, nil
+	entryName := accountPoolEntryNameForFolder(uploadFolder, filepath.Base(name))
+	data = applyAccountPoolImportMetadata(data, metadata)
+	return []string{entryName}, nil, []accountPoolArchiveFile{{Name: entryName, Data: data, Folder: uploadFolder}}, nil
 }
 
 func isAccountPoolUploadName(name string) bool {
@@ -1058,23 +1282,23 @@ func accountPoolEntryNameForFolder(folder string, name string) string {
 	return normalizeAccountPoolEntryName(path.Join(folder, name))
 }
 
-func readAccountPoolFilesFromArchive(data []byte, name string, folder string) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
+func readAccountPoolFilesFromArchive(data []byte, name string, folder string, metadata accountPoolImportMetadata) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
 	lowerName := strings.ToLower(name)
 	switch {
 	case strings.HasSuffix(lowerName, ".zip"):
-		return readAccountPoolFilesFromZip(data, folder)
+		return readAccountPoolFilesFromZip(data, folder, metadata)
 	case strings.HasSuffix(lowerName, ".tar"):
-		return readAccountPoolFilesFromTar(data, folder)
+		return readAccountPoolFilesFromTar(data, folder, metadata)
 	case strings.HasSuffix(lowerName, ".tar.gz") || strings.HasSuffix(lowerName, ".tgz"):
-		return readAccountPoolFilesFromGzipTar(data, folder)
+		return readAccountPoolFilesFromGzipTar(data, folder, metadata)
 	case strings.HasSuffix(lowerName, ".gz"):
-		return readAccountPoolFileFromGzip(data, name, folder)
+		return readAccountPoolFileFromGzip(data, name, folder, metadata)
 	default:
 		return nil, nil, nil, errAuthFileMustBeJSON
 	}
 }
 
-func readAccountPoolFilesFromZip(data []byte, folder string) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
+func readAccountPoolFilesFromZip(data []byte, folder string, metadata accountPoolImportMetadata) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
 	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("invalid zip archive: %w", err)
@@ -1131,13 +1355,14 @@ func readAccountPoolFilesFromZip(data []byte, folder string) ([]string, []authUp
 			failures = append(failures, authUploadFailure{Name: name, Error: "invalid auth file"})
 			continue
 		}
-		if sub2Uploaded, sub2Failures, sub2Files, ok := readAccountPoolFilesFromSub2JSON(entryData, folder); ok {
+		if sub2Uploaded, sub2Failures, sub2Files, ok := readAccountPoolFilesFromSub2JSON(entryData, folder, metadata); ok {
 			uploaded = append(uploaded, sub2Uploaded...)
 			failures = append(failures, sub2Failures...)
 			archiveFiles = append(archiveFiles, sub2Files...)
 			continue
 		}
 		entryName := accountPoolEntryNameForFolder(folder, name)
+		entryData = applyAccountPoolImportMetadata(entryData, metadata)
 		uploaded = append(uploaded, entryName)
 		archiveFiles = append(archiveFiles, accountPoolArchiveFile{Name: entryName, Data: entryData, Folder: folder})
 	}
@@ -1147,7 +1372,7 @@ func readAccountPoolFilesFromZip(data []byte, folder string) ([]string, []authUp
 	return uploaded, failures, archiveFiles, nil
 }
 
-func readAccountPoolFilesFromGzipTar(data []byte, folder string) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
+func readAccountPoolFilesFromGzipTar(data []byte, folder string, metadata accountPoolImportMetadata) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
 	reader, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("invalid gzip archive: %w", err)
@@ -1157,10 +1382,10 @@ func readAccountPoolFilesFromGzipTar(data []byte, folder string) ([]string, []au
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to read gzip archive: %w", err)
 	}
-	return readAccountPoolFilesFromTar(unzipped, folder)
+	return readAccountPoolFilesFromTar(unzipped, folder, metadata)
 }
 
-func readAccountPoolFileFromGzip(data []byte, uploadName string, folder string) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
+func readAccountPoolFileFromGzip(data []byte, uploadName string, folder string, metadata accountPoolImportMetadata) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
 	reader, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("invalid gzip file: %w", err)
@@ -1174,10 +1399,10 @@ func readAccountPoolFileFromGzip(data []byte, uploadName string, folder string) 
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
 		name += ".json"
 	}
-	return buildAccountPoolArchiveFilesFromRaw(map[string][]byte{name: entryData}, folder)
+	return buildAccountPoolArchiveFilesFromRaw(map[string][]byte{name: entryData}, folder, metadata)
 }
 
-func readAccountPoolFilesFromTar(data []byte, folder string) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
+func readAccountPoolFilesFromTar(data []byte, folder string, metadata accountPoolImportMetadata) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
 	reader := tar.NewReader(bytes.NewReader(data))
 	files := make(map[string][]byte)
 	failures := make([]authUploadFailure, 0)
@@ -1207,12 +1432,12 @@ func readAccountPoolFilesFromTar(data []byte, folder string) ([]string, []authUp
 		}
 		files[name] = entryData
 	}
-	uploaded, moreFailures, archiveFiles, err := buildAccountPoolArchiveFilesFromRaw(files, folder)
+	uploaded, moreFailures, archiveFiles, err := buildAccountPoolArchiveFilesFromRaw(files, folder, metadata)
 	failures = append(failures, moreFailures...)
 	return uploaded, failures, archiveFiles, err
 }
 
-func buildAccountPoolArchiveFilesFromRaw(files map[string][]byte, folder string) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
+func buildAccountPoolArchiveFilesFromRaw(files map[string][]byte, folder string, metadata accountPoolImportMetadata) ([]string, []authUploadFailure, []accountPoolArchiveFile, error) {
 	folder = normalizeAccountPoolFolder(folder)
 	names := make([]string, 0, len(files))
 	for name := range files {
@@ -1231,13 +1456,14 @@ func buildAccountPoolArchiveFilesFromRaw(files map[string][]byte, folder string)
 			failures = append(failures, authUploadFailure{Name: name, Error: "invalid auth file"})
 			continue
 		}
-		if sub2Uploaded, sub2Failures, sub2Files, ok := readAccountPoolFilesFromSub2JSON(entryData, folder); ok {
+		if sub2Uploaded, sub2Failures, sub2Files, ok := readAccountPoolFilesFromSub2JSON(entryData, folder, metadata); ok {
 			uploaded = append(uploaded, sub2Uploaded...)
 			failures = append(failures, sub2Failures...)
 			archiveFiles = append(archiveFiles, sub2Files...)
 			continue
 		}
 		entryName := accountPoolEntryNameForFolder(folder, name)
+		entryData = applyAccountPoolImportMetadata(entryData, metadata)
 		uploaded = append(uploaded, entryName)
 		archiveFiles = append(archiveFiles, accountPoolArchiveFile{Name: entryName, Data: entryData, Folder: folder})
 	}
@@ -1247,7 +1473,7 @@ func buildAccountPoolArchiveFilesFromRaw(files map[string][]byte, folder string)
 	return uploaded, failures, archiveFiles, nil
 }
 
-func readAccountPoolFilesFromSub2JSON(data []byte, folder string) ([]string, []authUploadFailure, []accountPoolArchiveFile, bool) {
+func readAccountPoolFilesFromSub2JSON(data []byte, folder string, metadata accountPoolImportMetadata) ([]string, []authUploadFailure, []accountPoolArchiveFile, bool) {
 	docs, err := parseSub2APIDocuments(string(data))
 	if err != nil {
 		return nil, nil, nil, false
@@ -1272,6 +1498,8 @@ func readAccountPoolFilesFromSub2JSON(data []byte, folder string) ([]string, []a
 				log.WithField("folder", folder).Warn(warning)
 			}
 		}
+		file.Name = accountPoolEntryNameForFolder(folder, file.Name)
+		file.Data = applyAccountPoolImportMetadata(file.Data, metadata)
 		uploaded = append(uploaded, file.Name)
 		archiveFiles = append(archiveFiles, file)
 	}
@@ -1296,7 +1524,7 @@ func convertAccountPoolSub2EntriesWithStats(entries map[string][]byte) (map[stri
 			continue
 		}
 		folder := accountPoolFolderFromEntryName(name)
-		_, _, files, ok := readAccountPoolFilesFromSub2JSON(data, folder)
+		_, _, files, ok := readAccountPoolFilesFromSub2JSON(data, folder, accountPoolImportMetadata{})
 		if !ok || len(files) == 0 {
 			continue
 		}
@@ -1371,6 +1599,87 @@ func inferAccountPoolCodexType(data []byte) ([]byte, bool) {
 		return data, false
 	}
 	return repaired, true
+}
+
+func applyAccountPoolImportMetadata(data []byte, metadata accountPoolImportMetadata) []byte {
+	if strings.TrimSpace(metadata.SourceChannel) == "" && metadata.AccountCost == nil {
+		return data
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		return data
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(trimmed, &parsed); err != nil {
+		return data
+	}
+	changed := false
+	if source := strings.TrimSpace(metadata.SourceChannel); source != "" {
+		if metadata.Overwrite || strings.TrimSpace(fmt.Sprint(parsed["source_channel"])) == "" {
+			parsed["source_channel"] = source
+			changed = true
+		}
+	}
+	if metadata.AccountCost != nil {
+		if metadata.Overwrite || accountPoolJSONNumberEmpty(parsed["account_cost"]) {
+			parsed["account_cost"] = *metadata.AccountCost
+			changed = true
+		}
+	}
+	if !changed {
+		return data
+	}
+	updated, err := json.MarshalIndent(parsed, "", "  ")
+	if err != nil {
+		return data
+	}
+	return updated
+}
+
+func accountPoolJSONNumberEmpty(value any) bool {
+	if value == nil {
+		return true
+	}
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v) == ""
+	case float64, float32, int, int64, int32, uint, uint64, uint32, json.Number:
+		return false
+	default:
+		return strings.TrimSpace(fmt.Sprint(v)) == ""
+	}
+}
+
+func accountPoolImportMetadataFromRequest(c *gin.Context) accountPoolImportMetadata {
+	metadata := accountPoolImportMetadata{}
+	if c == nil {
+		return metadata
+	}
+	metadata.SourceChannel = strings.TrimSpace(firstNonEmptyFormValue(c, "source_channel", "sourceChannel", "default_source_channel"))
+	costText := strings.TrimSpace(firstNonEmptyFormValue(c, "account_cost", "accountCost", "default_account_cost"))
+	if costText != "" {
+		if cost, err := strconv.ParseFloat(costText, 64); err == nil && cost >= 0 {
+			metadata.AccountCost = &cost
+		}
+	}
+	overwrite := strings.TrimSpace(firstNonEmptyFormValue(c, "overwrite_metadata", "overwriteMetadata"))
+	metadata.Overwrite = strings.EqualFold(overwrite, "true") || overwrite == "1" || strings.EqualFold(overwrite, "yes")
+	return metadata
+}
+
+func firstNonEmptyFormValue(c *gin.Context, keys ...string) string {
+	if c == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if value := strings.TrimSpace(c.PostForm(key)); value != "" {
+			return value
+		}
+		if value := strings.TrimSpace(c.Query(key)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func defaultAccountPoolFolder() string {
@@ -1638,7 +1947,7 @@ func uploadedFileDisplayName(file *multipart.FileHeader) string {
 	return filepath.Base(strings.TrimSpace(file.Filename))
 }
 
-func readAccountPoolPendingUploads(fileHeaders []*multipart.FileHeader) ([]accountPoolPendingUpload, error) {
+func readAccountPoolPendingUploads(fileHeaders []*multipart.FileHeader, metadata accountPoolImportMetadata) ([]accountPoolPendingUpload, error) {
 	uploads := make([]accountPoolPendingUpload, 0, len(fileHeaders))
 	for _, file := range fileHeaders {
 		if file == nil {
@@ -1660,6 +1969,7 @@ func readAccountPoolPendingUploads(fileHeaders []*multipart.FileHeader) ([]accou
 			Name:        file.Filename,
 			DisplayName: uploadedFileDisplayName(file),
 			Data:        data,
+			Metadata:    metadata,
 		})
 	}
 	return uploads, nil
@@ -1679,6 +1989,25 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	return h.writeAuthFileWithArchive(ctx, name, data, false)
 }
 
+func stripAccountPoolStateForAuthFile(data []byte) []byte {
+	cleaned := bytes.TrimSpace(data)
+	if len(cleaned) == 0 || !gjson.ValidBytes(cleaned) {
+		return append([]byte(nil), cleaned...)
+	}
+	text := string(cleaned)
+	for _, path := range accountPoolStateAuthFileJSONPaths {
+		if !gjson.Get(text, path).Exists() {
+			continue
+		}
+		next, err := sjson.Delete(text, path)
+		if err != nil {
+			continue
+		}
+		text = next
+	}
+	return append([]byte(nil), []byte(text)...)
+}
+
 func (h *Handler) writeAuthFileWithArchive(ctx context.Context, name string, data []byte, updateArchive bool) error {
 	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	if !filepath.IsAbs(dst) {
@@ -1690,9 +2019,41 @@ func (h *Handler) writeAuthFileWithArchive(ctx context.Context, name string, dat
 	if err != nil {
 		return err
 	}
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
-		return fmt.Errorf("failed to write file: %w", errWrite)
+	if errMkdir := os.MkdirAll(filepath.Dir(dst), 0o700); errMkdir != nil {
+		return fmt.Errorf("failed to create auth dir: %w", errMkdir)
 	}
+	tmp, errTmp := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+"-*.tmp")
+	if errTmp != nil {
+		return fmt.Errorf("failed to create temporary auth file: %w", errTmp)
+	}
+	tmpName := tmp.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			if errRemove := os.Remove(tmpName); errRemove != nil && !os.IsNotExist(errRemove) {
+				log.WithError(errRemove).Debug("failed to remove temporary auth file")
+			}
+		}
+	}()
+	if _, errWrite := tmp.Write(data); errWrite != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to write temporary auth file: %w", errWrite)
+	}
+	if errChmod := tmp.Chmod(0o600); errChmod != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to chmod temporary auth file: %w", errChmod)
+	}
+	if errSync := tmp.Sync(); errSync != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("failed to sync temporary auth file: %w", errSync)
+	}
+	if errClose := tmp.Close(); errClose != nil {
+		return fmt.Errorf("failed to close temporary auth file: %w", errClose)
+	}
+	if errRename := os.Rename(tmpName, dst); errRename != nil {
+		return fmt.Errorf("failed to replace auth file atomically: %w", errRename)
+	}
+	cleanupTmp = false
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
 		return err
 	}
@@ -1710,6 +2071,9 @@ func (h *Handler) upsertAccountPoolArchiveFiles(files []accountPoolArchiveFile) 
 	}
 	if len(files) == 0 {
 		return nil
+	}
+	if accountPoolPGEnabled() {
+		return upsertAccountPoolArchiveFilesToPostgres(context.Background(), files)
 	}
 	if _, err := os.Stat(h.accountPoolSQLitePath()); err == nil {
 		accountPoolDBMu.Lock()
@@ -1758,13 +2122,73 @@ func (h *Handler) readAccountPoolArchive() (map[string][]byte, error) {
 	return h.readAccountPoolDatabaseLocked()
 }
 
+func (h *Handler) readAccountPoolStoredChecks() (map[string]accountPoolStoredCheckResult, error) {
+	if h == nil || h.cfg == nil {
+		return nil, fmt.Errorf("handler not initialized")
+	}
+	accountPoolDBMu.Lock()
+	defer accountPoolDBMu.Unlock()
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]accountPoolStoredCheckResult{}, nil
+		}
+		return nil, err
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool sqlite database")
+		}
+	}()
+	rows, err := db.Query(`SELECT name, COALESCE(check_result, ''), COALESCE(check_content_hash, ''), COALESCE(check_updated_at, '') FROM account_pool_entries`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query account pool check results: %w", err)
+	}
+	defer func() {
+		if errClose := rows.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool check result rows")
+		}
+	}()
+	checks := make(map[string]accountPoolStoredCheckResult)
+	for rows.Next() {
+		var name string
+		var check accountPoolStoredCheckResult
+		if errScan := rows.Scan(&name, &check.Result, &check.ContentHash, &check.UpdatedAt); errScan != nil {
+			return nil, fmt.Errorf("failed to scan account pool check result: %w", errScan)
+		}
+		name = normalizeAccountPoolEntryName(name)
+		if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		checks[name] = check
+	}
+	if errRows := rows.Err(); errRows != nil {
+		return nil, fmt.Errorf("failed to read account pool check results: %w", errRows)
+	}
+	return checks, nil
+}
+
+func accountPoolCheckAllowsAuthWrite(rawCheck string, checkContentHash string, entryData []byte) bool {
+	contentHash := hashAccountPoolContent(bytes.TrimSpace(entryData))
+	checkContentHash = strings.TrimSpace(checkContentHash)
+	if checkContentHash == "" || contentHash == "" || checkContentHash != contentHash {
+		return false
+	}
+	_, _, ok := highQuotaRemainingFromCheck(rawCheck)
+	return ok
+}
+
 func (h *Handler) readAccountPoolArchiveEntry(name string) ([]byte, error) {
 	name = normalizeAccountPoolEntryName(name)
 	if isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
 		return nil, fmt.Errorf("invalid account pool entry name")
 	}
-	if h == nil || h.cfg == nil {
-		return nil, fmt.Errorf("handler not initialized")
+	if accountPoolPGEnabled() {
+		data, err := readAccountPoolEntryFromPostgres(context.Background(), name)
+		if err != nil {
+			return nil, err
+		}
+		return data, nil
 	}
 	if _, err := os.Stat(h.accountPoolSQLitePath()); err == nil {
 		return h.readAccountPoolSQLiteEntryLocked(name)
@@ -1789,8 +2213,8 @@ func (h *Handler) readAccountPoolDatabaseLocked() (map[string][]byte, error) {
 	if h == nil || h.cfg == nil {
 		return nil, fmt.Errorf("handler not initialized")
 	}
-	if err := os.MkdirAll(h.cfg.AuthDir, 0o700); err != nil {
-		return nil, fmt.Errorf("failed to create auth dir: %w", err)
+	if accountPoolPGEnabled() {
+		return readAccountPoolEntriesFromPostgres(context.Background())
 	}
 	if _, err := os.Stat(h.accountPoolSQLitePath()); err == nil {
 		if errEnsure := h.ensureAccountPoolSQLiteSub2Converted(); errEnsure != nil {
@@ -2192,6 +2616,9 @@ func (h *Handler) writeAccountPoolArchive(entries map[string][]byte) error {
 
 func (h *Handler) writeAccountPoolDatabaseLocked(entries map[string][]byte) error {
 	entries = dedupeAccountPoolEntries(entries)
+	if accountPoolPGEnabled() {
+		return syncAccountPoolEntriesToPostgres(context.Background(), entries)
+	}
 	if err := h.writeAccountPoolSQLiteLocked(entries); err != nil {
 		return err
 	}
@@ -2264,6 +2691,10 @@ func ensureAccountPoolSQLiteSchema(db *sql.DB) error {
 		{"account_pool_entries", "check_result", "TEXT NOT NULL DEFAULT ''"},
 		{"account_pool_entries", "check_content_hash", "TEXT NOT NULL DEFAULT ''"},
 		{"account_pool_entries", "check_updated_at", "TEXT NOT NULL DEFAULT ''"},
+		{"account_pool_entries", "account_started_at", "TEXT NOT NULL DEFAULT ''"},
+		{"account_pool_entries", "account_stopped_at", "TEXT NOT NULL DEFAULT ''"},
+		{"account_pool_entries", "account_lifetime_seconds", "INTEGER NOT NULL DEFAULT 0"},
+		{"account_pool_entries", "account_lifetime_active_since", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range columns {
 		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", column.table, column.name, column.def)); err != nil {
@@ -2477,17 +2908,21 @@ func (h *Handler) writeAccountPoolSQLiteLocked(entries map[string][]byte) error 
 		}
 	}()
 	previousChecks := make(map[string]accountPoolStoredCheckResult)
-	if rows, errRows := tx.Query(`SELECT name, COALESCE(check_result, ''), COALESCE(check_content_hash, ''), COALESCE(check_updated_at, '') FROM account_pool_entries`); errRows == nil {
+	previousLifetime := make(map[string][2]string)
+	if rows, errRows := tx.Query(`SELECT name, COALESCE(check_result, ''), COALESCE(check_content_hash, ''), COALESCE(check_updated_at, ''), COALESCE(account_started_at, ''), COALESCE(account_stopped_at, '') FROM account_pool_entries`); errRows == nil {
 		for rows.Next() {
-			var name string
+			var name, accountStartedAt, accountStoppedAt string
 			var check accountPoolStoredCheckResult
-			if errScan := rows.Scan(&name, &check.Result, &check.ContentHash, &check.UpdatedAt); errScan != nil {
+			if errScan := rows.Scan(&name, &check.Result, &check.ContentHash, &check.UpdatedAt, &accountStartedAt, &accountStoppedAt); errScan != nil {
 				log.WithError(errScan).Debug("failed to scan previous account pool check result")
 				continue
 			}
 			name = normalizeAccountPoolEntryName(name)
 			if name != "" && strings.TrimSpace(check.Result) != "" {
 				previousChecks[name] = check
+			}
+			if name != "" {
+				previousLifetime[name] = [2]string{strings.TrimSpace(accountStartedAt), strings.TrimSpace(accountStoppedAt)}
 			}
 		}
 		if errClose := rows.Close(); errClose != nil {
@@ -2503,8 +2938,8 @@ func (h *Handler) writeAccountPoolSQLiteLocked(entries map[string][]byte) error 
 	folders := make(map[string]struct{})
 	stmt, err := tx.Prepare(`
 INSERT INTO account_pool_entries (
-	name, content_hash, type, provider, email, folder, size, data, created_at, updated_at, check_result, check_content_hash, check_updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	name, content_hash, type, provider, email, folder, size, data, created_at, updated_at, check_result, check_content_hash, check_updated_at, account_started_at, account_stopped_at, account_lifetime_seconds, account_lifetime_active_since
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(name) DO UPDATE SET
 	content_hash=excluded.content_hash,
 	type=excluded.type,
@@ -2516,6 +2951,10 @@ ON CONFLICT(name) DO UPDATE SET
 	check_result=CASE WHEN excluded.check_result != '' THEN excluded.check_result ELSE account_pool_entries.check_result END,
 	check_content_hash=CASE WHEN excluded.check_content_hash != '' THEN excluded.check_content_hash ELSE account_pool_entries.check_content_hash END,
 	check_updated_at=CASE WHEN excluded.check_updated_at != '' THEN excluded.check_updated_at ELSE account_pool_entries.check_updated_at END,
+	account_started_at=CASE WHEN excluded.account_started_at != '' THEN excluded.account_started_at ELSE account_pool_entries.account_started_at END,
+	account_stopped_at=CASE WHEN excluded.account_stopped_at != '' THEN excluded.account_stopped_at ELSE account_pool_entries.account_stopped_at END,
+	account_lifetime_seconds=CASE WHEN excluded.account_lifetime_seconds > 0 THEN excluded.account_lifetime_seconds ELSE account_pool_entries.account_lifetime_seconds END,
+	account_lifetime_active_since=CASE WHEN excluded.account_lifetime_active_since != '' THEN excluded.account_lifetime_active_since ELSE account_pool_entries.account_lifetime_active_since END,
 	updated_at=excluded.updated_at
 `)
 	if err != nil {
@@ -2530,6 +2969,15 @@ ON CONFLICT(name) DO UPDATE SET
 		name = normalizeAccountPoolEntryName(name)
 		entry := buildAccountPoolDBEntry(name, data, now)
 		folders[entry.Folder] = struct{}{}
+		lifetime := previousLifetime[name]
+		startedAt := strings.TrimSpace(gjson.GetBytes([]byte(entry.Data), "account_started_at").String())
+		if startedAt == "" {
+			startedAt = lifetime[0]
+		}
+		stoppedAt := strings.TrimSpace(gjson.GetBytes([]byte(entry.Data), "account_stopped_at").String())
+		if stoppedAt == "" {
+			stoppedAt = lifetime[1]
+		}
 		check := previousChecks[name]
 		if check.ContentHash != "" && check.ContentHash != entry.Hash {
 			check = accountPoolStoredCheckResult{}
@@ -2548,6 +2996,10 @@ ON CONFLICT(name) DO UPDATE SET
 			check.Result,
 			check.ContentHash,
 			check.UpdatedAt,
+			startedAt,
+			stoppedAt,
+			0,
+			"",
 		); err != nil {
 			return fmt.Errorf("failed to insert account pool sqlite entry %s: %w", name, err)
 		}
@@ -2587,8 +3039,8 @@ func (h *Handler) upsertAccountPoolSQLiteFilesLocked(files []accountPoolArchiveF
 	}()
 	stmt, err := tx.Prepare(`
 INSERT INTO account_pool_entries (
-	name, content_hash, type, provider, email, folder, size, data, created_at, updated_at, check_result, check_content_hash, check_updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	name, content_hash, type, provider, email, folder, size, data, created_at, updated_at, check_result, check_content_hash, check_updated_at, account_started_at, account_stopped_at, account_lifetime_seconds, account_lifetime_active_since
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(name) DO UPDATE SET
 	content_hash=excluded.content_hash,
 	type=excluded.type,
@@ -2600,6 +3052,10 @@ ON CONFLICT(name) DO UPDATE SET
 	check_result=CASE WHEN excluded.check_result != '' THEN excluded.check_result ELSE account_pool_entries.check_result END,
 	check_content_hash=CASE WHEN excluded.check_content_hash != '' THEN excluded.check_content_hash ELSE account_pool_entries.check_content_hash END,
 	check_updated_at=CASE WHEN excluded.check_updated_at != '' THEN excluded.check_updated_at ELSE account_pool_entries.check_updated_at END,
+	account_started_at=CASE WHEN excluded.account_started_at != '' THEN excluded.account_started_at ELSE account_pool_entries.account_started_at END,
+	account_stopped_at=CASE WHEN excluded.account_stopped_at != '' THEN excluded.account_stopped_at ELSE account_pool_entries.account_stopped_at END,
+	account_lifetime_seconds=CASE WHEN excluded.account_lifetime_seconds > 0 THEN excluded.account_lifetime_seconds ELSE account_pool_entries.account_lifetime_seconds END,
+	account_lifetime_active_since=CASE WHEN excluded.account_lifetime_active_since != '' THEN excluded.account_lifetime_active_since ELSE account_pool_entries.account_lifetime_active_since END,
 	updated_at=excluded.updated_at
 `)
 	if err != nil {
@@ -2682,6 +3138,8 @@ ON CONFLICT(name) DO UPDATE SET
 			return fmt.Errorf("failed to replace account pool sqlite entry %s: %w", name, err)
 		}
 		folders[entry.Folder] = struct{}{}
+		startedAt := strings.TrimSpace(gjson.GetBytes([]byte(entry.Data), "account_started_at").String())
+		stoppedAt := strings.TrimSpace(gjson.GetBytes([]byte(entry.Data), "account_stopped_at").String())
 		if _, err = stmt.Exec(
 			entry.Name,
 			entry.Hash,
@@ -2695,6 +3153,10 @@ ON CONFLICT(name) DO UPDATE SET
 			entry.UpdatedAt,
 			"",
 			"",
+			"",
+			startedAt,
+			stoppedAt,
+			0,
 			"",
 		); err != nil {
 			return fmt.Errorf("failed to upsert account pool sqlite entry %s: %w", name, err)
@@ -2841,6 +3303,10 @@ func dedupeAccountPoolEntries(entries map[string][]byte) map[string][]byte {
 	seen := make(map[string]string, len(candidates))
 	for _, item := range candidates {
 		keys := accountPoolIdentityKeys(item.data)
+		email := normalizeAccountPoolEmail(firstAccountPoolJSONValue(bytes.TrimSpace(item.data), "email", "account_email", "service_email", "user_email", "login_email", "account.email", "user.email", "profile.email", "oauth.email"))
+		if email != "" {
+			keys = append([]string{"email|" + email}, keys...)
+		}
 		duplicate := false
 		for _, key := range keys {
 			if existingName, ok := seen[key]; ok && !strings.EqualFold(existingName, item.name) {
@@ -3034,6 +3500,15 @@ func (h *Handler) ListAccountPoolEntries(c *gin.Context) {
 		return
 	}
 	includeHash := strings.EqualFold(strings.TrimSpace(c.Query("include_hash")), "true")
+	if accountPoolPGEnabled() {
+		files, folderInfos, errPG := h.listAccountPoolPostgresEntrySummaries(c.Request.Context(), includeHash)
+		if errPG != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errPG.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"files": files, "folders": folderInfos, "source": "postgres"})
+		return
+	}
 	if _, err := os.Stat(h.accountPoolSQLitePath()); err == nil {
 		if errEnsure := h.ensureAccountPoolSQLiteSub2Converted(); errEnsure != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errEnsure.Error()})
@@ -3284,6 +3759,16 @@ func normalizeAccountPoolCheckResultPayload(result accountPoolCheckResultPayload
 	if status == "idle" {
 		return accountPoolCheckResultPayload{Status: status, CheckedAt: now.UnixMilli()}, true
 	}
+	if status == "success" && !result.RealRequestOK {
+		status = "error"
+		realRequestError := strings.TrimSpace(result.RealRequestError)
+		message := strings.TrimSpace(result.Message)
+		if realRequestError != "" {
+			result.Message = "模型检测请求失败: " + realRequestError
+		} else if message == "" || strings.EqualFold(message, "check passed") || message == "检测成功" {
+			result.Message = "模型检测请求失败"
+		}
+	}
 	if result.CheckedAt <= 0 {
 		result.CheckedAt = now.UnixMilli()
 	}
@@ -3298,6 +3783,9 @@ func normalizeAccountPoolCheckResultPayload(result accountPoolCheckResultPayload
 	}
 	if result.StatusCode < 0 {
 		result.StatusCode = 0
+	}
+	if result.RealRequestStatusCode < 0 {
+		result.RealRequestStatusCode = 0
 	}
 	if len(result.QuotaLines) > 8 {
 		result.QuotaLines = result.QuotaLines[:8]
@@ -3343,6 +3831,13 @@ func applyAccountPoolCheckResult(entry gin.H, rawResult string, checkContentHash
 	if result.QuotaRemainingPercent != nil {
 		entry["check_quota_remaining_percent"] = *result.QuotaRemainingPercent
 	}
+	entry["check_real_request_ok"] = result.RealRequestOK
+	if result.RealRequestError != "" {
+		entry["check_real_request_error"] = result.RealRequestError
+	}
+	if result.RealRequestStatusCode > 0 {
+		entry["check_real_request_status_code"] = result.RealRequestStatusCode
+	}
 	if result.StatusCode > 0 {
 		entry["check_status_code"] = result.StatusCode
 	}
@@ -3354,6 +3849,273 @@ func applyAccountPoolCheckResult(entry gin.H, rawResult string, checkContentHash
 	if checkContentHash != "" {
 		entry["check_content_hash"] = checkContentHash
 	}
+}
+
+func isAccountPoolLifetimeActiveStatus(result accountPoolCheckResultPayload) bool {
+	status := strings.ToLower(strings.TrimSpace(result.Status))
+	if status == "success" || status == "ok" || status == "passed" {
+		return true
+	}
+	message := strings.ToLower(strings.TrimSpace(result.Message + " " + result.RealRequestError + " " + strings.Join(result.QuotaLines, " ")))
+	if strings.Contains(message, "额度超") || strings.Contains(message, "超限制") || strings.Contains(message, "quota exceeded") || strings.Contains(message, "rate limit") || strings.Contains(message, "rate_limit") || strings.Contains(message, "limit exceeded") || strings.Contains(message, "usage limit") || strings.Contains(message, "limit has been reached") {
+		return true
+	}
+	if result.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	return false
+}
+
+func accountPoolCheckResultTime(result accountPoolCheckResultPayload, fallback time.Time) time.Time {
+	if result.CheckedAt > 0 {
+		if result.CheckedAt > 1_000_000_000_000 {
+			return time.UnixMilli(result.CheckedAt).UTC()
+		}
+		return time.Unix(result.CheckedAt, 0).UTC()
+	}
+	if fallback.IsZero() {
+		return time.Now().UTC()
+	}
+	return fallback.UTC()
+}
+
+func accountPoolAdvanceLifetime(accumulated int64, activeSince string, result accountPoolCheckResultPayload, now time.Time) (int64, string, string) {
+	if accumulated < 0 {
+		accumulated = 0
+	}
+	eventTime := accountPoolCheckResultTime(result, now)
+	activeStart, hasActiveStart := parseAccountPoolLifetimeTime(activeSince)
+	if isAccountPoolLifetimeActiveStatus(result) {
+		if !hasActiveStart || activeStart.After(eventTime) {
+			return accumulated, eventTime.Format(time.RFC3339), ""
+		}
+		return accumulated, activeStart.Format(time.RFC3339), ""
+	}
+	if hasActiveStart {
+		if eventTime.After(activeStart) {
+			accumulated += int64(eventTime.Sub(activeStart).Seconds())
+		}
+		return accumulated, "", eventTime.Format(time.RFC3339)
+	}
+	return accumulated, "", eventTime.Format(time.RFC3339)
+}
+
+func (h *Handler) persistAccountPoolCheckResults(updates []accountPoolCheckResultUpdate, now time.Time) (int, int, []string, error) {
+	if accountPoolPGEnabled() {
+		return h.persistAccountPoolCheckResultsPostgres(context.Background(), updates, now)
+	}
+	return h.persistAccountPoolCheckResultsSQLite(updates, now)
+}
+
+func (h *Handler) persistAccountPoolCheckResultsPostgres(ctx context.Context, updates []accountPoolCheckResultUpdate, now time.Time) (int, int, []string, error) {
+	accountPoolDBMu.Lock()
+	defer accountPoolDBMu.Unlock()
+	db, err := openAccountPoolPostgresDB(ctx)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	if db == nil {
+		return 0, 0, nil, fmt.Errorf("postgres account pool is not configured")
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool postgres database")
+		}
+	}()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("failed to begin account pool postgres check result transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if errRollback := tx.Rollback(); errRollback != nil {
+				log.WithError(errRollback).Debug("failed to rollback account pool postgres check result transaction")
+			}
+		}
+	}()
+	stmt, err := tx.PrepareContext(ctx, `
+UPDATE account_pool_entries
+SET check_result = $1,
+	check_content_hash = $2,
+	check_updated_at = $3,
+	account_lifetime_seconds = $4,
+	account_lifetime_active_since = $5,
+	account_stopped_at = $6,
+	data = $7
+WHERE name = $8`)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("failed to prepare account pool postgres check result update: %w", err)
+	}
+	defer func() {
+		if errClose := stmt.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool postgres check result statement")
+		}
+	}()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	updated := 0
+	skipped := 0
+	missing := make([]string, 0)
+	for _, update := range updates {
+		name := normalizeAccountPoolEntryName(update.Name)
+		if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			skipped++
+			continue
+		}
+		result, ok := normalizeAccountPoolCheckResultPayload(update.Result, now)
+		if !ok {
+			skipped++
+			continue
+		}
+		resultJSON, errMarshal := json.Marshal(result)
+		if errMarshal != nil {
+			skipped++
+			continue
+		}
+		nowText := now.Format(time.RFC3339)
+		var currentLifetimeSeconds int64
+		var currentActiveSince string
+		if errScan := tx.QueryRowContext(ctx, `SELECT COALESCE(account_lifetime_seconds, 0), COALESCE(account_lifetime_active_since, '') FROM account_pool_entries WHERE name = $1`, name).Scan(&currentLifetimeSeconds, &currentActiveSince); errScan != nil {
+			if errScan == sql.ErrNoRows {
+				missing = append(missing, name)
+				continue
+			}
+			return updated, skipped, missing, fmt.Errorf("failed to read account pool postgres lifetime %s: %w", name, errScan)
+		}
+		lifetimeSeconds, activeSince, stoppedAt := accountPoolAdvanceLifetime(currentLifetimeSeconds, currentActiveSince, result, now)
+		if activeSince == "" && stoppedAt == "" {
+			stoppedAt = nowText
+		}
+		var data string
+		if errData := tx.QueryRowContext(ctx, `SELECT data FROM account_pool_entries WHERE name = $1`, name).Scan(&data); errData != nil {
+			if errData == sql.ErrNoRows {
+				missing = append(missing, name)
+				continue
+			}
+			return updated, skipped, missing, fmt.Errorf("failed to read account pool postgres data %s: %w", name, errData)
+		}
+		persistedData := bytes.TrimSpace([]byte(data))
+		if isAccountPoolLifetimeActiveStatus(result) {
+			persistedData = stripAccountPoolStateForAuthFile(persistedData)
+		}
+		entry := buildAccountPoolDBEntry(name, persistedData, nowText)
+		res, errExec := stmt.ExecContext(ctx, string(resultJSON), strings.TrimSpace(update.ContentHash), nowText, lifetimeSeconds, activeSince, stoppedAt, entry.Data, name)
+		if errExec != nil {
+			return updated, skipped, missing, fmt.Errorf("failed to update account pool postgres check result %s: %w", name, errExec)
+		}
+		rowsAffected, _ := res.RowsAffected()
+		if rowsAffected == 0 {
+			missing = append(missing, name)
+			continue
+		}
+		updated++
+	}
+	if err = tx.Commit(); err != nil {
+		return updated, skipped, missing, fmt.Errorf("failed to commit account pool postgres check results: %w", err)
+	}
+	committed = true
+	return updated, skipped, missing, nil
+}
+
+func (h *Handler) persistAccountPoolCheckResultsSQLite(updates []accountPoolCheckResultUpdate, now time.Time) (int, int, []string, error) {
+	accountPoolDBMu.Lock()
+	defer accountPoolDBMu.Unlock()
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool sqlite database")
+		}
+	}()
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("failed to begin account pool check result transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if errRollback := tx.Rollback(); errRollback != nil {
+				log.WithError(errRollback).Debug("failed to rollback account pool check result transaction")
+			}
+		}
+	}()
+	stmt, err := tx.Prepare(`
+UPDATE account_pool_entries
+SET check_result = ?,
+	check_content_hash = ?,
+	check_updated_at = ?,
+	account_lifetime_seconds = ?,
+	account_lifetime_active_since = ?,
+	account_stopped_at = ?
+WHERE name = ?`)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("failed to prepare account pool check result update: %w", err)
+	}
+	defer func() {
+		if errClose := stmt.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool check result statement")
+		}
+	}()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	updated := 0
+	skipped := 0
+	missing := make([]string, 0)
+	for _, update := range updates {
+		name := normalizeAccountPoolEntryName(update.Name)
+		if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			skipped++
+			continue
+		}
+		result, ok := normalizeAccountPoolCheckResultPayload(update.Result, now)
+		if !ok {
+			skipped++
+			continue
+		}
+		resultJSON, errMarshal := json.Marshal(result)
+		if errMarshal != nil {
+			skipped++
+			continue
+		}
+		nowText := now.Format(time.RFC3339)
+		var currentLifetimeSeconds int64
+		var currentActiveSince string
+		if errScan := tx.QueryRow(`SELECT COALESCE(account_lifetime_seconds, 0), COALESCE(account_lifetime_active_since, '') FROM account_pool_entries WHERE name = ?`, name).Scan(&currentLifetimeSeconds, &currentActiveSince); errScan != nil {
+			if errScan == sql.ErrNoRows {
+				missing = append(missing, name)
+				continue
+			}
+			return updated, skipped, missing, fmt.Errorf("failed to read account pool lifetime %s: %w", name, errScan)
+		}
+		lifetimeSeconds, activeSince, stoppedAt := accountPoolAdvanceLifetime(currentLifetimeSeconds, currentActiveSince, result, now)
+		if activeSince == "" && stoppedAt == "" {
+			stoppedAt = nowText
+		}
+		res, errExec := stmt.Exec(string(resultJSON), strings.TrimSpace(update.ContentHash), nowText, lifetimeSeconds, activeSince, stoppedAt, name)
+		if errExec != nil {
+			return updated, skipped, missing, fmt.Errorf("failed to update account pool check result %s: %w", name, errExec)
+		}
+		rowsAffected, _ := res.RowsAffected()
+		if rowsAffected == 0 {
+			missing = append(missing, name)
+			continue
+		}
+		updated++
+	}
+	if err = tx.Commit(); err != nil {
+		return updated, skipped, missing, fmt.Errorf("failed to commit account pool check results: %w", err)
+	}
+	committed = true
+	return updated, skipped, missing, nil
 }
 
 func (h *Handler) PatchAccountPoolCheckResults(c *gin.Context) {
@@ -3378,79 +4140,103 @@ func (h *Handler) PatchAccountPoolCheckResults(c *gin.Context) {
 		return
 	}
 
-	accountPoolDBMu.Lock()
-	defer accountPoolDBMu.Unlock()
-	db, err := h.openAccountPoolSQLiteLocked()
+	updated, skipped, missing, err := h.persistAccountPoolCheckResults(updates, time.Now().UTC())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	appended, appendSkipped, appendErr := h.appendHighQuotaAccountPoolEntries(c.Request.Context())
+	if appendErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": appendErr.Error(), "updated": updated, "skipped": skipped, "missing": missing})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "updated": updated, "skipped": skipped, "missing": missing, "auto_appended": appended, "auto_append_skipped": appendSkipped})
+}
+
+func (h *Handler) listAccountPoolPostgresEntrySummaries(ctx context.Context, includeHash bool) ([]gin.H, []accountPoolFolderInfo, error) {
+	db, err := openAccountPoolPostgresDB(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if db == nil {
+		return nil, nil, nil
+	}
 	defer func() {
 		if errClose := db.Close(); errClose != nil {
-			log.WithError(errClose).Debug("failed to close account pool sqlite database")
+			log.WithError(errClose).Debug("failed to close account pool postgres database")
 		}
 	}()
-	tx, err := db.Begin()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to begin account pool check result transaction: %v", err)})
-		return
+
+	folderInfos, errFolders := listAccountPoolFoldersFromDB(db)
+	if errFolders != nil {
+		return nil, nil, errFolders
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			if errRollback := tx.Rollback(); errRollback != nil {
-				log.WithError(errRollback).Debug("failed to rollback account pool check result transaction")
-			}
-		}
-	}()
-	stmt, err := tx.Prepare(`UPDATE account_pool_entries SET check_result = ?, check_content_hash = ?, check_updated_at = ? WHERE name = ?`)
+
+	rows, err := db.QueryContext(ctx, `
+SELECT name, data, content_hash, COALESCE(type, ''), COALESCE(provider, ''), COALESCE(email, ''), COALESCE(folder, ''), size, COALESCE(created_at, ''), COALESCE(check_result, ''), COALESCE(check_content_hash, ''), COALESCE(check_updated_at, ''), COALESCE(account_started_at, ''), COALESCE(account_stopped_at, ''), COALESCE(account_lifetime_seconds, 0), COALESCE(account_lifetime_active_since, '')
+FROM account_pool_entries
+ORDER BY lower(name)`)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to prepare account pool check result update: %v", err)})
-		return
+		return nil, nil, fmt.Errorf("failed to query account pool postgres summaries: %w", err)
 	}
 	defer func() {
-		if errClose := stmt.Close(); errClose != nil {
-			log.WithError(errClose).Debug("failed to close account pool check result statement")
+		if errClose := rows.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool postgres summary rows")
 		}
 	}()
-	now := time.Now().UTC()
-	updated := 0
-	skipped := 0
-	missing := make([]string, 0)
-	for _, update := range updates {
-		name := normalizeAccountPoolEntryName(update.Name)
+
+	files := make([]gin.H, 0)
+	folderUsage := make(map[string]accountPoolUsageSummary)
+	for rows.Next() {
+		var name, data, contentHash, typeValue, provider, email, folder, createdAt, checkResult, checkContentHash, checkUpdatedAt, accountStartedAt, accountStoppedAt, accountLifetimeActiveSince string
+		var size int
+		var accountLifetimeSeconds int64
+		if errScan := rows.Scan(&name, &data, &contentHash, &typeValue, &provider, &email, &folder, &size, &createdAt, &checkResult, &checkContentHash, &checkUpdatedAt, &accountStartedAt, &accountStoppedAt, &accountLifetimeSeconds, &accountLifetimeActiveSince); errScan != nil {
+			return nil, nil, fmt.Errorf("failed to scan account pool postgres summary: %w", errScan)
+		}
+		name = normalizeAccountPoolEntryName(name)
 		if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
-			skipped++
 			continue
 		}
-		result, ok := normalizeAccountPoolCheckResultPayload(update.Result, now)
-		if !ok {
-			skipped++
-			continue
+		entryFolder := accountPoolFolderFromStoredEntry(name, folder)
+		entry := gin.H{
+			"id":         name,
+			"auth_id":    name,
+			"auth_index": name,
+			"name":       name,
+			"size":       size,
+			"source":     "account_pool_pg",
+			"folder":     entryFolder,
 		}
-		resultJSON, errMarshal := json.Marshal(result)
-		if errMarshal != nil {
-			skipped++
-			continue
+		if typeValue != "" {
+			entry["type"] = typeValue
+			entry["provider"] = typeValue
 		}
-		res, errExec := stmt.Exec(string(resultJSON), strings.TrimSpace(update.ContentHash), now.Format(time.RFC3339), name)
-		if errExec != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update account pool check result %s: %v", name, errExec)})
-			return
+		if provider != "" {
+			entry["provider"] = provider
 		}
-		rowsAffected, _ := res.RowsAffected()
-		if rowsAffected == 0 {
-			missing = append(missing, name)
-			continue
+		if email != "" {
+			entry["email"] = email
 		}
-		updated++
+		if strings.TrimSpace(accountStartedAt) == "" {
+			accountStartedAt = createdAt
+		}
+		applyAccountPoolLifetimeFields(entry, accountStartedAt, accountStoppedAt, accountLifetimeSeconds, accountLifetimeActiveSince)
+		summary := accountPoolUsage.SummaryForAccountPoolEntry(name, email)
+		applyAccountPoolUsageSummary(entry, summary)
+		accumulateAccountPoolFolderUsage(folderUsage, entryFolder, summary)
+		if includeHash {
+			entry["content_hash"] = contentHash
+		}
+		applyAccountPoolCheckResult(entry, checkResult, checkContentHash, checkUpdatedAt, contentHash)
+		exposeAccountPoolEditableFields(entry, []byte(data))
+		files = append(files, entry)
 	}
-	if err = tx.Commit(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to commit account pool check results: %v", err)})
-		return
+	if errRows := rows.Err(); errRows != nil {
+		return nil, nil, fmt.Errorf("failed to read account pool postgres summaries: %w", errRows)
 	}
-	committed = true
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "updated": updated, "skipped": skipped, "missing": missing})
+	applyAccountPoolFolderUsageSummaries(folderInfos, folderUsage)
+	return files, folderInfos, nil
 }
 
 func (h *Handler) listAccountPoolSQLiteEntrySummaries(includeHash bool) ([]gin.H, []accountPoolFolderInfo, error) {
@@ -3470,7 +4256,7 @@ func (h *Handler) listAccountPoolSQLiteEntrySummaries(includeHash bool) ([]gin.H
 	}
 
 	rows, err := db.Query(`
-SELECT name, content_hash, COALESCE(type, ''), COALESCE(provider, ''), COALESCE(email, ''), COALESCE(folder, ''), size, COALESCE(check_result, ''), COALESCE(check_content_hash, ''), COALESCE(check_updated_at, '')
+SELECT name, data, content_hash, COALESCE(type, ''), COALESCE(provider, ''), COALESCE(email, ''), COALESCE(folder, ''), size, COALESCE(created_at, ''), COALESCE(check_result, ''), COALESCE(check_content_hash, ''), COALESCE(check_updated_at, ''), COALESCE(account_started_at, ''), COALESCE(account_stopped_at, ''), COALESCE(account_lifetime_seconds, 0), COALESCE(account_lifetime_active_since, '')
 FROM account_pool_entries
 ORDER BY lower(name)`)
 	if err != nil {
@@ -3485,9 +4271,10 @@ ORDER BY lower(name)`)
 	files := make([]gin.H, 0)
 	folderUsage := make(map[string]accountPoolUsageSummary)
 	for rows.Next() {
-		var name, contentHash, typeValue, provider, email, folder, checkResult, checkContentHash, checkUpdatedAt string
+		var name, data, contentHash, typeValue, provider, email, folder, createdAt, checkResult, checkContentHash, checkUpdatedAt, accountStartedAt, accountStoppedAt, accountLifetimeActiveSince string
 		var size int
-		if errScan := rows.Scan(&name, &contentHash, &typeValue, &provider, &email, &folder, &size, &checkResult, &checkContentHash, &checkUpdatedAt); errScan != nil {
+		var accountLifetimeSeconds int64
+		if errScan := rows.Scan(&name, &data, &contentHash, &typeValue, &provider, &email, &folder, &size, &createdAt, &checkResult, &checkContentHash, &checkUpdatedAt, &accountStartedAt, &accountStoppedAt, &accountLifetimeSeconds, &accountLifetimeActiveSince); errScan != nil {
 			return nil, nil, fmt.Errorf("failed to scan account pool sqlite summary: %w", errScan)
 		}
 		name = normalizeAccountPoolEntryName(name)
@@ -3506,15 +4293,18 @@ ORDER BY lower(name)`)
 		}
 		if typeValue != "" {
 			entry["type"] = typeValue
+			entry["provider"] = typeValue
 		}
 		if provider != "" {
 			entry["provider"] = provider
-		} else if typeValue != "" {
-			entry["provider"] = typeValue
 		}
 		if email != "" {
 			entry["email"] = email
 		}
+		if strings.TrimSpace(accountStartedAt) == "" {
+			accountStartedAt = createdAt
+		}
+		applyAccountPoolLifetimeFields(entry, accountStartedAt, accountStoppedAt, accountLifetimeSeconds, accountLifetimeActiveSince)
 		summary := accountPoolUsage.SummaryForAccountPoolEntry(name, email)
 		applyAccountPoolUsageSummary(entry, summary)
 		accumulateAccountPoolFolderUsage(folderUsage, entryFolder, summary)
@@ -3522,6 +4312,7 @@ ORDER BY lower(name)`)
 			entry["content_hash"] = contentHash
 		}
 		applyAccountPoolCheckResult(entry, checkResult, checkContentHash, checkUpdatedAt, contentHash)
+		exposeAccountPoolEditableFields(entry, []byte(data))
 		files = append(files, entry)
 	}
 	if errRows := rows.Err(); errRows != nil {
@@ -3529,6 +4320,74 @@ ORDER BY lower(name)`)
 	}
 	applyAccountPoolFolderUsageSummaries(folderInfos, folderUsage)
 	return files, folderInfos, nil
+}
+
+func applyAccountPoolLifetimeFields(entry gin.H, startedAt string, stoppedAt string, lifetimeSeconds int64, activeSince string) {
+	startedAt = strings.TrimSpace(startedAt)
+	stoppedAt = strings.TrimSpace(stoppedAt)
+	activeSince = strings.TrimSpace(activeSince)
+	if startedAt != "" {
+		entry["account_started_at"] = startedAt
+	}
+	if stoppedAt != "" {
+		entry["account_stopped_at"] = stoppedAt
+	}
+	if activeSince != "" {
+		entry["account_lifetime_active_since"] = activeSince
+	}
+	if lifetimeSeconds > 0 || activeSince != "" {
+		if activeStart, ok := parseAccountPoolLifetimeTime(activeSince); ok {
+			now := time.Now().UTC()
+			if now.After(activeStart) {
+				lifetimeSeconds += int64(now.Sub(activeStart).Seconds())
+			}
+		}
+		if lifetimeSeconds < 0 {
+			lifetimeSeconds = 0
+		}
+		entry["account_lifetime_seconds"] = lifetimeSeconds
+		return
+	}
+	if legacySeconds, ok := accountPoolLifetimeSeconds(startedAt, stoppedAt, time.Now().UTC()); ok {
+		entry["account_lifetime_seconds"] = legacySeconds
+	}
+}
+
+func accountPoolLifetimeSeconds(startedAt string, stoppedAt string, now time.Time) (int64, bool) {
+	start, ok := parseAccountPoolLifetimeTime(startedAt)
+	if !ok {
+		return 0, false
+	}
+	end := now
+	if stoppedAt = strings.TrimSpace(stoppedAt); stoppedAt != "" {
+		if parsedEnd, okEnd := parseAccountPoolLifetimeTime(stoppedAt); okEnd {
+			end = parsedEnd
+		}
+	}
+	if end.Before(start) {
+		return 0, true
+	}
+	return int64(end.Sub(start).Seconds()), true
+}
+
+func parseAccountPoolLifetimeTime(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed.UTC(), true
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return parsed.UTC(), true
+	}
+	if unixMs, err := strconv.ParseInt(value, 10, 64); err == nil && unixMs > 0 {
+		if unixMs > 1_000_000_000_000 {
+			return time.UnixMilli(unixMs).UTC(), true
+		}
+		return time.Unix(unixMs, 0).UTC(), true
+	}
+	return time.Time{}, false
 }
 
 func applyAccountPoolUsageSummary(entry gin.H, summary accountPoolUsageSummary) {
@@ -3555,6 +4414,9 @@ func applyAccountPoolUsageSummary(entry gin.H, summary accountPoolUsageSummary) 
 	if summary.LastUsedAt != "" {
 		entry["usage_last_used_at"] = summary.LastUsedAt
 	}
+	if summary.TotalUSD > 0 {
+		entry["usage_total_usd"] = summary.TotalUSD
+	}
 }
 
 func accumulateAccountPoolFolderUsage(folderUsage map[string]accountPoolUsageSummary, folder string, summary accountPoolUsageSummary) {
@@ -3579,6 +4441,7 @@ func applyAccountPoolFolderUsageSummaries(folderInfos []accountPoolFolderInfo, f
 		summary := folderUsage[folder]
 		folderInfos[index].Requests = summary.Requests
 		folderInfos[index].TotalTokens = summary.TotalTokens
+		folderInfos[index].TotalUSD = summary.TotalUSD
 	}
 }
 
@@ -3745,7 +4608,7 @@ func (h *Handler) runAccountPoolImportJob(jobID string, uploads []accountPoolPen
 
 	archiveFiles := make([]accountPoolArchiveFile, 0, len(uploads))
 	for _, upload := range uploads {
-		names, failures, updates, errUpload := h.readAccountPoolUploadData(upload.Name, upload.Data)
+		names, failures, updates, errUpload := h.readAccountPoolUploadData(upload.Name, upload.Data, upload.Metadata)
 		h.updateAccountPoolImportJob(jobID, func(job *accountPoolImportJob) {
 			job.Done++
 			if errUpload != nil {
@@ -3808,7 +4671,8 @@ func (h *Handler) UploadAccountPoolEntries(c *gin.Context) {
 		return
 	}
 	if strings.EqualFold(strings.TrimSpace(c.Query("async")), "true") {
-		uploads, errRead := readAccountPoolPendingUploads(fileHeaders)
+		metadata := accountPoolImportMetadataFromRequest(c)
+		uploads, errRead := readAccountPoolPendingUploads(fileHeaders, metadata)
 		if errRead != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errRead.Error()})
 			return
@@ -3829,8 +4693,9 @@ func (h *Handler) UploadAccountPoolEntries(c *gin.Context) {
 	uploaded := make([]string, 0, len(fileHeaders))
 	failed := make([]gin.H, 0)
 	archiveFiles := make([]accountPoolArchiveFile, 0, len(fileHeaders))
+	metadata := accountPoolImportMetadataFromRequest(c)
 	for _, file := range fileHeaders {
-		names, failures, updates, errUpload := h.readUploadedAccountPoolFiles(file)
+		names, failures, updates, errUpload := h.readUploadedAccountPoolFiles(file, metadata)
 		if errUpload != nil {
 			if errors.Is(errUpload, errAuthFileMustBeJSON) {
 				continue
@@ -3904,6 +4769,11 @@ func (h *Handler) WriteAccountPoolToAuthFiles(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	storedChecks, err := h.readAccountPoolStoredChecks()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
 	candidates := make([]accountPoolAuthWriteCandidate, 0, len(names))
 	failed := make([]gin.H, 0)
@@ -3919,6 +4789,12 @@ func (h *Handler) WriteAccountPoolToAuthFiles(c *gin.Context) {
 			failed = append(failed, gin.H{"name": name, "error": "account pool entry not found"})
 			continue
 		}
+		check := storedChecks[name]
+		if !accountPoolCheckAllowsAuthWrite(check.Result, check.ContentHash, data) {
+			failed = append(failed, gin.H{"name": name, "error": "account pool entry has not passed a real model request check"})
+			continue
+		}
+		data = stripAccountPoolStateForAuthFile(data)
 		targetName := filepath.Base(name)
 		if previous, exists := targets[strings.ToLower(targetName)]; exists {
 			failed = append(failed, gin.H{
@@ -3986,31 +4862,6 @@ func (h *Handler) deleteAllAuthFilesForOverwrite(ctx context.Context) error {
 	if h == nil || h.authManager == nil {
 		return nil
 	}
-	auths := h.authManager.List()
-	ids := make([]string, 0, len(auths))
-	syntheticIDs := make([]string, 0)
-	for _, auth := range auths {
-		if auth == nil || strings.TrimSpace(auth.ID) == "" {
-			continue
-		}
-		if h.isAccountPoolSyntheticAuth(auth) {
-			syntheticIDs = append(syntheticIDs, auth.ID)
-			continue
-		}
-		ids = append(ids, auth.ID)
-	}
-	if len(ids) > 0 {
-		if _, failures := h.authManager.DeleteAuthFiles(ctx, ids); len(failures) > 0 {
-			messages := make([]string, 0, len(failures))
-			for _, failure := range failures {
-				if failure != nil {
-					messages = append(messages, failure.Error())
-				}
-			}
-			return fmt.Errorf("failed to delete existing auth files: %s", strings.Join(messages, "; "))
-		}
-	}
-
 	if strings.TrimSpace(h.cfg.AuthDir) == "" {
 		return nil
 	}
@@ -4033,12 +4884,6 @@ func (h *Handler) deleteAllAuthFilesForOverwrite(ctx context.Context) error {
 		if errRemove := os.Remove(filepath.Join(h.cfg.AuthDir, name)); errRemove != nil && !os.IsNotExist(errRemove) {
 			return fmt.Errorf("failed to remove stale auth file %s: %w", name, errRemove)
 		}
-	}
-	if len(ids) > 0 {
-		h.authManager.RemoveAuths(ids)
-	}
-	if len(syntheticIDs) > 0 {
-		h.authManager.RemoveAuths(syntheticIDs)
 	}
 	return nil
 }
@@ -4206,26 +5051,7 @@ func (h *Handler) WriteAccountPoolEntriesToAuthFiles(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	if req.Overwrite {
-		entries, errRead := os.ReadDir(h.cfg.AuthDir)
-		if errRead != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", errRead)})
-			return
-		}
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".json") {
-				continue
-			}
-			full := filepath.Join(h.cfg.AuthDir, e.Name())
-			if errRemove := os.Remove(full); errRemove != nil && !os.IsNotExist(errRemove) {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to delete auth file %s: %v", e.Name(), errRemove)})
-				return
-			}
-			if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": errDel.Error()})
-				return
-			}
-			h.removeAuthRuntime(full)
-		}
+		log.Warn("account pool write requested with overwrite=true; preserving existing auth files during online reload")
 	}
 
 	uploaded := make([]string, 0, len(names))
@@ -4447,9 +5273,8 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	if errPath != nil {
 		return "", http.StatusBadRequest, errPath
 	}
-	targetID := ""
-	if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
-		targetID = strings.TrimSpace(targetAuth.ID)
+	targetAuth := h.findAuthForDelete(name)
+	if targetAuth != nil {
 		if path := strings.TrimSpace(authAttribute(targetAuth, "path")); path != "" {
 			targetPath = path
 		}
@@ -4468,11 +5293,7 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
 		return name, http.StatusInternalServerError, errDeleteRecord
 	}
-	if targetID != "" {
-		h.removeAuthRuntime(targetID)
-	} else {
-		h.removeAuthRuntime(targetPath)
-	}
+	h.markAuthDeletedFromDisk(ctx, targetAuth)
 	return name, http.StatusOK, nil
 }
 
@@ -4710,20 +5531,324 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 }
 
 // PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note) of an auth file.
+func applyAccountPoolEditableFieldsPatchToJSON(data []byte, req accountPoolEditableFieldsPatch) ([]byte, bool, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, false, fmt.Errorf("account pool entry data is empty")
+	}
+	if !gjson.ValidBytes(trimmed) {
+		return nil, false, fmt.Errorf("account pool entry data is not valid JSON")
+	}
+	updated := string(trimmed)
+	changed := false
+	setStringField := func(key string, value *string) error {
+		if value == nil {
+			return nil
+		}
+		trimmedValue := strings.TrimSpace(*value)
+		current := strings.TrimSpace(gjson.Get(updated, key).String())
+		if trimmedValue == "" {
+			if gjson.Get(updated, key).Exists() {
+				var err error
+				updated, err = sjson.Delete(updated, key)
+				if err != nil {
+					return err
+				}
+				changed = true
+			}
+			return nil
+		}
+		if current == trimmedValue {
+			return nil
+		}
+		var err error
+		updated, err = sjson.Set(updated, key, trimmedValue)
+		if err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	}
+	if err := setStringField("prefix", req.Prefix); err != nil {
+		return nil, false, err
+	}
+	if err := setStringField("proxy_url", req.ProxyURL); err != nil {
+		return nil, false, err
+	}
+	if err := setStringField("note", req.Note); err != nil {
+		return nil, false, err
+	}
+	if err := setStringField("account_started_at", req.AccountStartedAt); err != nil {
+		return nil, false, err
+	}
+	if err := setStringField("account_stopped_at", req.AccountStoppedAt); err != nil {
+		return nil, false, err
+	}
+	if err := setStringField("source_channel", req.SourceChannel); err != nil {
+		return nil, false, err
+	}
+	if req.Priority != nil {
+		if *req.Priority == 0 {
+			if gjson.Get(updated, "priority").Exists() {
+				var err error
+				updated, err = sjson.Delete(updated, "priority")
+				if err != nil {
+					return nil, false, err
+				}
+				changed = true
+			}
+		} else if int(gjson.Get(updated, "priority").Int()) != *req.Priority {
+			var err error
+			updated, err = sjson.Set(updated, "priority", *req.Priority)
+			if err != nil {
+				return nil, false, err
+			}
+			changed = true
+		}
+	}
+	if req.AccountCost != nil {
+		if *req.AccountCost <= 0 {
+			if gjson.Get(updated, "account_cost").Exists() {
+				var err error
+				updated, err = sjson.Delete(updated, "account_cost")
+				if err != nil {
+					return nil, false, err
+				}
+				changed = true
+			}
+		} else if current := gjson.Get(updated, "account_cost"); !current.Exists() || current.Float() != *req.AccountCost {
+			var err error
+			updated, err = sjson.Set(updated, "account_cost", *req.AccountCost)
+			if err != nil {
+				return nil, false, err
+			}
+			changed = true
+		}
+	}
+	if len(req.Headers) > 0 {
+		for key, value := range req.Headers {
+			name := strings.TrimSpace(key)
+			if name == "" {
+				continue
+			}
+			headerPath := "headers." + name
+			trimmedValue := strings.TrimSpace(value)
+			if trimmedValue == "" {
+				if gjson.Get(updated, headerPath).Exists() {
+					var err error
+					updated, err = sjson.Delete(updated, headerPath)
+					if err != nil {
+						return nil, false, err
+					}
+					changed = true
+				}
+				continue
+			}
+			if gjson.Get(updated, headerPath).String() == trimmedValue {
+				continue
+			}
+			var err error
+			updated, err = sjson.Set(updated, headerPath, trimmedValue)
+			if err != nil {
+				return nil, false, err
+			}
+			changed = true
+		}
+	}
+	if !changed {
+		return trimmed, false, nil
+	}
+	return []byte(updated), true, nil
+}
+
+func (h *Handler) patchAccountPoolSQLiteEntryFields(name string, req accountPoolEditableFieldsPatch) (bool, error) {
+	name = normalizeAccountPoolEntryName(name)
+	if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+		return false, fmt.Errorf("invalid account pool entry name")
+	}
+	accountPoolDBMu.Lock()
+	defer accountPoolDBMu.Unlock()
+	db, err := h.openAccountPoolSQLiteLocked()
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool sqlite database")
+		}
+	}()
+	var data string
+	err = db.QueryRow(`SELECT data FROM account_pool_entries WHERE name = ?`, name).Scan(&data)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to query account pool entry %s: %w", name, err)
+	}
+	updatedData, changed, err := applyAccountPoolEditableFieldsPatchToJSON([]byte(data), req)
+	if err != nil {
+		return false, err
+	}
+	if !changed {
+		return true, nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	entry := buildAccountPoolDBEntry(name, updatedData, now)
+	startedAt := strings.TrimSpace(gjson.GetBytes(updatedData, "account_started_at").String())
+	stoppedAt := strings.TrimSpace(gjson.GetBytes(updatedData, "account_stopped_at").String())
+	if req.AccountStartedAt != nil {
+		startedAt = strings.TrimSpace(*req.AccountStartedAt)
+	}
+	if req.AccountStoppedAt != nil {
+		stoppedAt = strings.TrimSpace(*req.AccountStoppedAt)
+	}
+	_, err = db.Exec(`
+UPDATE account_pool_entries
+SET content_hash = ?, type = ?, provider = ?, email = ?, folder = CASE WHEN ? != '' THEN ? ELSE folder END, size = ?, data = ?, updated_at = ?, account_started_at = ?, account_stopped_at = ?
+WHERE name = ?`, entry.Hash, entry.Type, entry.Provider, entry.Email, entry.Folder, entry.Folder, entry.Size, entry.Data, now, startedAt, stoppedAt, name)
+	if err != nil {
+		return false, fmt.Errorf("failed to update account pool entry %s: %w", name, err)
+	}
+	entries, err := h.readAccountPoolSQLiteLocked()
+	if err != nil {
+		return false, err
+	}
+	if err := h.writeAccountPoolZipMirrorLocked(entries); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (h *Handler) patchAccountPoolPostgresEntryFields(ctx context.Context, name string, req accountPoolEditableFieldsPatch) (bool, []byte, error) {
+	name = normalizeAccountPoolEntryName(name)
+	if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+		return false, nil, fmt.Errorf("invalid account pool entry name")
+	}
+	db, err := openAccountPoolPostgresDB(ctx)
+	if err != nil {
+		return false, nil, err
+	}
+	if db == nil {
+		return false, nil, nil
+	}
+	defer func() {
+		if errClose := db.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close account pool postgres database")
+		}
+	}()
+	var data string
+	err = db.QueryRowContext(ctx, `SELECT data FROM account_pool_entries WHERE name = $1`, name).Scan(&data)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil, nil
+		}
+		return false, nil, fmt.Errorf("failed to query account pool postgres entry %s: %w", name, err)
+	}
+	updatedData, changed, err := applyAccountPoolEditableFieldsPatchToJSON([]byte(data), req)
+	if err != nil {
+		return false, nil, err
+	}
+	if !changed {
+		return true, bytes.TrimSpace([]byte(data)), nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	entry := buildAccountPoolDBEntry(name, updatedData, now)
+	startedAt := strings.TrimSpace(gjson.GetBytes(updatedData, "account_started_at").String())
+	stoppedAt := strings.TrimSpace(gjson.GetBytes(updatedData, "account_stopped_at").String())
+	if req.AccountStartedAt != nil {
+		startedAt = strings.TrimSpace(*req.AccountStartedAt)
+	}
+	if req.AccountStoppedAt != nil {
+		stoppedAt = strings.TrimSpace(*req.AccountStoppedAt)
+	}
+	res, err := db.ExecContext(ctx, `
+UPDATE account_pool_entries
+SET content_hash = $1, type = $2, provider = $3, email = $4, folder = CASE WHEN $5 != '' THEN $6 ELSE folder END, size = $7, data = $8, updated_at = $9, account_started_at = $10, account_stopped_at = $11
+WHERE name = $12`, entry.Hash, entry.Type, entry.Provider, entry.Email, entry.Folder, entry.Folder, entry.Size, entry.Data, now, startedAt, stoppedAt, name)
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to update account pool postgres entry %s: %w", name, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return true, updatedData, nil
+	}
+	return affected > 0, updatedData, nil
+}
+
+func (h *Handler) syncAccountPoolPatchedEntryToLocal(name string, data []byte) error {
+	name = normalizeAccountPoolEntryName(name)
+	entryData := bytes.TrimSpace(data)
+	if name == "" || isUnsafeAccountPoolEntryName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") || len(entryData) == 0 {
+		return nil
+	}
+	accountPoolDBMu.Lock()
+	defer accountPoolDBMu.Unlock()
+	entries, err := h.readAccountPoolSQLiteLocked()
+	if err != nil {
+		return err
+	}
+	entries[name] = append([]byte(nil), entryData...)
+	if err := h.writeAccountPoolSQLiteLocked(entries); err != nil {
+		return err
+	}
+	if err := h.writeAccountPoolZipMirrorLocked(entries); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *Handler) patchAccountPoolEntryFields(ctx context.Context, name string, req accountPoolEditableFieldsPatch) (bool, string, error) {
+	if accountPoolPGEnabled() {
+		updated, _, err := h.patchAccountPoolPostgresEntryFields(ctx, name, req)
+		if err != nil {
+			return false, "", err
+		}
+		if !updated {
+			return false, "", nil
+		}
+		return true, "account_pool_pg", nil
+	}
+	updated, err := h.patchAccountPoolSQLiteEntryFields(name, req)
+	if err != nil {
+		return false, "", err
+	}
+	if !updated {
+		return false, "", nil
+	}
+	return true, "account_pool_db", nil
+}
+
+func (h *Handler) patchAccountPoolEntryEditableFields(c *gin.Context, req *accountPoolEditableFieldsPatch) bool {
+	var parsed accountPoolEditableFieldsPatch
+	if req == nil {
+		if err := c.ShouldBindJSON(&parsed); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			return true
+		}
+		req = &parsed
+	}
+	updated, source, err := h.patchAccountPoolEntryFields(c.Request.Context(), req.Name, *req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update account pool entry: %v", err)})
+		return true
+	}
+	if !updated {
+		return false
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "source": source})
+	return true
+}
+
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
+		if h.patchAccountPoolEntryEditableFields(c, nil) {
+			return
+		}
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
 		return
 	}
 
-	var req struct {
-		Name     string            `json:"name"`
-		Prefix   *string           `json:"prefix"`
-		ProxyURL *string           `json:"proxy_url"`
-		Headers  map[string]string `json:"headers"`
-		Priority *int              `json:"priority"`
-		Note     *string           `json:"note"`
-	}
+	var req accountPoolEditableFieldsPatch
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
@@ -4732,6 +5857,9 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	if h.patchAccountPoolEntryEditableFields(c, &req) {
 		return
 	}
 
@@ -4752,6 +5880,9 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	if targetAuth == nil {
+		if h.patchAccountPoolEntryEditableFields(c, &req) {
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
@@ -4859,7 +5990,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			changed = true
 		}
 	}
-	if req.Priority != nil || req.Note != nil {
+	if req.Priority != nil || req.Note != nil || req.AccountCost != nil || req.AccountStartedAt != nil || req.AccountStoppedAt != nil || req.SourceChannel != nil {
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
 		}
@@ -4886,6 +6017,45 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 				targetAuth.Attributes["note"] = trimmedNote
 			}
 		}
+		if req.AccountCost != nil {
+			if *req.AccountCost <= 0 {
+				delete(targetAuth.Metadata, "account_cost")
+				delete(targetAuth.Attributes, "account_cost")
+			} else {
+				targetAuth.Metadata["account_cost"] = *req.AccountCost
+				targetAuth.Attributes["account_cost"] = strconv.FormatFloat(*req.AccountCost, 'f', -1, 64)
+			}
+		}
+		if req.AccountStartedAt != nil {
+			startedAt := strings.TrimSpace(*req.AccountStartedAt)
+			if startedAt == "" {
+				delete(targetAuth.Metadata, "account_started_at")
+				delete(targetAuth.Attributes, "account_started_at")
+			} else {
+				targetAuth.Metadata["account_started_at"] = startedAt
+				targetAuth.Attributes["account_started_at"] = startedAt
+			}
+		}
+		if req.AccountStoppedAt != nil {
+			stoppedAt := strings.TrimSpace(*req.AccountStoppedAt)
+			if stoppedAt == "" {
+				delete(targetAuth.Metadata, "account_stopped_at")
+				delete(targetAuth.Attributes, "account_stopped_at")
+			} else {
+				targetAuth.Metadata["account_stopped_at"] = stoppedAt
+				targetAuth.Attributes["account_stopped_at"] = stoppedAt
+			}
+		}
+		if req.SourceChannel != nil {
+			sourceChannel := strings.TrimSpace(*req.SourceChannel)
+			if sourceChannel == "" {
+				delete(targetAuth.Metadata, "source_channel")
+				delete(targetAuth.Attributes, "source_channel")
+			} else {
+				targetAuth.Metadata["source_channel"] = sourceChannel
+				targetAuth.Attributes["source_channel"] = sourceChannel
+			}
+		}
 		changed = true
 	}
 
@@ -4904,6 +6074,28 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
+func (h *Handler) markAuthDeletedFromDisk(ctx context.Context, auth *coreauth.Auth) {
+	if h == nil || h.authManager == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	next := auth.Clone()
+	next.Status = coreauth.StatusDisabled
+	next.Disabled = true
+	next.StatusMessage = "removed via management api"
+	next.UpdatedAt = time.Now()
+	if next.Attributes == nil {
+		next.Attributes = make(map[string]string)
+	}
+	if next.Metadata == nil {
+		next.Metadata = make(map[string]any)
+	}
+	next.Attributes["deleted_from_disk"] = "true"
+	next.Metadata["deleted_from_disk"] = true
+	if _, err := h.authManager.Update(coreauth.WithSkipPersist(ctx), next); err != nil {
+		log.WithError(err).Debugf("failed to mark auth %s as deleted from disk", next.ID)
+	}
+}
+
 func (h *Handler) removeAuthRuntime(id string) {
 	if h == nil || h.authManager == nil {
 		return
@@ -4912,15 +6104,40 @@ func (h *Handler) removeAuthRuntime(id string) {
 	if id == "" {
 		return
 	}
-	if auth, ok := h.authManager.GetByID(id); ok {
-		h.authManager.Remove(auth.ID)
+	removeByID := func(targetID string) bool {
+		targetID = strings.TrimSpace(targetID)
+		if targetID == "" {
+			return false
+		}
+		if auth, ok := h.authManager.GetByID(targetID); ok {
+			h.authManager.Remove(auth.ID)
+			return true
+		}
+		return false
+	}
+	if removeByID(id) {
 		return
 	}
 	authID := h.authIDForPath(id)
-	if authID == "" {
+	if removeByID(authID) {
 		return
 	}
-	h.authManager.Remove(authID)
+	cleaned := filepath.Clean(id)
+	base := filepath.Base(cleaned)
+	if base == "." || base == string(filepath.Separator) {
+		base = ""
+	}
+	if base != "" {
+		if removeByID(base) {
+			return
+		}
+	}
+	if authID != "" && authID != id {
+		authIDBase := filepath.Base(filepath.Clean(authID))
+		if authIDBase != "" && authIDBase != "." {
+			_ = removeByID(authIDBase)
+		}
+	}
 }
 
 func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
