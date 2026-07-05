@@ -219,7 +219,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
 	retainResponsesWebsocketToolCaches(downstreamSessionKey)
 	clientIP := websocketClientAddress(c)
-	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)
+	log.Debugf("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)
 
 	requestLogEnabled := h != nil && h.Cfg != nil && h.Cfg.RequestLog
 	wsTimelineLog := newWebsocketTimelineLog(requestLogEnabled, websocketTimelineSourceFromContext(c))
@@ -259,11 +259,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			appendWebsocketTimelineDisconnect(wsTimelineLog, wsTerminateErr, time.Now())
 			// log.Infof("responses websocket: session closing id=%s reason=%v", passthroughSessionID, wsTerminateErr)
 		} else {
-			log.Infof("responses websocket: session closing id=%s", passthroughSessionID)
+			log.Debugf("responses websocket: session closing id=%s", passthroughSessionID)
 		}
 		if h != nil && h.AuthManager != nil {
 			h.AuthManager.CloseExecutionSession(passthroughSessionID)
-			log.Infof("responses websocket: upstream execution session closed id=%s", passthroughSessionID)
+			log.Debugf("responses websocket: upstream execution session closed id=%s", passthroughSessionID)
 		}
 		wsTimelineLog.SetContext(c)
 		if errClose := conn.Close(); errClose != nil {
@@ -294,7 +294,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if errReadMessage != nil {
 			wsTerminateErr = errReadMessage
 			if websocket.IsCloseError(errReadMessage, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
-				log.Infof("responses websocket: client disconnected id=%s error=%v", passthroughSessionID, errReadMessage)
+				log.Debugf("responses websocket: client disconnected id=%s error=%v", passthroughSessionID, errReadMessage)
 			} else {
 				// log.Warnf("responses websocket: read message failed id=%s error=%v", passthroughSessionID, errReadMessage)
 			}
@@ -615,7 +615,7 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	// See: https://github.com/router-for-me/CLIProxyAPI/issues/2207
 	var mergedInput string
 	if allowCompactionReplayBypass && inputContainsFullTranscript(nextInput) {
-		log.Infof("responses websocket: full transcript detected, skipping stale merge (input items=%d)", len(nextInput.Array()))
+		log.Debugf("responses websocket: full transcript detected, skipping stale merge (input items=%d)", len(nextInput.Array()))
 		mergedInput = nextInput.Raw
 	} else {
 		appendInputRaw := nextInput.Raw

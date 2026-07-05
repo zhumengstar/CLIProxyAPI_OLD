@@ -29,6 +29,7 @@ type UsageReporter struct {
 	authID       string
 	authIndex    string
 	authType     string
+	email        string
 	apiKey       string
 	source       string
 	reasoning    string
@@ -69,6 +70,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		apiKey:      apiKey,
 		source:      resolveUsageSource(auth, apiKey),
 		authType:    resolveUsageAuthType(auth),
+		email:       resolveUsageEmail(auth),
 		reasoning:   usage.ReasoningEffortFromContext(ctx),
 		serviceTier: usage.ServiceTierFromContext(ctx),
 	}
@@ -241,6 +243,7 @@ func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 
 func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) {
 	record.ResponseHeaders = internallogging.GetResponseHeaders(ctx)
+	cliproxyauth.ObserveQuotaHeaders(record.AuthID, record.ResponseHeaders)
 	usage.PublishRecord(ctx, record)
 }
 
@@ -269,6 +272,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		AuthID:          r.authID,
 		AuthIndex:       r.authIndex,
 		AuthType:        r.authType,
+		Email:           r.email,
 		ReasoningEffort: r.reasoning,
 		ServiceTier:     r.serviceTier,
 		RequestedAt:     r.requestedAt,
@@ -397,6 +401,28 @@ func APIKeyFromContext(ctx context.Context) string {
 		default:
 			return fmt.Sprintf("%v", value)
 		}
+	}
+	return ""
+}
+
+func resolveUsageEmail(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if email, ok := auth.Metadata["email"].(string); ok {
+			if trimmed := strings.TrimSpace(email); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	kind, value := auth.AccountInfo()
+	if strings.EqualFold(strings.TrimSpace(kind), "oauth") {
+		value = strings.TrimSpace(value)
+		if idx := strings.Index(value, " ("); idx > 0 {
+			value = strings.TrimSpace(value[:idx])
+		}
+		return value
 	}
 	return ""
 }

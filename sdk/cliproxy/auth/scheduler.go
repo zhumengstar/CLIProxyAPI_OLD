@@ -788,6 +788,10 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
 		view = &bucket.ws
 	}
+	now := time.Now()
+	if hasWeeklyPreferredEntry(view.flat, predicate, now) {
+		predicate = weeklyPreferredPredicate(predicate, now)
+	}
 	var picked *scheduledAuth
 	if strategy == schedulerStrategyFillFirst {
 		picked = view.pickFirst(predicate)

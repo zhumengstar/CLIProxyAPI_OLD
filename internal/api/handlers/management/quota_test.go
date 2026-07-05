@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -130,5 +131,124 @@ func TestResetQuota_DoesNotAcceptAuthIDOrFileName(t *testing.T) {
 				t.Fatalf("status = %d, want %d with body %s", rec.Code, tt.wantCode, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestResetQuotaBatch_ByAuthIndexes(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	next := time.Now().Add(time.Hour)
+	auths := []*coreauth.Auth{
+		{
+			ID:             "batch-auth-a",
+			FileName:       "batch-auth-a.json",
+			Provider:       "antigravity",
+			Status:         coreauth.StatusError,
+			StatusMessage:  "quota exhausted",
+			Unavailable:    true,
+			NextRetryAfter: next,
+			Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next, BackoffLevel: 2},
+		},
+		{
+			ID:             "batch-auth-b",
+			FileName:       "batch-auth-b.json",
+			Provider:       "antigravity",
+			Status:         coreauth.StatusError,
+			StatusMessage:  "quota exhausted",
+			Unavailable:    true,
+			NextRetryAfter: next,
+			Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next, BackoffLevel: 2},
+		},
+	}
+	indexes := make([]string, 0, len(auths))
+	for _, auth := range auths {
+		indexes = append(indexes, auth.EnsureIndex())
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("failed to register auth record: %v", errRegister)
+		}
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/reset-quota/batch", strings.NewReader(`{"auth_indexes":["`+indexes[0]+`","`+indexes[1]+`"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.ResetQuotaBatch(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("failed to decode response: %v", errUnmarshal)
+	}
+	if got := int(payload["succeeded"].(float64)); got != 2 {
+		t.Fatalf("succeeded = %d, want 2", got)
+	}
+	for _, auth := range auths {
+		updated, ok := manager.GetByID(auth.ID)
+		if !ok || updated == nil {
+			t.Fatalf("expected auth %s to exist after reset", auth.ID)
+		}
+		if updated.Status != coreauth.StatusActive || updated.Quota.Exceeded || updated.Unavailable {
+			t.Fatalf("updated auth %s state = status %q quota %+v unavailable %v", auth.ID, updated.Status, updated.Quota, updated.Unavailable)
+		}
+	}
+}
+
+func TestResetQuotaBatch_ProviderPageSizeMaxOneHundred(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	next := time.Now().Add(time.Hour)
+	for i := 0; i < 105; i++ {
+		auth := &coreauth.Auth{
+			ID:             fmt.Sprintf("ag-batch-%03d", i),
+			FileName:       fmt.Sprintf("ag-batch-%03d.json", i),
+			Provider:       "antigravity",
+			Status:         coreauth.StatusError,
+			StatusMessage:  "quota exhausted",
+			Unavailable:    true,
+			NextRetryAfter: next,
+			Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next, BackoffLevel: 1},
+		}
+		auth.EnsureIndex()
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("failed to register auth record: %v", errRegister)
+		}
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/reset-quota", strings.NewReader(`{"provider":"antigravity","page":1,"page_size":500}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.ResetQuotaBatch(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("failed to decode response: %v", errUnmarshal)
+	}
+	if got := int(payload["page_size"].(float64)); got != 100 {
+		t.Fatalf("page_size = %d, want 100", got)
+	}
+	if got := int(payload["total"].(float64)); got != 105 {
+		t.Fatalf("total = %d, want 105", got)
+	}
+	if got := int(payload["succeeded"].(float64)); got != 100 {
+		t.Fatalf("succeeded = %d, want 100", got)
+	}
+	if hasMore, ok := payload["has_more"].(bool); !ok || !hasMore {
+		t.Fatalf("has_more = %#v, want true", payload["has_more"])
 	}
 }

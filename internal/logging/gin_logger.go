@@ -99,7 +99,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 		case statusCode >= http.StatusBadRequest:
 			entry.Warn(logLine)
 		default:
-			entry.Info(logLine)
+			entry.Debug(logLine)
 		}
 	}
 }

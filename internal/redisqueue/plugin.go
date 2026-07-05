@@ -103,6 +103,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		Alias:           aliasName,
 		Endpoint:        resolveEndpoint(ctx),
 		AuthType:        authType,
+		Email:           strings.TrimSpace(record.Email),
 		APIKey:          apiKey,
 		RequestID:       requestID,
 		ReasoningEffort: reasoningEffort,
@@ -122,6 +123,7 @@ type queuedUsageDetail struct {
 	Alias           string `json:"alias"`
 	Endpoint        string `json:"endpoint"`
 	AuthType        string `json:"auth_type"`
+	Email           string `json:"email"`
 	APIKey          string `json:"api_key"`
 	RequestID       string `json:"request_id"`
 	ReasoningEffort string `json:"reasoning_effort"`
