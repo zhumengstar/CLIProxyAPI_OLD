@@ -2,6 +2,8 @@ package usagepersist
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -16,7 +18,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-const defaultDir = "logs"
+const (
+	defaultDir       = "logs"
+	writeQueueSize   = 4096
+	maxFailBodyBytes = 2048
+)
 
 var (
 	enabled atomic.Bool
@@ -24,7 +30,8 @@ var (
 	dirMu sync.RWMutex
 	dir   = defaultDir
 
-	writeMu sync.Mutex
+	workerOnce sync.Once
+	writeQueue chan usageWrite
 )
 
 func init() {
@@ -34,6 +41,9 @@ func init() {
 // SetEnabled toggles durable usage record persistence.
 func SetEnabled(value bool) {
 	enabled.Store(value)
+	if value {
+		startWorker()
+	}
 }
 
 // SetDirectory updates the directory where structured usage JSONL files are written.
@@ -67,17 +77,40 @@ func (p *plugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 	}
 	payload = append(payload, '\n')
 
+	startWorker()
 	targetDir := Directory()
-	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		log.WithError(err).Warnf("failed to create usage persistence directory %s", targetDir)
-		return
-	}
-
 	filename := filepath.Join(targetDir, "usage-records-"+time.Now().Format("2006-01-02")+".jsonl")
-	writeMu.Lock()
-	defer writeMu.Unlock()
-	if err := appendFile(filename, payload); err != nil {
-		log.WithError(err).Warnf("failed to write structured usage record %s", filename)
+	select {
+	case writeQueue <- usageWrite{filename: filename, payload: payload}:
+	default:
+		log.Warn("usage persistence queue is full; dropping structured usage record")
+	}
+}
+
+type usageWrite struct {
+	filename string
+	payload  []byte
+}
+
+func startWorker() {
+	workerOnce.Do(func() {
+		writeQueue = make(chan usageWrite, writeQueueSize)
+		go usageWorker()
+	})
+}
+
+func usageWorker() {
+	for item := range writeQueue {
+		if len(item.payload) == 0 || strings.TrimSpace(item.filename) == "" {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(item.filename), 0o755); err != nil {
+			log.WithError(err).Warnf("failed to create usage persistence directory %s", filepath.Dir(item.filename))
+			continue
+		}
+		if err := appendFile(item.filename, item.payload); err != nil {
+			log.WithError(err).Warnf("failed to write structured usage record %s", item.filename)
+		}
 	}
 }
 
@@ -88,10 +121,9 @@ type recordJSON struct {
 	Alias           string      `json:"alias"`
 	Endpoint        string      `json:"endpoint"`
 	AuthType        string      `json:"auth_type"`
-	Email           string      `json:"email"`
-	AuthID          string      `json:"auth_id"`
+	EmailHash       string      `json:"email_hash,omitempty"`
+	AuthIDHash      string      `json:"auth_id_hash,omitempty"`
 	AuthIndex       string      `json:"auth_index"`
-	APIKey          string      `json:"api_key"`
 	RequestID       string      `json:"request_id"`
 	Source          string      `json:"source"`
 	ReasoningEffort string      `json:"reasoning_effort"`
@@ -174,10 +206,9 @@ func buildRecord(ctx context.Context, record coreusage.Record) recordJSON {
 		Alias:           alias,
 		Endpoint:        strings.TrimSpace(internallogging.GetEndpoint(ctx)),
 		AuthType:        authType,
-		Email:           strings.TrimSpace(record.Email),
-		AuthID:          strings.TrimSpace(record.AuthID),
+		EmailHash:       stableHash(record.Email),
+		AuthIDHash:      stableHash(record.AuthID),
 		AuthIndex:       strings.TrimSpace(record.AuthIndex),
-		APIKey:          strings.TrimSpace(record.APIKey),
 		RequestID:       strings.TrimSpace(internallogging.GetRequestID(ctx)),
 		Source:          strings.TrimSpace(record.Source),
 		ReasoningEffort: reasoningEffort,
@@ -185,7 +216,7 @@ func buildRecord(ctx context.Context, record coreusage.Record) recordJSON {
 		Tokens:          tokens,
 		Failed:          failed,
 		Fail:            fail,
-		ResponseHeaders: record.ResponseHeaders,
+		ResponseHeaders: quotaResponseHeaders(record.ResponseHeaders),
 	}
 }
 
@@ -207,8 +238,43 @@ func resolveFail(ctx context.Context, record coreusage.Record, failed bool) fail
 	}
 	return failJSON{
 		StatusCode: status,
-		Body:       strings.TrimSpace(record.Fail.Body),
+		Body:       truncateBody(strings.TrimSpace(record.Fail.Body), maxFailBodyBytes),
 	}
+}
+
+func stableHash(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+func truncateBody(value string, maxBytes int) string {
+	if maxBytes <= 0 || len(value) <= maxBytes {
+		return value
+	}
+	return value[:maxBytes] + "...[truncated]"
+}
+
+func quotaResponseHeaders(headers http.Header) http.Header {
+	if len(headers) == 0 {
+		return nil
+	}
+	filtered := make(http.Header)
+	for key, values := range headers {
+		canonical := http.CanonicalHeaderKey(key)
+		lower := strings.ToLower(canonical)
+		if !strings.HasPrefix(lower, "x-codex-primary-") && !strings.HasPrefix(lower, "x-codex-secondary-") {
+			continue
+		}
+		filtered[canonical] = append([]string(nil), values...)
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
 }
 
 func appendFile(filename string, payload []byte) error {

@@ -789,12 +789,16 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		view = &bucket.ws
 	}
 	now := time.Now()
-	if hasWeeklyPreferredEntry(view.flat, predicate, now) {
-		predicate = weeklyPreferredPredicate(predicate, now)
-	}
+	weeklyWeighted := weeklyPreferredEntries(view.flat, predicate, now)
 	var picked *scheduledAuth
 	if strategy == schedulerStrategyFillFirst {
-		picked = view.pickFirst(predicate)
+		if len(weeklyWeighted) > 0 {
+			picked = weeklyWeighted[0]
+		} else {
+			picked = view.pickFirst(predicate)
+		}
+	} else if len(weeklyWeighted) > 0 {
+		picked = view.pickRoundRobinWeighted(weeklyWeighted)
 	} else {
 		picked = view.pickRoundRobin(predicate)
 	}
@@ -971,6 +975,26 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 		index := (start + offset) % len(v.flat)
 		entry := v.flat[index]
 		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		v.cursor = index + 1
+		return entry
+	}
+	return nil
+}
+
+func (v *readyView) pickRoundRobinWeighted(entries []*scheduledAuth) *scheduledAuth {
+	if len(entries) == 0 {
+		return nil
+	}
+	start := 0
+	if len(entries) > 0 {
+		start = v.cursor % len(entries)
+	}
+	for offset := 0; offset < len(entries); offset++ {
+		index := (start + offset) % len(entries)
+		entry := entries[index]
+		if entry == nil {
 			continue
 		}
 		v.cursor = index + 1

@@ -11,7 +11,8 @@ import (
 const (
 	weeklyWindowMinimum = 6 * 24 * time.Hour
 	weeklyRefreshSoon   = 48 * time.Hour
-	weeklyRemainingMin  = 20.0
+	weeklyRemainingMin  = 50.0
+	weeklyPreferWeight  = 3
 )
 
 type weeklyQuotaPreference struct {
@@ -103,15 +104,23 @@ func weeklyPreferenceForAuth(auth *Auth, now time.Time) (weeklyQuotaPreference, 
 
 func preferExpiringWeeklyQuota(auths []*Auth, now time.Time) []*Auth {
 	preferred := make([]*Auth, 0, len(auths))
+	ordinary := make([]*Auth, 0, len(auths))
 	for _, candidate := range auths {
 		if _, ok := weeklyPreferenceForAuth(candidate, now); ok {
 			preferred = append(preferred, candidate)
+			continue
 		}
+		ordinary = append(ordinary, candidate)
 	}
 	if len(preferred) == 0 {
 		return auths
 	}
-	return preferred
+	weighted := make([]*Auth, 0, len(preferred)*weeklyPreferWeight+len(ordinary))
+	for i := 0; i < weeklyPreferWeight; i++ {
+		weighted = append(weighted, preferred...)
+	}
+	weighted = append(weighted, ordinary...)
+	return weighted
 }
 
 func hasWeeklyPreferredEntry(entries []*scheduledAuth, predicate func(*scheduledAuth) bool, now time.Time) bool {
@@ -137,4 +146,28 @@ func weeklyPreferredPredicate(predicate func(*scheduledAuth) bool, now time.Time
 		_, ok := weeklyPreferenceForAuth(entry.auth, now)
 		return ok
 	}
+}
+
+func weeklyPreferredEntries(entries []*scheduledAuth, predicate func(*scheduledAuth) bool, now time.Time) []*scheduledAuth {
+	preferred := make([]*scheduledAuth, 0, len(entries))
+	ordinary := make([]*scheduledAuth, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil || (predicate != nil && !predicate(entry)) {
+			continue
+		}
+		if _, ok := weeklyPreferenceForAuth(entry.auth, now); ok {
+			preferred = append(preferred, entry)
+			continue
+		}
+		ordinary = append(ordinary, entry)
+	}
+	if len(preferred) == 0 {
+		return nil
+	}
+	weighted := make([]*scheduledAuth, 0, len(preferred)*weeklyPreferWeight+len(ordinary))
+	for i := 0; i < weeklyPreferWeight; i++ {
+		weighted = append(weighted, preferred...)
+	}
+	weighted = append(weighted, ordinary...)
+	return weighted
 }

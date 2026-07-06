@@ -18,13 +18,14 @@ func TestRoundRobinPrefersExpiringWeeklyQuotaWithRemainingCapacity(t *testing.T)
 	ObserveQuotaHeaders(preferred.ID, weeklyHeaders(now.Add(12*time.Hour), 25))
 
 	selector := &RoundRobinSelector{}
-	for range 4 {
+	expected := []string{"preferred", "preferred", "preferred", "regular"}
+	for i, want := range expected {
 		got, err := selector.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, []*Auth{regular, preferred})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.ID != preferred.ID {
-			t.Fatalf("picked %q, want %q", got.ID, preferred.ID)
+		if got.ID != want {
+			t.Fatalf("pick %d = %q, want %q", i, got.ID, want)
 		}
 	}
 }
