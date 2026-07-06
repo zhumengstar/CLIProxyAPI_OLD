@@ -34,11 +34,24 @@ func TestWeeklyQuotaPreferenceRequiresSoonResetAndRemainingCapacity(t *testing.T
 	now := time.Now()
 	tooLate := &Auth{ID: "too-late"}
 	tooEmpty := &Auth{ID: "too-empty"}
-	ObserveQuotaHeaders(tooLate.ID, weeklyHeaders(now.Add(72*time.Hour), 10))
-	ObserveQuotaHeaders(tooEmpty.ID, weeklyHeaders(now.Add(12*time.Hour), 90))
+	ObserveQuotaHeaders(tooLate.ID, weeklyHeaders(now.Add(26*time.Hour), 10))
+	ObserveQuotaHeaders(tooEmpty.ID, weeklyHeaders(now.Add(12*time.Hour), 98))
 
 	if got := preferExpiringWeeklyQuota([]*Auth{tooLate, tooEmpty}, now); len(got) != 2 {
 		t.Fatalf("preferred len = %d, want ordinary candidate set", len(got))
+	}
+}
+
+func TestWeeklyQuotaPreferenceAcceptsMoreThanTwoPercentRemaining(t *testing.T) {
+	resetWeeklyQuotaPreferences(t)
+	now := time.Now()
+	preferred := &Auth{ID: "preferred"}
+	regular := &Auth{ID: "regular"}
+	ObserveQuotaHeaders(preferred.ID, weeklyHeaders(now.Add(12*time.Hour), 97.9))
+
+	got := preferExpiringWeeklyQuota([]*Auth{regular, preferred}, now)
+	if len(got) != 1 || got[0].ID != preferred.ID {
+		t.Fatalf("preferred = %#v, want only %q", got, preferred.ID)
 	}
 }
 

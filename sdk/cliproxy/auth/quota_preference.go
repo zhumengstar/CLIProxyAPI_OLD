@@ -10,8 +10,8 @@ import (
 
 const (
 	weeklyWindowMinimum = 6 * 24 * time.Hour
-	weeklyRefreshSoon   = 48 * time.Hour
-	weeklyRemainingMin  = 20.0
+	weeklyRefreshSoon   = 24 * time.Hour
+	weeklyRemainingMin  = 2.0
 )
 
 type weeklyQuotaPreference struct {
@@ -95,7 +95,7 @@ func weeklyPreferenceForAuth(auth *Auth, now time.Time) (weeklyQuotaPreference, 
 		weeklyQuotaPreferences.Delete(auth.ID)
 		return weeklyQuotaPreference{}, false
 	}
-	if preference.resetAt.Sub(now) > weeklyRefreshSoon || preference.remainingPercent < weeklyRemainingMin {
+	if preference.resetAt.Sub(now) > weeklyRefreshSoon || preference.remainingPercent <= weeklyRemainingMin {
 		return weeklyQuotaPreference{}, false
 	}
 	return preference, true
