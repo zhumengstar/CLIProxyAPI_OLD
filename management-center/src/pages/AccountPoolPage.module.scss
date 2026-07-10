@@ -1,0 +1,1411 @@
+@use '../styles/variables' as *;
+@use '../styles/mixins' as *;
+
+.container {
+  display: flex;
+  flex-direction: column;
+  gap: $spacing-lg;
+}
+
+.pageHeader {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(280px, auto) minmax(260px, 1fr);
+  align-items: center;
+  gap: 12px 20px;
+
+  @include mobile {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+}
+
+.headerIntro {
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+}
+
+.pageTitle {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.description {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+.headerActions,
+.toolbar,
+.selectionActions {
+  display: flex;
+  align-items: center;
+  gap: $spacing-sm;
+  flex-wrap: wrap;
+}
+
+.headerActions {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  display: grid;
+  grid-template-columns:
+    minmax(210px, auto)
+    minmax(220px, auto)
+    minmax(118px, auto)
+    minmax(330px, auto)
+    minmax(270px, auto);
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  width: 100%;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 68%, transparent);
+  border-radius: 10px;
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--bg-secondary) 74%, transparent),
+      color-mix(in srgb, var(--bg-primary) 92%, transparent)
+    );
+  box-shadow: 0 8px 24px color-mix(in srgb, #000 5%, transparent);
+
+  :global(.btn) {
+    min-height: 34px;
+    padding-inline: 11px;
+    white-space: nowrap;
+    min-width: 58px;
+  }
+}
+
+.viewModeSwitch {
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  min-height: 40px;
+  padding: 4px;
+  border: 1px solid color-mix(in srgb, var(--primary-color) 22%, var(--border-color));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--primary-color) 7%, var(--bg-primary));
+}
+
+.viewModeSwitch button {
+  min-width: 92px;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+  white-space: nowrap;
+  transition:
+    background $transition-fast,
+    color $transition-fast,
+    box-shadow $transition-fast;
+}
+
+.viewModeSwitch button:hover {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--text-primary) 7%, transparent);
+}
+
+.viewModeSwitch button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary-color) 24%, transparent);
+}
+
+.viewModeActive {
+  background: var(--primary-color) !important;
+  color: var(--button-primary-text, #fff) !important;
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--primary-color) 22%, transparent);
+}
+
+.actionGroup,
+.actionGroupDanger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  padding: 4px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 72%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-primary) 74%, transparent);
+}
+
+.actionGroupDanger {
+  border-color: color-mix(in srgb, var(--danger-color) 20%, var(--border-color));
+  background: color-mix(in srgb, var(--danger-color) 4%, var(--bg-secondary));
+}
+
+.actionGroupLabel {
+  min-width: 34px;
+  padding: 0 5px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 800;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.actionScope {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 7px;
+  min-height: 40px;
+  padding: 6px 11px;
+  border: 1px solid color-mix(in srgb, var(--primary-color) 22%, var(--border-color));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--primary-color) 7%, var(--bg-primary));
+  white-space: nowrap;
+}
+
+.actionScope span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.actionScope strong {
+  color: var(--text-primary);
+  font-size: 18px;
+  font-weight: 850;
+  line-height: 1;
+}
+
+.actionScope em {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.headerStats {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  justify-self: center;
+  gap: 7px;
+  min-width: 190px;
+  padding: 0;
+  flex-wrap: wrap;
+  min-height: 40px;
+}
+
+.statPill {
+  appearance: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 75%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-secondary) 82%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  min-width: 72px;
+  transition:
+    border-color 0.16s ease,
+    background 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.16s ease;
+}
+
+.statPill:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px color-mix(in srgb, #000 9%, transparent);
+}
+
+.statPillActive {
+  border-color: color-mix(in srgb, currentColor 52%, var(--border-color));
+  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.statPill strong {
+  min-width: 2ch;
+  text-align: right;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.statPillSuccess {
+  border-color: color-mix(in srgb, var(--success-color) 30%, var(--border-color));
+  background: color-mix(in srgb, var(--success-color) 10%, var(--bg-secondary));
+  color: var(--success-color);
+}
+
+.statPillWarning {
+  border-color: color-mix(in srgb, var(--quota-medium-color, #e0aa14) 36%, var(--border-color));
+  background: color-mix(in srgb, var(--quota-medium-color, #e0aa14) 12%, var(--bg-secondary));
+  color: var(--quota-medium-color, #a87400);
+}
+
+.statPillError {
+  border-color: color-mix(in srgb, var(--danger-color) 34%, var(--border-color));
+  background: color-mix(in srgb, var(--danger-color) 9%, var(--bg-secondary));
+  color: var(--danger-color);
+}
+
+.syncProgressPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--primary-color) 22%, var(--border-color));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--primary-color) 5%, var(--bg-primary));
+}
+
+.syncProgressHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.syncProgressHeader strong {
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.syncProgressTrack {
+  position: relative;
+  overflow: hidden;
+  height: 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border-color) 58%, transparent);
+}
+
+.syncProgressBar {
+  height: 100%;
+  min-width: 8px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--primary-color), var(--success-color));
+  transition: width $transition-fast;
+}
+
+.syncProgressStats {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.syncProgressStats span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 3px 9px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 68%, transparent);
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.usageHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: $spacing-md;
+  margin-bottom: $spacing-sm;
+}
+
+.usageTitle {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.usageDesc {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.usageActions {
+  display: inline-flex;
+  align-items: center;
+  gap: $spacing-sm;
+  flex-wrap: wrap;
+}
+
+.usageEmpty {
+  padding: $spacing-md;
+  border: 1px dashed var(--border-color);
+  border-radius: 8px;
+  color: var(--text-tertiary);
+  font-size: 13px;
+  text-align: center;
+}
+
+.usageTableWrap {
+  overflow-x: auto;
+}
+
+.usageTable {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 860px;
+}
+
+.usageTable th,
+.usageTable td {
+  padding: 9px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 65%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.usageTable th {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.usageStrong {
+  max-width: 260px;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usageMuted {
+  max-width: 280px;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usageStatusOk,
+.usageStatusError {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 42px;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.usageStatusOk {
+  background: color-mix(in srgb, var(--success-color) 12%, var(--bg-secondary));
+  color: var(--success-color);
+}
+
+.usageStatusError {
+  background: color-mix(in srgb, var(--danger-color) 10%, var(--bg-secondary));
+  color: var(--danger-color);
+}
+
+.toolbar {
+  --account-pool-control-height: 40px;
+  --account-pool-filter-width: 124px;
+  --account-pool-number-width: 64px;
+
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: flex-start;
+  justify-content: space-between;
+  row-gap: 12px;
+  margin-bottom: 14px;
+}
+
+.filters {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.filterControls {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.4fr) repeat(auto-fit, minmax(112px, 1fr));
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 720px;
+  min-width: 0;
+
+  :global(.form-group) {
+    margin-bottom: 0;
+  }
+}
+
+.toolbarMeta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex: 0 1 auto;
+  min-width: 0;
+  flex-wrap: wrap;
+
+  @include mobile {
+    width: 100%;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+}
+
+.searchInput {
+  height: var(--account-pool-control-height);
+  box-sizing: border-box;
+  width: 100%;
+}
+
+.typeSelect,
+.folderSelect,
+.planSelect,
+.statusSelect,
+.quotaSelect,
+.sortSelect {
+  width: 100%;
+  min-width: 0;
+}
+
+.stats {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pageSizeControl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--account-pool-control-height);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pageSizeInput,
+.checkConcurrencyInput {
+  width: var(--account-pool-number-width);
+  height: var(--account-pool-control-height);
+  box-sizing: border-box;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 14px;
+
+  &:focus {
+    outline: none;
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary-color) 12%, transparent);
+  }
+}
+
+.selectionActions {
+  min-height: var(--account-pool-control-height);
+  padding-top: 2px;
+
+  :global(.btn) {
+    min-height: var(--account-pool-control-height);
+  }
+
+  label {
+    min-height: var(--account-pool-control-height);
+  }
+}
+
+@media (max-width: 1280px) {
+  .headerStats {
+    justify-content: center;
+    grid-column: 1 / -1;
+  }
+
+  .headerActions {
+    grid-template-columns: 1fr 1fr;
+    justify-content: stretch;
+  }
+
+  .actionGroup,
+  .actionGroupDanger {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .actionScope {
+    justify-content: flex-start;
+  }
+}
+
+@include mobile {
+  .pageHeader {
+    align-items: stretch;
+  }
+
+  .headerStats,
+  .headerActions {
+    justify-content: flex-start;
+    max-width: none;
+    padding: 0;
+  }
+
+  .headerActions {
+    grid-template-columns: 1fr;
+    padding: 8px;
+  }
+
+  .actionGroup,
+  .actionGroupDanger {
+    display: grid;
+    grid-template-columns: auto repeat(3, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .actionScope {
+    width: 100%;
+  }
+
+  .viewModeSwitch {
+    width: 100%;
+  }
+
+  .headerIntro,
+  .headerStats,
+  .headerActions {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .filterControls {
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+
+  .searchInput {
+    grid-column: 1 / -1;
+  }
+
+  .typeSelect,
+  .folderSelect,
+  .planSelect,
+  .statusSelect,
+  .quotaSelect,
+  .sortSelect {
+    width: 100%;
+  }
+}
+
+.poolGrid {
+  display: grid;
+  gap: $spacing-md;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+
+  @include mobile {
+    grid-template-columns: 1fr;
+  }
+}
+
+.folderGroups {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+
+.folderGroup {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  gap: 10px;
+  min-height: 236px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
+  border-radius: 10px;
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--bg-primary) 96%, transparent),
+      color-mix(in srgb, var(--bg-secondary) 58%, transparent)
+    );
+  cursor: pointer;
+  transition:
+    border-color $transition-fast,
+    box-shadow $transition-fast,
+    transform $transition-fast;
+}
+
+.folderGroupSelected {
+  border-color: color-mix(in srgb, var(--primary-color) 58%, var(--border-color));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--primary-color) 24%, transparent),
+    0 14px 28px color-mix(in srgb, #000 8%, transparent);
+}
+
+.folderGroup:hover {
+  border-color: color-mix(in srgb, var(--primary-color) 34%, var(--border-color));
+  box-shadow: 0 14px 28px color-mix(in srgb, #000 8%, transparent);
+  transform: translateY(-2px);
+}
+
+.folderGroup:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary-color) 48%, transparent);
+  outline-offset: 2px;
+}
+
+.folderSelectControl {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 1;
+  display: inline-flex;
+  min-height: 30px;
+  padding: 4px 7px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-primary) 88%, transparent);
+  box-shadow: 0 6px 14px color-mix(in srgb, #000 8%, transparent);
+}
+
+.folderVisual {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  min-height: 92px;
+  padding-top: 4px;
+}
+
+.folderIcon {
+  position: relative;
+  width: 118px;
+  height: 82px;
+  filter: drop-shadow(0 8px 10px color-mix(in srgb, #000 13%, transparent));
+}
+
+.folderImportTime {
+  position: absolute;
+  top: 0;
+  right: 2px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 108px;
+  min-height: 26px;
+  padding: 3px 8px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--bg-primary) 94%, transparent);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.2;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 6px 12px color-mix(in srgb, #000 8%, transparent);
+}
+
+.folderIconTab {
+  position: absolute;
+  top: 0;
+  left: 6px;
+  width: 48px;
+  height: 22px;
+  border: 1px solid #e3a400;
+  border-bottom: 0;
+  border-radius: 8px 10px 0 0;
+  background: linear-gradient(180deg, #ffc928, #efae05);
+}
+
+.folderIconBody {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 64px;
+  overflow: hidden;
+  border: 1px solid #e0a212;
+  border-radius: 7px;
+  background: linear-gradient(180deg, #ffe07a 0%, #ffca45 56%, #f5b82c 100%);
+}
+
+.folderZipRail {
+  position: absolute;
+  top: 26px;
+  right: 0;
+  left: 0;
+  height: 12px;
+  border-top: 1px solid color-mix(in srgb, #8b6a35 34%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, #8b6a35 34%, transparent);
+  background:
+    repeating-linear-gradient(
+      90deg,
+      #d9d9d9 0 7px,
+      #8f8f8f 7px 10px,
+      #f3f3f3 10px 14px
+    );
+  box-shadow: 0 1px 2px color-mix(in srgb, #000 18%, transparent);
+}
+
+.folderCountBadge {
+  position: absolute;
+  right: 2px;
+  bottom: 8px;
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 4px 9px;
+  border: 1px solid color-mix(in srgb, var(--primary-color) 22%, var(--border-color));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-primary) 92%, transparent);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 800;
+  box-shadow: 0 6px 14px color-mix(in srgb, #000 8%, transparent);
+}
+
+.folderTokenBadge {
+  position: absolute;
+  right: 2px;
+  bottom: 40px;
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  max-width: 128px;
+  padding: 3px 8px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--success-color) 24%, var(--border-color));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-primary) 92%, transparent);
+  color: var(--success-color);
+  font-size: 11px;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 6px 14px color-mix(in srgb, #000 8%, transparent);
+}
+
+.folderHeader {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  text-align: center;
+}
+
+.folderHeader h3 {
+  max-width: 100%;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folderTokenLine {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--success-color);
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folderHeader p {
+  width: 100%;
+  min-height: 17px;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folderStatusGrid {
+  display: flex;
+  align-content: flex-start;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+
+.folderStatusPill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 72%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-primary) 84%, transparent);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.folderStatusPill strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.folderStatusSuccess {
+  border-color: color-mix(in srgb, var(--success-color) 30%, var(--border-color));
+  background: color-mix(in srgb, var(--success-color) 10%, var(--bg-primary));
+  color: var(--success-color);
+}
+
+.folderStatusError {
+  border-color: color-mix(in srgb, var(--danger-color) 30%, var(--border-color));
+  background: color-mix(in srgb, var(--danger-color) 8%, var(--bg-primary));
+  color: var(--danger-color);
+}
+
+.folderStatusChecking {
+  border-color: color-mix(in srgb, var(--primary-color) 30%, var(--border-color));
+  background: color-mix(in srgb, var(--primary-color) 9%, var(--bg-primary));
+  color: var(--primary-color);
+}
+
+.folderTokenPill {
+  border-color: color-mix(in srgb, var(--success-color) 28%, var(--border-color));
+  background: color-mix(in srgb, var(--success-color) 9%, var(--bg-primary));
+  color: var(--success-color);
+}
+
+.folderHeaderActions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+
+  :global(.btn) {
+    min-height: 32px;
+  }
+}
+
+.folderBreadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.folderBreadcrumb span {
+  color: var(--text-primary);
+  font-weight: 800;
+}
+
+.folderBreadcrumb strong {
+  color: var(--text-tertiary);
+  font-weight: 700;
+}
+
+.poolCard {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: $spacing-sm;
+  min-width: 0;
+  padding: $spacing-md;
+  border: 1px solid var(--border-color);
+  border-radius: $radius-lg;
+  background: var(--bg-primary);
+  transition:
+    border-color $transition-fast,
+    box-shadow $transition-fast,
+    transform $transition-fast;
+
+  &:hover {
+    border-color: rgba(37, 99, 235, 0.25);
+    box-shadow: $shadow-sm;
+    transform: translateY(-1px);
+  }
+}
+
+.poolCardSelected {
+  border-color: var(--primary-color);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary-color) 35%, transparent);
+}
+
+.cardTop {
+  display: flex;
+  align-items: flex-start;
+  gap: $spacing-sm;
+  min-width: 0;
+}
+
+.cardMain {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.fileName {
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.35;
+  word-break: break-all;
+}
+
+.fileNameButton {
+  width: 100%;
+  min-height: 54px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 750;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  text-align: left;
+  transition: color $transition-fast;
+}
+
+.fileNameButton:hover {
+  color: var(--primary-color);
+}
+
+.fileNameButton:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary-color) 35%, transparent);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+.metaRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.usageMetricRow {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.usageMetric {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-secondary) 72%, transparent);
+}
+
+.usageMetricLabel {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usageMetricValue {
+  flex: 0 0 auto;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.typeBadge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--primary-color) 13%, var(--bg-secondary));
+  color: var(--primary-color);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.folderBadge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  max-width: 180px;
+  padding: 3px 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-secondary) 11%, var(--bg-secondary));
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.planBadge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--success-color) 13%, var(--bg-secondary));
+  color: var(--success-color);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.muted {
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.statusLine {
+  color: var(--danger-color);
+  font-size: 12px;
+  line-height: 1.4;
+  border-top: 1px dashed var(--border-color);
+  padding-top: $spacing-sm;
+}
+
+.checkLine {
+  font-size: 12px;
+  line-height: 1.4;
+  border-top: 1px dashed var(--border-color);
+  padding-top: $spacing-sm;
+}
+
+.checkProgress {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: $spacing-md;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--primary-color) 18%, var(--border-color));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--primary-color) 7%, var(--bg-primary));
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.checkSuccess {
+  color: var(--success-color);
+}
+
+.checkLoading,
+.checkUnsupported {
+  color: var(--text-secondary);
+}
+
+.checkError {
+  color: var(--danger-color);
+}
+
+.checkHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.checkStatusPill,
+.checkPlanPill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.checkStatusPill {
+  background: color-mix(in srgb, var(--success-color) 12%, transparent);
+  color: var(--success-color);
+}
+
+.checkPlanPill {
+  background: color-mix(in srgb, var(--primary-color) 12%, transparent);
+  color: var(--primary-color);
+}
+
+.checkTime {
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.quotaPanel {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--text-secondary);
+}
+
+.quotaItem,
+.quotaItemEmpty {
+  display: grid;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-secondary) 70%, transparent);
+}
+
+.quotaItemEmpty {
+  border-color: color-mix(in srgb, var(--danger-color) 28%, var(--border-color));
+  background: color-mix(in srgb, var(--danger-color) 6%, var(--bg-secondary));
+}
+
+.quotaItemTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.quotaName {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quotaValue,
+.quotaLowValue,
+.quotaEmptyValue {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.quotaValue {
+  color: var(--success-color);
+}
+
+.quotaLowValue {
+  color: var(--danger-color);
+}
+
+.quotaEmptyValue {
+  color: var(--danger-color);
+}
+
+.quotaTrack {
+  position: relative;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border-color) 70%, transparent);
+}
+
+.quotaFill,
+.quotaFillLow,
+.quotaFillEmpty {
+  position: absolute;
+  inset: 0 auto 0 0;
+  min-width: 3px;
+  border-radius: inherit;
+}
+
+.quotaFill {
+  background: var(--success-color);
+}
+
+.quotaFillLow {
+  background: var(--danger-color);
+}
+
+.quotaFillEmpty {
+  background: var(--danger-color);
+  opacity: 0.35;
+}
+
+.quotaReset {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.errorBox {
+  padding: $spacing-md;
+  border: 1px solid var(--danger-color);
+  border-radius: $radius-md;
+  background: rgba($error-color, 0.08);
+  color: var(--danger-color);
+  font-size: 14px;
+}
+
+.hint {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: $spacing-md;
+  flex-wrap: wrap;
+  margin-top: $spacing-lg;
+  padding-top: $spacing-md;
+  border-top: 1px solid var(--border-color);
+}
+
+.pageInfo {
+  color: var(--text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.sourceEditor {
+  display: grid;
+  gap: 16px;
+}
+
+.sourceEditorFolder {
+  display: grid;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-secondary) 66%, transparent);
+}
+
+.sourceEditorFolder span,
+.sourceEditorField span,
+.sourceEditorCheckbox span {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.sourceEditorFolder strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sourceEditorField {
+  display: grid;
+  gap: 7px;
+}
+
+.sourceEditorCheckbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sourceEditorCheckbox input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary-color);
+}
+
+.sourceEditorField input,
+.sourceEditorField textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid color-mix(in srgb, var(--border-color) 76%, transparent);
+  border-radius: 8px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 14px;
+  transition:
+    border-color $transition-fast,
+    box-shadow $transition-fast;
+}
+
+.sourceEditorField input {
+  min-height: 42px;
+  padding: 0 12px;
+}
+
+.sourceEditorField textarea {
+  min-height: 108px;
+  padding: 11px 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.sourceEditorField input:focus,
+.sourceEditorField textarea:focus {
+  outline: none;
+  border-color: var(--primary-color);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary-color) 14%, transparent);
+}
+
+.sourceEditorField input:disabled,
+.sourceEditorField textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
