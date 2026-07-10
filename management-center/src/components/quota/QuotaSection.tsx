@@ -38,32 +38,50 @@ type QuotaSortMode = 'quota_desc' | 'quota_asc' | 'name_asc';
 type AntigravityPool = 'gemini' | 'claude-gpt';
 type AntigravityFilter = 'all' | 'priority48' | 'mid72' | 'reserve' | 'noquota' | 'unfetched' | 'invalid';
 
+const antigravityGroupBelongsToPool = (
+  group: AntigravityQuotaState['groups'][number],
+  pool: AntigravityPool
+): boolean => {
+  const descriptor = [group.id, group.label, ...group.models].join(' ').toLowerCase();
+  return pool === 'gemini' ? /gemini/.test(descriptor) : /claude|gpt/.test(descriptor);
+};
+
+const antigravityGroupsForPool = (
+  state: AntigravityQuotaState,
+  pool: AntigravityPool
+) => state.groups.filter((group) => antigravityGroupBelongsToPool(group, pool));
+
 const antigravityStateBelongsToPool = (
   state: AntigravityQuotaState | undefined,
   pool: AntigravityPool
 ): boolean => {
   if (!state || state.status !== 'success') return true;
-  const descriptor = state.groups
-    .flatMap((group) => [group.id, group.label, ...group.models])
-    .join(' ')
-    .toLowerCase();
-  return pool === 'gemini' ? /gemini/.test(descriptor) : /claude|gpt/.test(descriptor);
+  return antigravityGroupsForPool(state, pool).length > 0;
 };
 
-const antigravityFilterForState = (state?: AntigravityQuotaState): AntigravityFilter => {
+const antigravityFilterForState = (
+  state: AntigravityQuotaState | undefined,
+  pool: AntigravityPool
+): AntigravityFilter => {
   if (!state || state.status === 'idle' || state.status === 'loading') return 'unfetched';
   if (state.status === 'error') return 'invalid';
-  const remaining = state.groups
+  const poolGroups = antigravityGroupsForPool(state, pool);
+  if (poolGroups.length === 0) return 'unfetched';
+  const remaining = poolGroups
     .map((group) => group.remainingFraction)
     .filter((value) => Number.isFinite(value));
   if (remaining.length === 0) return 'unfetched';
   const lowest = Math.min(...remaining);
   if (lowest <= 0) return 'noquota';
-  const resetTime = state.groups
+  const resetAt = poolGroups
     .map((group) => group.resetTime)
-    .find((value): value is string => Boolean(value));
-  const resetAt = resetTime ? Date.parse(resetTime) : Number.NaN;
-  const resetHours = Number.isFinite(resetAt) ? (resetAt - Date.now()) / 3_600_000 : Number.POSITIVE_INFINITY;
+    .filter((value): value is string => Boolean(value))
+    .map((value) => Date.parse(value))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right)[0];
+  const resetHours = Number.isFinite(resetAt)
+    ? (resetAt - Date.now()) / 3_600_000
+    : Number.POSITIVE_INFINITY;
   if (resetHours <= 48) return 'priority48';
   if (resetHours <= 72) return 'mid72';
   return 'reserve';
@@ -228,13 +246,15 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
     const states = quota as unknown as Record<string, AntigravityQuotaState>;
     return quotaFiles.reduce<Record<AntigravityFilter, number>>(
       (counts, file) => {
+        const state = states[file.name];
+        if (!antigravityStateBelongsToPool(state, antigravityPool)) return counts;
         counts.all += 1;
-        counts[antigravityFilterForState(states[file.name])] += 1;
+        counts[antigravityFilterForState(state, antigravityPool)] += 1;
         return counts;
       },
       { all: 0, priority48: 0, mid72: 0, reserve: 0, noquota: 0, unfetched: 0, invalid: 0 }
     );
-  }, [config.type, quota, quotaFiles]);
+  }, [antigravityPool, config.type, quota, quotaFiles]);
   const antigravityPoolCounts = useMemo(() => {
     if (config.type !== 'antigravity') return null;
     const states = quota as unknown as Record<string, AntigravityQuotaState>;
@@ -249,7 +269,7 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
     return quotaFiles.filter((file) => {
       const state = states[file.name];
       if (!antigravityStateBelongsToPool(state, antigravityPool)) return false;
-      return antigravityFilter === 'all' || antigravityFilterForState(state) === antigravityFilter;
+      return antigravityFilter === 'all' || antigravityFilterForState(state, antigravityPool) === antigravityFilter;
     });
   }, [antigravityFilter, antigravityPool, config.type, quota, quotaFiles]);
 
@@ -333,11 +353,15 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
       if (!state || state.status !== 'success') return null;
 
       if (config.type === 'antigravity') {
-        const groups = Array.isArray(state.groups) ? state.groups : [];
+        const groups = Array.isArray(state.groups)
+          ? (state.groups as AntigravityQuotaState['groups']).filter((group) =>
+              antigravityGroupBelongsToPool(group, antigravityPool)
+            )
+          : [];
         const values = groups
           .map((group) => {
             if (!group || typeof group !== 'object') return null;
-            const fraction = (group as Record<string, unknown>).remainingFraction;
+            const fraction = group.remainingFraction;
             return typeof fraction === 'number' && Number.isFinite(fraction) ? fraction * 100 : null;
           })
           .filter((value): value is number => value !== null);
@@ -392,7 +416,7 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
 
       return null;
     },
-    [config.type, quota]
+    [antigravityPool, config.type, quota]
   );
 
   const sortedFiles = useMemo(() => {

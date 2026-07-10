@@ -714,10 +714,38 @@ const renderAntigravityItems = (
     return h('div', { className: styleMap.quotaMessage }, t('antigravity_quota.empty_models'));
   }
 
-  return groups.map((group) => {
-    const clamped = Math.max(0, Math.min(1, group.remainingFraction));
-    const percent = Math.round(clamped * 100);
-    const resetLabel = formatQuotaResetTime(group.resetTime);
+  const belongsToPool = (group: AntigravityQuotaGroup, pool: 'gemini' | 'claude-gpt') => {
+    const descriptor = [group.id, group.label, ...group.models].join(' ').toLowerCase();
+    return pool === 'gemini' ? /gemini/.test(descriptor) : /claude|gpt/.test(descriptor);
+  };
+  const aggregatePool = (pool: 'gemini' | 'claude-gpt', label: string) => {
+    const poolGroups = groups.filter((group) => belongsToPool(group, pool));
+    const fractions = poolGroups
+      .map((group) => group.remainingFraction)
+      .filter(Number.isFinite);
+    const remainingFraction = fractions.length > 0 ? Math.min(...fractions) : null;
+    const resetTimes = poolGroups
+      .map((group) => group.resetTime)
+      .filter((value): value is string => Boolean(value))
+      .sort((left, right) => Date.parse(left) - Date.parse(right));
+    return {
+      id: pool,
+      label,
+      models: poolGroups.flatMap((group) => group.models),
+      remainingFraction,
+      resetTime: resetTimes[0],
+    };
+  };
+  const poolRows = [
+    aggregatePool('claude-gpt', 'Claude/GPT'),
+    aggregatePool('gemini', 'Gemini'),
+  ];
+
+  return poolRows.map((group) => {
+    const percent = group.remainingFraction === null
+      ? null
+      : Math.round(Math.max(0, Math.min(1, group.remainingFraction)) * 100);
+    const resetLabel = group.resetTime ? formatQuotaResetTime(group.resetTime) : '-';
 
     return h(
       'div',
@@ -729,7 +757,7 @@ const renderAntigravityItems = (
         h(
           'div',
           { className: styleMap.quotaMeta },
-          h('span', { className: styleMap.quotaPercent }, `${percent}%`),
+          h('span', { className: styleMap.quotaPercent }, percent === null ? '-' : `${percent}%`),
           h('span', { className: styleMap.quotaReset }, formatResetMeta(t, resetLabel))
         )
       ),
