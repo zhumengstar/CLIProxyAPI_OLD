@@ -165,16 +165,18 @@
   white-space: nowrap;
 }
 
-.antigravityPoolTabActive:global(.btn.btn-sm) {
-  background: var(--primary-color);
-  border-color: var(--primary-color);
-  color: var(--primary-contrast, #fff);
-}
-
+.antigravityPoolTabActive:global(.btn.btn-sm),
 .antigravityFilterTabActive:global(.btn.btn-sm) {
-  background: color-mix(in srgb, var(--primary-color) 16%, var(--bg-secondary));
-  border-color: color-mix(in srgb, var(--primary-color) 42%, var(--border-color));
-  color: var(--text-primary);
+  background: var(--text-primary);
+  border-color: var(--text-primary);
+  color: var(--bg-primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary-color) 28%, transparent);
+
+  &:hover:not(:disabled) {
+    background: var(--text-primary);
+    border-color: var(--text-primary);
+    color: var(--bg-primary);
+  }
 }
 
 .antigravityRenderStatus {
