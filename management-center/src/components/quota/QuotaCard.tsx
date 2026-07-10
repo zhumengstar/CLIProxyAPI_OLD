@@ -67,6 +67,7 @@ interface QuotaCardProps<TState extends QuotaStatusState> {
   cardIdleMessageKey?: string;
   cardClassName: string;
   defaultType: string;
+  showAccountMeta?: boolean;
   canRefresh?: boolean;
   onRefresh?: () => void;
   renderContext?: QuotaRenderContext;
@@ -81,6 +82,7 @@ export function QuotaCard<TState extends QuotaStatusState>({
   cardIdleMessageKey,
   cardClassName,
   defaultType,
+  showAccountMeta = false,
   canRefresh = false,
   onRefresh,
   renderContext,
@@ -94,6 +96,22 @@ export function QuotaCard<TState extends QuotaStatusState>({
     resolvedTheme === 'dark' && typeColorSet.dark ? typeColorSet.dark : typeColorSet.light;
 
   const quotaStatus = quota?.status ?? 'idle';
+  const rawAccountType = item.account_type ?? item.accountType;
+  const accountType = (() => {
+    if (typeof rawAccountType !== 'string' || !rawAccountType.trim()) return '未知类型';
+    const normalized = rawAccountType
+      .trim()
+      .toLowerCase()
+      .replace(/[\s-]+/g, '_');
+    if (normalized === 'oauth') return 'OAuth';
+    if (normalized === 'api_key' || normalized === 'apikey') return 'API Key';
+    return rawAccountType.trim();
+  })();
+  const accountDisabled =
+    item.disabled === true ||
+    String(item.status ?? '')
+      .trim()
+      .toLowerCase() === 'disabled';
   const quotaErrorMessage = resolveQuotaErrorMessage(
     t,
     quota?.errorStatus,
@@ -126,6 +144,19 @@ export function QuotaCard<TState extends QuotaStatusState>({
         </span>
         <span className={styles.fileName}>{item.name}</span>
       </div>
+
+      {showAccountMeta && (
+        <div className={styles.cardAccountMeta}>
+          <span className={styles.accountTypeBadge}>{`账号类型：${accountType}`}</span>
+          <span
+            className={`${styles.accountStatusBadge} ${
+              accountDisabled ? styles.accountStatusDisabled : styles.accountStatusEnabled
+            }`}
+          >
+            {accountDisabled ? '已停用' : '已启用'}
+          </span>
+        </div>
+      )}
 
       <div className={styles.quotaSection}>
         {quotaStatus === 'loading' ? (

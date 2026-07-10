@@ -586,19 +586,20 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
   const runRefreshTargets = useCallback(
     async (targets: AuthFileItem[], options: { resume?: boolean; concurrency?: number } = {}) => {
       if (disabled || refreshTask.refreshing) return;
-      if (targets.length === 0) return;
+      const refreshableTargets = targets.filter((file) => !file.disabled);
+      if (refreshableTargets.length === 0) return;
 
       const concurrency = Math.max(
         MIN_QUOTA_REFRESH_CONCURRENCY,
         Math.round(options.concurrency ?? refreshConcurrency)
       );
-      const runId = beginRefresh(config.type, targets.length, concurrency);
+      const runId = beginRefresh(config.type, refreshableTargets.length, concurrency);
       if (!runId) return;
       const controller = new AbortController();
       quotaRefreshAbortControllers.set(config.type, controller);
       if (!options.resume) {
         writePendingQuotaRefresh(config.type, {
-          names: targets.map((file) => file.name),
+          names: refreshableTargets.map((file) => file.name),
           completed: [],
           concurrency,
           startedAt: Date.now(),
@@ -607,21 +608,21 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
 
       setQuota((prev) => {
         const next = { ...prev };
-        targets.forEach((file) => {
+        refreshableTargets.forEach((file) => {
           next[file.name] = config.buildLoadingState();
         });
         return next;
       });
 
       let cursor = 0;
-      const workerCount = Math.max(1, Math.min(concurrency, targets.length));
+      const workerCount = Math.max(1, Math.min(concurrency, refreshableTargets.length));
 
       const worker = async () => {
         for (;;) {
           if (controller.signal.aborted) return;
           const index = cursor;
           cursor += 1;
-          const file = targets[index];
+          const file = refreshableTargets[index];
           if (!file) return;
           try {
             const data = await config.fetchQuota(file, t, controller.signal);
@@ -1003,6 +1004,7 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
                 cardIdleMessageKey={config.cardIdleMessageKey}
                 cardClassName={config.cardClassName}
                 defaultType={config.type}
+                showAccountMeta={config.type === 'antigravity'}
                 canRefresh={!disabled && !item.disabled}
                 onRefresh={() => void refreshQuotaForFile(item)}
                 renderContext={config.type === 'antigravity' ? { antigravityPool } : undefined}
