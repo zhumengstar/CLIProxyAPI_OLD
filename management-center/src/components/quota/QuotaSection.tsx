@@ -18,6 +18,11 @@ import type { QuotaConfig } from './quotaConfigs';
 import { useGridColumns } from './useGridColumns';
 import { IconRefreshCw } from '@/components/ui/icons';
 import styles from '@/pages/QuotaPage.module.scss';
+import {
+  antigravityGroupsForPool,
+  antigravityGroupsForWindow,
+  type AntigravityPool,
+} from './antigravityQuota';
 
 type QuotaUpdater<T> = T | ((prev: T) => T);
 
@@ -35,7 +40,6 @@ const ANTIGRAVITY_INITIAL_CARD_COUNT = 12;
 const ANTIGRAVITY_RENDER_BATCH_SIZE = 8;
 
 type QuotaSortMode = 'quota_desc' | 'quota_asc' | 'name_asc';
-type AntigravityPool = 'gemini' | 'claude-gpt';
 type AntigravityFilter =
   | 'all'
   | 'priority48'
@@ -44,17 +48,6 @@ type AntigravityFilter =
   | 'noquota'
   | 'unfetched'
   | 'invalid';
-
-const antigravityGroupBelongsToPool = (
-  group: AntigravityQuotaState['groups'][number],
-  pool: AntigravityPool
-): boolean => {
-  const descriptor = [group.id, group.label, ...group.models].join(' ').toLowerCase();
-  return pool === 'gemini' ? /gemini/.test(descriptor) : /claude|gpt/.test(descriptor);
-};
-
-const antigravityGroupsForPool = (state: AntigravityQuotaState, pool: AntigravityPool) =>
-  state.groups.filter((group) => antigravityGroupBelongsToPool(group, pool));
 
 const antigravityStateBelongsToPool = (
   state: AntigravityQuotaState | undefined,
@@ -70,15 +63,15 @@ const antigravityFilterForState = (
 ): AntigravityFilter => {
   if (!state || state.status === 'idle' || state.status === 'loading') return 'unfetched';
   if (state.status === 'error') return 'invalid';
-  const poolGroups = antigravityGroupsForPool(state, pool);
-  if (poolGroups.length === 0) return 'unfetched';
-  const remaining = poolGroups
+  const weeklyGroups = antigravityGroupsForWindow(state, pool, 'weekly');
+  if (weeklyGroups.length === 0) return 'unfetched';
+  const remaining = weeklyGroups
     .map((group) => group.remainingFraction)
     .filter((value) => Number.isFinite(value));
   if (remaining.length === 0) return 'unfetched';
   const lowest = Math.min(...remaining);
   if (lowest <= 0) return 'noquota';
-  const resetAt = poolGroups
+  const resetAt = weeklyGroups
     .map((group) => group.resetTime)
     .filter((value): value is string => Boolean(value))
     .map((value) => Date.parse(value))
@@ -375,8 +368,10 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
 
       if (config.type === 'antigravity') {
         const groups = Array.isArray(state.groups)
-          ? (state.groups as AntigravityQuotaState['groups']).filter((group) =>
-              antigravityGroupBelongsToPool(group, antigravityPool)
+          ? antigravityGroupsForWindow(
+              state as unknown as AntigravityQuotaState,
+              antigravityPool,
+              'weekly'
             )
           : [];
         const values = groups
@@ -1010,6 +1005,7 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
                 defaultType={config.type}
                 canRefresh={!disabled && !item.disabled}
                 onRefresh={() => void refreshQuotaForFile(item)}
+                renderContext={config.type === 'antigravity' ? { antigravityPool } : undefined}
                 renderQuotaItems={config.renderQuotaItems}
               />
             ))}

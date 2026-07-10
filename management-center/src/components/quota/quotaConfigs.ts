@@ -29,7 +29,12 @@ import type {
   KimiQuotaRow,
   KimiQuotaState,
 } from '@/types';
-import { apiCallApi, authFilesApi, getApiCallErrorMessage } from '@/services/api';
+import {
+  apiCallApi,
+  authFilesApi,
+  getApiCallErrorMessage,
+  normalizeAntigravityQuotaGroups,
+} from '@/services/api';
 import { useQuotaStore } from '@/stores';
 import {
   ANTIGRAVITY_QUOTA_URLS,
@@ -78,6 +83,7 @@ import {
 import { normalizeAuthIndex } from '@/utils/authIndex';
 import type { QuotaRenderHelpers } from './QuotaCard';
 import styles from '@/pages/QuotaPage.module.scss';
+import { aggregateAntigravityWindow, antigravityGroupsForPool } from './antigravityQuota';
 
 type QuotaUpdater<T> = T | ((prev: T) => T);
 
@@ -205,6 +211,10 @@ const fetchAntigravityQuota = async (
 
       hadSuccess = true;
       const payload = parseAntigravityPayload(result.body ?? result.bodyText);
+      const officialGroups = normalizeAntigravityQuotaGroups(payload?.groups);
+      if (officialGroups.length > 0) {
+        return officialGroups;
+      }
       const models = payload?.models;
       if (!models || typeof models !== 'object' || Array.isArray(models)) {
         lastError = t('antigravity_quota.empty_models');
@@ -728,27 +738,16 @@ const renderAntigravityItems = (
     return h('div', { className: styleMap.quotaMessage }, t('antigravity_quota.empty_models'));
   }
 
-  const belongsToPool = (group: AntigravityQuotaGroup, pool: 'gemini' | 'claude-gpt') => {
-    const descriptor = [group.id, group.label, ...group.models].join(' ').toLowerCase();
-    return pool === 'gemini' ? /gemini/.test(descriptor) : /claude|gpt/.test(descriptor);
-  };
-  const aggregatePool = (pool: 'gemini' | 'claude-gpt', label: string) => {
-    const poolGroups = groups.filter((group) => belongsToPool(group, pool));
-    const fractions = poolGroups.map((group) => group.remainingFraction).filter(Number.isFinite);
-    const remainingFraction = fractions.length > 0 ? Math.min(...fractions) : null;
-    const resetTimes = poolGroups
-      .map((group) => group.resetTime)
-      .filter((value): value is string => Boolean(value))
-      .sort((left, right) => Date.parse(left) - Date.parse(right));
-    return {
-      id: pool,
-      label,
-      models: poolGroups.flatMap((group) => group.models),
-      remainingFraction,
-      resetTime: resetTimes[0],
-    };
-  };
-  const poolRows = [aggregatePool('claude-gpt', 'Claude/GPT'), aggregatePool('gemini', 'Gemini')];
+  const pool = helpers.antigravityPool ?? 'gemini';
+  const poolGroups = antigravityGroupsForPool(quota, pool);
+  const poolRows = [
+    {
+      id: 'five-hour',
+      label: '5 小时重置',
+      ...aggregateAntigravityWindow(poolGroups, 'five-hour'),
+    },
+    { id: 'weekly', label: '周重置', ...aggregateAntigravityWindow(poolGroups, 'weekly') },
+  ];
 
   const rows = poolRows.map((group) => {
     const percent =
@@ -763,7 +762,14 @@ const renderAntigravityItems = (
       h(
         'div',
         { className: styleMap.quotaRowHeader },
-        h('span', { className: styleMap.quotaModel, title: group.models.join(', ') }, group.label),
+        h(
+          'span',
+          {
+            className: styleMap.quotaModel,
+            title: group.groups.flatMap((item) => item.models).join(', '),
+          },
+          group.label
+        ),
         h(
           'div',
           { className: styleMap.quotaMeta },

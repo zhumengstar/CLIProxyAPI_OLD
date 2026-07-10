@@ -81,6 +81,13 @@ const normalizeGroup = (group: LegacyGroup, index: number): AntigravityQuotaGrou
   });
 };
 
+export const normalizeAntigravityQuotaGroups = (groups: unknown): AntigravityQuotaGroup[] =>
+  Array.isArray(groups)
+    ? groups.flatMap((rawGroup, index) =>
+        normalizeGroup((asRecord(rawGroup) ?? {}) as LegacyGroup, index)
+      )
+    : [];
+
 export const normalizeAntigravityQuotaStates = (
   files: Record<string, unknown> | undefined,
   fallbackRefreshedAt?: string
@@ -94,11 +101,7 @@ export const normalizeAntigravityQuotaStates = (
       if (status === 'error') {
         return [name, { status: 'error', groups: [], error: asString(state?.error), refreshedAt }];
       }
-      const groups = Array.isArray(state?.groups)
-        ? state.groups.flatMap((rawGroup, index) =>
-            normalizeGroup((asRecord(rawGroup) ?? {}) as LegacyGroup, index)
-          )
-        : [];
+      const groups = normalizeAntigravityQuotaGroups(state?.groups);
       return [
         name,
         {
