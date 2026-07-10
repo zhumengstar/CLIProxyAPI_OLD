@@ -37,7 +37,12 @@ function getVersion(): string {
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [react(), viteSingleFile()],
+  plugins: [
+    react(),
+    viteSingleFile({
+      removeViteModuleLoader: true
+    })
+  ],
   define: {
     __APP_VERSION__: JSON.stringify(getVersion())
   },
@@ -60,8 +65,13 @@ export default defineConfig({
   build: {
     target: 'es2020',
     outDir: 'dist',
-    assetsInlineLimit: Number.MAX_SAFE_INTEGER,
-    chunkSizeWarningLimit: 1200,
+    assetsInlineLimit: 100000000,
+    chunkSizeWarningLimit: 100000000,
     cssCodeSplit: false,
+    rolldownOptions: {
+      output: {
+        codeSplitting: false
+      }
+    }
   }
 });

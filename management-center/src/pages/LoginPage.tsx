@@ -32,18 +32,33 @@ function getLocalizedErrorMessage(error: unknown, t: (key: string) => string): s
           ? error
           : '';
 
+  const withHttpStatus = (summary: string) => {
+    if (!status) {
+      return summary;
+    }
+
+    const genericAxiosMessage = `Request failed with status code ${status}`;
+    const detail = message.trim();
+    const backendDetail =
+      detail && detail !== genericAxiosMessage
+        ? ` (${t('login.error_backend_detail')}: ${detail})`
+        : '';
+
+    return `HTTP ${status}: ${summary}${backendDetail}`;
+  };
+
   // 根据 HTTP 状态码判断
   if (status === 401) {
-    return t('login.error_unauthorized');
+    return withHttpStatus(t('login.error_unauthorized'));
   }
   if (status === 403) {
-    return t('login.error_forbidden');
+    return withHttpStatus(t('login.error_forbidden'));
   }
   if (status === 404) {
-    return t('login.error_not_found');
+    return withHttpStatus(t('login.error_not_found'));
   }
   if (status && status >= 500) {
-    return t('login.error_server');
+    return withHttpStatus(t('login.error_server'));
   }
 
   // 根据 axios 错误码判断
@@ -63,7 +78,7 @@ function getLocalizedErrorMessage(error: unknown, t: (key: string) => string): s
   }
 
   // 默认错误消息
-  return t('login.error_invalid');
+  return withHttpStatus(t('login.error_invalid'));
 }
 
 export function LoginPage() {
@@ -95,7 +110,7 @@ export function LoginPage() {
     () =>
       LANGUAGE_ORDER.map((lang) => ({
         value: lang,
-        label: t(LANGUAGE_LABEL_KEYS[lang])
+        label: t(LANGUAGE_LABEL_KEYS[lang]),
       })),
     [t]
   );
@@ -126,9 +141,8 @@ export function LoginPage() {
           setRememberPassword(storedRememberPassword || Boolean(storedKey));
         }
       } finally {
-        if (!autoLoginSuccess) {
-          setAutoLoading(false);
-        }
+        // 自动登录成功时 showSplash 仍由 autoLoginSuccess 维持，可无条件结束 loading
+        setAutoLoading(false);
       }
     };
 
@@ -149,7 +163,7 @@ export function LoginPage() {
       await login({
         apiBase: baseToUse,
         managementKey: managementKey.trim(),
-        rememberPassword
+        rememberPassword,
       });
       showNotification(t('common.connected_status'), 'success');
       navigate('/', { replace: true });
@@ -160,7 +174,16 @@ export function LoginPage() {
     } finally {
       setLoading(false);
     }
-  }, [apiBase, detectedBase, login, managementKey, navigate, rememberPassword, showNotification, t]);
+  }, [
+    apiBase,
+    detectedBase,
+    login,
+    managementKey,
+    navigate,
+    rememberPassword,
+    showNotification,
+    t,
+  ]);
 
   const handleSubmitKeyDown = useCallback(
     (event: React.KeyboardEvent) => {
@@ -257,6 +280,8 @@ export function LoginPage() {
                 label={t('login.management_key_label')}
                 placeholder={t('login.management_key_placeholder')}
                 type={showKey ? 'text' : 'password'}
+                name="cpa-management-key"
+                autoComplete="current-password"
                 value={managementKey}
                 onChange={(e) => setManagementKey(e.target.value)}
                 onKeyDown={handleSubmitKeyDown}

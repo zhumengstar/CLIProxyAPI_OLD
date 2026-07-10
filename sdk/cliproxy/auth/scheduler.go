@@ -38,13 +38,15 @@ type authScheduler struct {
 	providers     map[string]*providerScheduler
 	authProviders map[string]string
 	mixedCursors  map[string]int
+	manualRouting manualWeeklyRoutingState
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
 type providerScheduler struct {
-	providerKey string
-	auths       map[string]*scheduledAuthMeta
-	modelShards map[string]*modelScheduler
+	providerKey   string
+	auths         map[string]*scheduledAuthMeta
+	modelShards   map[string]*modelScheduler
+	manualRouting *manualWeeklyRoutingState
 }
 
 // scheduledAuthMeta stores the immutable scheduling fields derived from an auth snapshot.
@@ -63,6 +65,8 @@ type modelScheduler struct {
 	priorityOrder   []int
 	readyByPriority map[int]*readyBucket
 	blocked         cooldownQueue
+	providerKey     string
+	manualRouting   *manualWeeklyRoutingState
 }
 
 // scheduledAuth stores the runtime scheduling state for a single auth inside a model shard.
@@ -527,9 +531,10 @@ func (s *authScheduler) ensureProviderLocked(providerKey string) *providerSchedu
 	providerState := s.providers[providerKey]
 	if providerState == nil {
 		providerState = &providerScheduler{
-			providerKey: providerKey,
-			auths:       make(map[string]*scheduledAuthMeta),
-			modelShards: make(map[string]*modelScheduler),
+			providerKey:   providerKey,
+			auths:         make(map[string]*scheduledAuthMeta),
+			modelShards:   make(map[string]*modelScheduler),
+			manualRouting: &s.manualRouting,
 		}
 		s.providers[providerKey] = providerState
 	}
@@ -617,6 +622,8 @@ func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *m
 		modelKey:        modelKey,
 		entries:         make(map[string]*scheduledAuth),
 		readyByPriority: make(map[int]*readyBucket),
+		providerKey:     p.providerKey,
+		manualRouting:   p.manualRouting,
 	}
 	for _, meta := range p.auths {
 		if meta == nil || !meta.supportsModel(modelKey) {
@@ -735,7 +742,20 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if m == nil {
 		return nil
 	}
-	m.promoteExpiredLocked(time.Now())
+	now := time.Now()
+	m.promoteExpiredLocked(now)
+	if m.manualRouting != nil {
+		manualEntries := make([]*scheduledAuth, 0, len(m.entries))
+		for _, entry := range m.entries {
+			if entry != nil && entry.state == scheduledStateReady {
+				manualEntries = append(manualEntries, entry)
+			}
+		}
+		if picked := m.manualRouting.pick(manualEntries, predicate, now, m.modelKey, m.providerKey); picked != nil {
+			return picked.auth
+		}
+	}
+	predicate = fiveHourQuotaEligiblePredicate(predicate, now, m.modelKey)
 	priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocket, predicate)
 	if !okPriority {
 		return nil
@@ -789,9 +809,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		view = &bucket.ws
 	}
 	now := time.Now()
-	if hasWeeklyPreferredEntry(view.flat, predicate, now) {
-		predicate = weeklyPreferredPredicate(predicate, now)
-	}
+	predicate = weightedWeeklyPreferredPredicate(view.flat, predicate, now, m.modelKey)
 	var picked *scheduledAuth
 	if strategy == schedulerStrategyFillFirst {
 		picked = view.pickFirst(predicate)

@@ -6,6 +6,7 @@ import axios from 'axios';
 import { normalizeModelList } from '@/utils/models';
 import { normalizeApiBase } from '@/utils/connection';
 import { apiCallApi, getApiCallErrorMessage } from './apiCall';
+import { isRecord } from '@/utils/helpers';
 
 const DEFAULT_CLAUDE_BASE_URL = 'https://api.anthropic.com';
 const DEFAULT_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com';
@@ -13,15 +14,16 @@ const DEFAULT_ANTHROPIC_VERSION = '2023-06-01';
 const CLAUDE_MODELS_IN_FLIGHT = new Map<string, Promise<ReturnType<typeof normalizeModelList>>>();
 const GEMINI_MODELS_IN_FLIGHT = new Map<string, Promise<ReturnType<typeof normalizeModelList>>>();
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  value !== null && typeof value === 'object' && !Array.isArray(value);
-
-const buildRequestSignature = (url: string, headers: Record<string, string>) => {
+const buildRequestSignature = (
+  url: string,
+  headers: Record<string, string>,
+  authIndex?: string
+) => {
   const headerSignature = Object.entries(headers)
     .sort(([a], [b]) => a.toLowerCase().localeCompare(b.toLowerCase()))
     .map(([key, value]) => `${key}:${value}`)
     .join('|');
-  return `${url}||${headerSignature}`;
+  return `${url}||${headerSignature}||auth=${authIndex ?? ''}`;
 };
 
 const buildModelsEndpoint = (baseUrl: string): string => {
@@ -95,7 +97,7 @@ export const modelsApi = {
     }
 
     const response = await axios.get(endpoint, {
-      headers: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined
+      headers: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined,
     });
     const payload = response.data?.data ?? response.data?.models ?? response.data;
     return normalizeModelList(payload, { dedupe: true });
@@ -108,22 +110,27 @@ export const modelsApi = {
   async fetchV1ModelsViaApiCall(
     baseUrl: string,
     apiKey?: string,
-    headers: Record<string, string> = {}
+    headers: Record<string, string> = {},
+    authIndex?: string
   ) {
     const endpoint = buildV1ModelsEndpoint(baseUrl);
     if (!endpoint) {
       throw new Error('Invalid base url');
     }
 
+    const trimmedAuthIndex = authIndex?.trim() || undefined;
     const resolvedHeaders = { ...headers };
     if (apiKey && !hasHeader(resolvedHeaders, 'authorization')) {
       resolvedHeaders.Authorization = `Bearer ${apiKey}`;
+    } else if (trimmedAuthIndex && !hasHeader(resolvedHeaders, 'authorization')) {
+      resolvedHeaders.Authorization = 'Bearer $TOKEN$';
     }
 
     const result = await apiCallApi.request({
+      authIndex: trimmedAuthIndex,
       method: 'GET',
       url: endpoint,
-      header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined
+      header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined,
     });
 
     if (result.statusCode < 200 || result.statusCode >= 300) {
@@ -140,22 +147,27 @@ export const modelsApi = {
   async fetchModelsViaApiCall(
     baseUrl: string,
     apiKey?: string,
-    headers: Record<string, string> = {}
+    headers: Record<string, string> = {},
+    authIndex?: string
   ) {
     const endpoint = buildModelsEndpoint(baseUrl);
     if (!endpoint) {
       throw new Error('Invalid base url');
     }
 
+    const trimmedAuthIndex = authIndex?.trim() || undefined;
     const resolvedHeaders = { ...headers };
     if (apiKey && !hasHeader(resolvedHeaders, 'authorization')) {
       resolvedHeaders.Authorization = `Bearer ${apiKey}`;
+    } else if (trimmedAuthIndex && !hasHeader(resolvedHeaders, 'authorization')) {
+      resolvedHeaders.Authorization = 'Bearer $TOKEN$';
     }
 
     const result = await apiCallApi.request({
+      authIndex: trimmedAuthIndex,
       method: 'GET',
       url: endpoint,
-      header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined
+      header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined,
     });
 
     if (result.statusCode < 200 || result.statusCode >= 300) {
@@ -166,18 +178,6 @@ export const modelsApi = {
     return normalizeModelList(payload, { dedupe: true });
   },
 
-  buildV1ModelsEndpoint(baseUrl: string) {
-    return buildV1ModelsEndpoint(baseUrl);
-  },
-
-  buildClaudeModelsEndpoint(baseUrl: string) {
-    return buildClaudeModelsEndpoint(baseUrl);
-  },
-
-  buildGeminiModelsEndpoint(baseUrl: string) {
-    return buildGeminiModelsEndpoint(baseUrl);
-  },
-
   /**
    * Fetch Claude models from /v1/models via api-call.
    * Anthropic requires `x-api-key` and `anthropic-version` headers.
@@ -185,13 +185,15 @@ export const modelsApi = {
   async fetchClaudeModelsViaApiCall(
     baseUrl: string,
     apiKey?: string,
-    headers: Record<string, string> = {}
+    headers: Record<string, string> = {},
+    authIndex?: string
   ) {
     const endpoint = buildClaudeModelsEndpoint(baseUrl);
     if (!endpoint) {
       throw new Error('Invalid base url');
     }
 
+    const trimmedAuthIndex = authIndex?.trim() || undefined;
     const resolvedHeaders = { ...headers };
     let resolvedApiKey = String(apiKey ?? '').trim();
     if (!resolvedApiKey && !hasHeader(resolvedHeaders, 'x-api-key')) {
@@ -200,20 +202,23 @@ export const modelsApi = {
 
     if (resolvedApiKey && !hasHeader(resolvedHeaders, 'x-api-key')) {
       resolvedHeaders['x-api-key'] = resolvedApiKey;
+    } else if (trimmedAuthIndex && !hasHeader(resolvedHeaders, 'x-api-key')) {
+      resolvedHeaders['x-api-key'] = '$TOKEN$';
     }
     if (!hasHeader(resolvedHeaders, 'anthropic-version')) {
       resolvedHeaders['anthropic-version'] = DEFAULT_ANTHROPIC_VERSION;
     }
 
-    const signature = buildRequestSignature(endpoint, resolvedHeaders);
+    const signature = buildRequestSignature(endpoint, resolvedHeaders, trimmedAuthIndex);
     const existing = CLAUDE_MODELS_IN_FLIGHT.get(signature);
     if (existing) return existing;
 
     const request = (async () => {
       const result = await apiCallApi.request({
+        authIndex: trimmedAuthIndex,
         method: 'GET',
         url: endpoint,
-        header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined
+        header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined,
       });
 
       if (result.statusCode < 200 || result.statusCode >= 300) {
@@ -239,20 +244,24 @@ export const modelsApi = {
   async fetchGeminiModelsViaApiCall(
     baseUrl: string,
     apiKey?: string,
-    headers: Record<string, string> = {}
+    headers: Record<string, string> = {},
+    authIndex?: string
   ) {
     const endpoint = buildGeminiModelsEndpoint(baseUrl);
     if (!endpoint) {
       throw new Error('Invalid base url');
     }
 
+    const trimmedAuthIndex = authIndex?.trim() || undefined;
     const resolvedHeaders = { ...headers };
     const resolvedApiKey = String(apiKey ?? '').trim();
     if (resolvedApiKey && !hasHeader(resolvedHeaders, 'x-goog-api-key')) {
       resolvedHeaders['x-goog-api-key'] = resolvedApiKey;
+    } else if (trimmedAuthIndex && !hasHeader(resolvedHeaders, 'x-goog-api-key')) {
+      resolvedHeaders['x-goog-api-key'] = '$TOKEN$';
     }
 
-    const signature = buildRequestSignature(endpoint, resolvedHeaders);
+    const signature = buildRequestSignature(endpoint, resolvedHeaders, trimmedAuthIndex);
     const existing = GEMINI_MODELS_IN_FLIGHT.get(signature);
     if (existing) return existing;
 
@@ -268,9 +277,10 @@ export const modelsApi = {
         }
 
         const result = await apiCallApi.request({
+          authIndex: trimmedAuthIndex,
           method: 'GET',
           url: url.toString(),
-          header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined
+          header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined,
         });
 
         if (result.statusCode < 200 || result.statusCode >= 300) {
@@ -292,7 +302,9 @@ export const modelsApi = {
         });
 
         const nextToken =
-          isRecord(payload) && typeof payload.nextPageToken === 'string' ? payload.nextPageToken : '';
+          isRecord(payload) && typeof payload.nextPageToken === 'string'
+            ? payload.nextPageToken
+            : '';
         if (!nextToken) {
           break;
         }

@@ -124,6 +124,64 @@ func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_ManualPriorityOverridesConfiguredPriorityAndFallsBackDuringCadence(t *testing.T) {
+	resetWeeklyQuotaPreferences(t)
+	const model = "gemini-3-pro"
+	low := &Auth{ID: "manual-low-priority", Provider: "antigravity", Attributes: map[string]string{"priority": "0"}}
+	high := &Auth{ID: "ordinary-high-priority", Provider: "antigravity", Attributes: map[string]string{"priority": "10"}}
+	registerSchedulerModels(t, "antigravity", model, low.ID, high.ID)
+	now := time.Now()
+	ReplaceWeeklyQuotaSnapshots(low.ID, map[string]WeeklyQuotaSnapshotUpdate{
+		"gemini": {ResetAt: now.Add(12 * time.Hour), RemainingPercent: 80},
+	})
+	ReplaceWeeklyQuotaSnapshots(high.ID, map[string]WeeklyQuotaSnapshotUpdate{
+		"gemini": {ResetAt: now.Add(12 * time.Hour), RemainingPercent: 80},
+	})
+	SetManualWeeklyPriority(low.ID, true)
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, low, high)
+
+	first, err := scheduler.pickSingle(context.Background(), "antigravity", model, cliproxyexecutor.Options{}, nil)
+	if err != nil || first == nil || first.ID != low.ID {
+		t.Fatalf("first pick = %#v, %v; want manually pinned %q", first, err, low.ID)
+	}
+	second, err := scheduler.pickSingle(context.Background(), "antigravity", model, cliproxyexecutor.Options{}, nil)
+	if err != nil || second == nil || second.ID != high.ID {
+		t.Fatalf("second pick = %#v, %v; want ordinary fallback %q during cadence", second, err, high.ID)
+	}
+}
+
+func TestSchedulerPick_UsesRefreshedWeeklyPoolsWithoutRebuild(t *testing.T) {
+	resetWeeklyQuotaPreferences(t)
+	const model = "gemini-3-pro"
+	firstPool := &Auth{ID: "cached-pool-a", Provider: "antigravity"}
+	secondPool := &Auth{ID: "cached-pool-b", Provider: "antigravity"}
+	registerSchedulerModels(t, "antigravity", model, firstPool.ID, secondPool.ID)
+	now := time.Now()
+	ReplaceWeeklyQuotaSnapshots(firstPool.ID, map[string]WeeklyQuotaSnapshotUpdate{
+		"gemini": {ResetAt: now.Add(12 * time.Hour), RemainingPercent: 80},
+	})
+	ReplaceWeeklyQuotaSnapshots(secondPool.ID, map[string]WeeklyQuotaSnapshotUpdate{
+		"gemini": {ResetAt: now.Add(96 * time.Hour), RemainingPercent: 80},
+	})
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, firstPool, secondPool)
+
+	first, err := scheduler.pickSingle(context.Background(), "antigravity", model, cliproxyexecutor.Options{}, nil)
+	if err != nil || first == nil || first.ID != firstPool.ID {
+		t.Fatalf("first pick = %#v, %v; want current urgent pool %q", first, err, firstPool.ID)
+	}
+
+	ReplaceWeeklyQuotaSnapshots(firstPool.ID, map[string]WeeklyQuotaSnapshotUpdate{
+		"gemini": {ResetAt: now.Add(96 * time.Hour), RemainingPercent: 80},
+	})
+	ReplaceWeeklyQuotaSnapshots(secondPool.ID, map[string]WeeklyQuotaSnapshotUpdate{
+		"gemini": {ResetAt: now.Add(12 * time.Hour), RemainingPercent: 80},
+	})
+	second, err := scheduler.pickSingle(context.Background(), "antigravity", model, cliproxyexecutor.Options{}, nil)
+	if err != nil || second == nil || second.ID != secondPool.ID {
+		t.Fatalf("pick after quota refresh = %#v, %v; want new urgent pool %q without rebuilding scheduler", second, err, secondPool.ID)
+	}
+}
+
 func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	t.Parallel()
 

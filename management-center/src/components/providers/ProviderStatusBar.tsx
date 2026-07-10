@@ -1,16 +1,17 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { StatusBarData, StatusBlockDetail } from '@/utils/recentRequests';
-import defaultStyles from '@/pages/AiProvidersPage.module.scss';
+
+const defaultStyles: Record<string, string> = {};
 
 /**
  * 根据成功率 (0–1) 在三个色标之间做 RGB 线性插值
  * 0 → 红 (#ef4444)  →  0.5 → 金黄 (#facc15)  →  1 → 绿 (#22c55e)
  */
 const COLOR_STOPS = [
-  { r: 239, g: 68, b: 68 },   // #ef4444
-  { r: 250, g: 204, b: 21 },  // #facc15
-  { r: 34, g: 197, b: 94 },   // #22c55e
+  { r: 239, g: 68, b: 68 }, // #ef4444
+  { r: 250, g: 204, b: 21 }, // #facc15
+  { r: 34, g: 197, b: 94 }, // #22c55e
 ] as const;
 
 function rateToColor(rate: number): string {
@@ -106,8 +107,12 @@ export function ProviderStatusBar({ statusData, styles: stylesProp }: ProviderSt
         <span className={s.tooltipTime}>{timeRange}</span>
         {total > 0 ? (
           <span className={s.tooltipStats}>
-            <span className={s.tooltipSuccess}>{t('status_bar.success_short')} {detail.success}</span>
-            <span className={s.tooltipFailure}>{t('status_bar.failure_short')} {detail.failure}</span>
+            <span className={s.tooltipSuccess}>
+              {t('status_bar.success_short')} {detail.success}
+            </span>
+            <span className={s.tooltipFailure}>
+              {t('status_bar.failure_short')} {detail.failure}
+            </span>
             <span className={s.tooltipRate}>({(detail.rate * 100).toFixed(1)}%)</span>
           </span>
         ) : (

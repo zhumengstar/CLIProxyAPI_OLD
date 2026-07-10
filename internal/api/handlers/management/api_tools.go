@@ -194,12 +194,205 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
+	observeAntigravityQuotaSnapshotFromAPICall(auth, urlStr, resp.StatusCode, respBody)
+	if errPersist := h.persistAntigravityQuotaSnapshotFromAPICall(auth, urlStr, resp.StatusCode, respBody); errPersist != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist antigravity quota: " + errPersist.Error()})
+		return
+	}
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+type antigravityAvailableModelsResponse struct {
+	Groups []antigravityAvailableModelsGroup `json:"groups"`
+	Models json.RawMessage                   `json:"models"`
+}
+
+type antigravityAvailableModelsGroup struct {
+	ID               string                             `json:"id"`
+	Label            string                             `json:"label"`
+	DisplayName      string                             `json:"displayName"`
+	DisplayNameSnake string                             `json:"display_name"`
+	Description      string                             `json:"description"`
+	Buckets          []antigravityAvailableModelsBucket `json:"buckets"`
+}
+
+type antigravityAvailableModelsBucket struct {
+	ID                     string   `json:"id"`
+	BucketID               string   `json:"bucketId"`
+	BucketIDSnake          string   `json:"bucket_id"`
+	Label                  string   `json:"label"`
+	DisplayName            string   `json:"displayName"`
+	DisplayNameSnake       string   `json:"display_name"`
+	Window                 string   `json:"window"`
+	RemainingFraction      *float64 `json:"remainingFraction"`
+	RemainingFractionSnake *float64 `json:"remaining_fraction"`
+	ResetTime              string   `json:"resetTime"`
+	ResetTimeSnake         string   `json:"reset_time"`
+	Description            string   `json:"description"`
+}
+
+type antigravityAvailableModelEntry struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	DisplayName   string `json:"displayName"`
+	DisplayNameV1 string `json:"display_name"`
+	Model         string `json:"model"`
+	APIProvider   string `json:"apiProvider"`
+	ModelProvider string `json:"modelProvider"`
+	QuotaInfo     *struct {
+		RemainingFraction *float64 `json:"remainingFraction"`
+		ResetTime         string   `json:"resetTime"`
+	} `json:"quotaInfo"`
+}
+
+func observeAntigravityQuotaSnapshotFromAPICall(auth *coreauth.Auth, urlStr string, statusCode int, body []byte) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+		return
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices || len(body) == 0 {
+		return
+	}
+	parsedURL, errParse := url.Parse(urlStr)
+	if errParse != nil {
+		return
+	}
+	path := strings.ToLower(parsedURL.Path)
+	if !strings.Contains(path, "fetchavailablemodels") && !strings.Contains(path, "retrieveuserquotasummary") {
+		return
+	}
+
+	var payload antigravityAvailableModelsResponse
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
+		log.WithError(errUnmarshal).Debug("failed to parse antigravity quota snapshot")
+		return
+	}
+
+	now := time.Now()
+	observed := 0
+	for _, group := range payload.Groups {
+		family := antigravityQuotaFamily(group.ID + " " + antigravityQuotaDisplayName(group.Label, group.DisplayName, group.DisplayNameSnake))
+		for _, bucket := range group.Buckets {
+			remainingFraction := bucketRemainingFraction(bucket)
+			resetTime := bucketResetTime(bucket)
+			if remainingFraction == nil || resetTime == "" {
+				continue
+			}
+			resetAt, ok := parseAntigravityResetTime(resetTime)
+			if !ok || !resetAt.After(now) {
+				continue
+			}
+			bucketName := antigravityQuotaDisplayName(bucket.ID, bucket.BucketID, bucket.BucketIDSnake, bucket.Label, bucket.DisplayName, bucket.DisplayNameSnake, bucket.Window)
+			if !isAntigravityWeeklyQuota(bucketName, resetAt, now) {
+				continue
+			}
+			if coreauth.ObserveWeeklyQuotaSnapshot(auth.ID, family, resetAt, *remainingFraction*100) {
+				observed++
+			}
+		}
+	}
+
+	for _, model := range antigravityAvailableModels(payload.Models) {
+		if model.QuotaInfo == nil || model.QuotaInfo.RemainingFraction == nil || model.QuotaInfo.ResetTime == "" {
+			continue
+		}
+		resetAt, ok := parseAntigravityResetTime(model.QuotaInfo.ResetTime)
+		if !ok || !resetAt.After(now) || resetAt.Sub(now) < 24*time.Hour {
+			continue
+		}
+		family := antigravityQuotaFamily(model.ID + " " + model.Name + " " + model.Model)
+		if coreauth.ObserveWeeklyQuotaSnapshot(auth.ID, family, resetAt, *model.QuotaInfo.RemainingFraction*100) {
+			observed++
+		}
+	}
+
+	if observed > 0 {
+		log.WithFields(log.Fields{"auth_id": auth.ID, "count": observed}).Debug("loaded antigravity quota snapshot into routing memory")
+	}
+}
+
+func bucketRemainingFraction(bucket antigravityAvailableModelsBucket) *float64 {
+	if bucket.RemainingFraction != nil {
+		return bucket.RemainingFraction
+	}
+	return bucket.RemainingFractionSnake
+}
+
+func bucketResetTime(bucket antigravityAvailableModelsBucket) string {
+	if trimmed := strings.TrimSpace(bucket.ResetTime); trimmed != "" {
+		return trimmed
+	}
+	return strings.TrimSpace(bucket.ResetTimeSnake)
+}
+
+func antigravityQuotaDisplayName(values ...string) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func antigravityAvailableModels(raw json.RawMessage) []antigravityAvailableModelEntry {
+	if len(raw) == 0 {
+		return nil
+	}
+	var list []antigravityAvailableModelEntry
+	if err := json.Unmarshal(raw, &list); err == nil {
+		return list
+	}
+	var byID map[string]antigravityAvailableModelEntry
+	if err := json.Unmarshal(raw, &byID); err != nil {
+		return nil
+	}
+	list = make([]antigravityAvailableModelEntry, 0, len(byID))
+	for id, model := range byID {
+		if strings.TrimSpace(model.ID) == "" {
+			model.ID = id
+		}
+		list = append(list, model)
+	}
+	return list
+}
+
+func antigravityQuotaFamily(value string) string {
+	value = strings.ToLower(value)
+	switch {
+	case strings.Contains(value, "gemini"):
+		return "gemini"
+	case strings.Contains(value, "claude") || strings.Contains(value, "gpt"):
+		return "claude-gpt"
+	default:
+		return ""
+	}
+}
+
+func isAntigravityWeeklyQuota(value string, resetAt time.Time, now time.Time) bool {
+	value = strings.ToLower(value)
+	if strings.Contains(value, "week") || strings.Contains(value, "weekly") || strings.Contains(value, "周") {
+		return true
+	}
+	return resetAt.Sub(now) >= 24*time.Hour
+}
+
+func parseAntigravityResetTime(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		resetAt, errParse := time.Parse(layout, value)
+		if errParse == nil {
+			return resetAt, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func firstNonEmptyString(values ...*string) string {

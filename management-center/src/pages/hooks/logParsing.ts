@@ -10,11 +10,10 @@ const LOG_LATENCY_REGEX =
 const LOG_IPV4_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}\b/;
 const LOG_IPV6_REGEX = /\b(?:[a-f0-9]{0,4}:){2,7}[a-f0-9]{0,4}\b/i;
 const LOG_REQUEST_ID_REGEX = /^([a-f0-9]{8}|--------)$/i;
+const LOG_NAMED_REQUEST_ID_REGEX = /\brequest[_-]?id=([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\b/i;
 const LOG_TIME_OF_DAY_REGEX = /^\d{1,2}:\d{2}:\d{2}(?:\.\d{1,3})?$/;
 const GIN_TIMESTAMP_SEGMENT_REGEX =
   /^\[GIN\]\s+(\d{4})\/(\d{2})\/(\d{2})\s*-\s*(\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)\s*$/;
-const REQUEST_SUMMARY_FIELD_REGEX =
-  /\b(user|user_id|session_id|channel|model|type|matched_email|retry|first_byte_ms|tokens)=([^\s|]+)/g;
 
 const HTTP_STATUS_PATTERNS: RegExp[] = [
   /\|\s*([1-5]\d{2})\s*\|/,
@@ -89,6 +88,14 @@ const inferLogLevel = (line: string): LogLevel | undefined => {
   return undefined;
 };
 
+const extractNamedRequestId = (text: string): string | undefined => {
+  const match = text.match(LOG_NAMED_REQUEST_ID_REGEX);
+  if (!match) return undefined;
+  const id = match[1];
+  if (/^-+$/.test(id)) return undefined;
+  return id;
+};
+
 const extractHttpMethodAndPath = (text: string): { method?: HttpMethod; path?: string } => {
   const match = text.match(HTTP_METHOD_REGEX);
   if (!match) return {};
@@ -140,16 +147,6 @@ export const parseLogLine = (raw: string): ParsedLogLine => {
   let method: HttpMethod | undefined;
   let path: string | undefined;
   let message = remaining;
-  let user: string | undefined;
-  let userId: string | undefined;
-  let sessionId: string | undefined;
-  let channel: string | undefined;
-  let model: string | undefined;
-  let requestType: string | undefined;
-  let matchedEmail: string | undefined;
-  let retry: string | undefined;
-  let firstByteMs: string | undefined;
-  let tokens: string | undefined;
 
   if (remaining.includes('|')) {
     const segments = remaining
@@ -175,16 +172,24 @@ export const parseLogLine = (raw: string): ParsedLogLine => {
       }
     }
 
-    // request id (8-char hex or dashes)
-    const requestIdIndex = segments.findIndex((segment) => LOG_REQUEST_ID_REGEX.test(segment));
+    // request id
+    const requestIdIndex = segments.findIndex(
+      (segment) => LOG_REQUEST_ID_REGEX.test(segment) || Boolean(extractNamedRequestId(segment))
+    );
     if (requestIdIndex >= 0) {
-      const match = segments[requestIdIndex].match(LOG_REQUEST_ID_REGEX);
-      if (match) {
-        const id = match[1];
-        if (!/^-+$/.test(id)) {
-          requestId = id;
-        }
+      const namedId = extractNamedRequestId(segments[requestIdIndex]);
+      if (namedId) {
+        requestId = namedId;
         consumed.add(requestIdIndex);
+      } else {
+        const match = segments[requestIdIndex].match(LOG_REQUEST_ID_REGEX);
+        if (match) {
+          const id = match[1];
+          if (!/^-+$/.test(id)) {
+            requestId = id;
+          }
+          consumed.add(requestIdIndex);
+        }
       }
     }
 
@@ -255,6 +260,10 @@ export const parseLogLine = (raw: string): ParsedLogLine => {
     const parsed = extractHttpMethodAndPath(remaining);
     method = parsed.method;
     path = parsed.path;
+
+    if (!requestId) {
+      requestId = extractNamedRequestId(remaining);
+    }
   }
 
   if (!level) level = inferLogLevel(raw);
@@ -265,59 +274,6 @@ export const parseLogLine = (raw: string): ParsedLogLine => {
       const ginTimestamp = `${match[1]}-${match[2]}-${match[3]} ${match[4]}`;
       if (!timestamp) timestamp = ginTimestamp;
       if (normalizeTimestampToSeconds(timestamp) === normalizeTimestampToSeconds(ginTimestamp)) {
-        message = '';
-      }
-    }
-  }
-
-  if (message) {
-    const consumed = new Set<string>();
-    for (const match of message.matchAll(REQUEST_SUMMARY_FIELD_REGEX)) {
-      const key = match[1];
-      const value = match[2];
-      switch (key) {
-        case 'user':
-          user = value;
-          break;
-        case 'user_id':
-          userId = value;
-          break;
-        case 'session_id':
-          sessionId = value;
-          break;
-        case 'channel':
-          channel = value;
-          break;
-        case 'model':
-          model = value;
-          break;
-        case 'type':
-          requestType = value;
-          break;
-        case 'matched_email':
-          matchedEmail = value;
-          break;
-        case 'retry':
-          retry = value;
-          break;
-        case 'first_byte_ms':
-          firstByteMs = value;
-          break;
-        case 'tokens':
-          tokens = value;
-          break;
-        default:
-          break;
-      }
-      consumed.add(match[0]);
-    }
-    if (consumed.size > 0) {
-      let cleanedMessage = message;
-      for (const token of consumed) {
-        cleanedMessage = cleanedMessage.replace(token, ' ');
-      }
-      message = cleanedMessage.replace(/\s+/g, ' ').replace(/\s+\|/g, ' |').trim();
-      if (message === '|') {
         message = '';
       }
     }
@@ -334,17 +290,6 @@ export const parseLogLine = (raw: string): ParsedLogLine => {
     ip,
     method,
     path,
-    user,
-    userId,
-    sessionId,
-    channel,
-    model,
-    requestType,
-    matchedEmail,
-    retry,
-    firstByteMs,
-    tokens,
     message,
   };
 };
-

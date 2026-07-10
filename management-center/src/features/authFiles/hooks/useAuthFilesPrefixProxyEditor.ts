@@ -3,25 +3,32 @@ import { useTranslation } from 'react-i18next';
 import { authFilesApi, type AuthFileFieldsPatch } from '@/services/api';
 import type { AuthFileItem } from '@/types';
 import { useNotificationStore } from '@/stores';
-import { parsePriorityValue } from '@/features/authFiles/constants';
+import {
+  applyAuthFileWebsockets,
+  normalizeProviderKey,
+  parsePriorityValue,
+  readAuthFileWebsockets,
+  supportsAuthFileWebsockets,
+} from '@/features/authFiles/constants';
 
 type AuthFileHeaders = Record<string, string>;
 type AuthFileHeadersErrorKey =
   | 'auth_files.headers_invalid_json'
   | 'auth_files.headers_invalid_object'
   | 'auth_files.headers_invalid_value';
+type AuthFileContentErrorKey =
+  | 'auth_files.prefix_proxy_invalid_json'
+  | 'auth_files.prefix_proxy_html_challenge';
 
 export type PrefixProxyEditorField =
   | 'prefix'
   | 'proxyUrl'
   | 'priority'
-  | 'accountCost'
-  | 'accountStartedAt'
-  | 'sourceChannel'
+  | 'websockets'
   | 'note'
   | 'headersText';
 
-export type PrefixProxyEditorFieldValue = string;
+export type PrefixProxyEditorFieldValue = string | boolean;
 
 export type PrefixProxyEditorState = {
   fileName: string;
@@ -31,17 +38,15 @@ export type PrefixProxyEditorState = {
   error: string | null;
   originalText: string;
   rawText: string;
+  invalidContentPreview: string;
   json: Record<string, unknown> | null;
+  providerKey: string;
   prefix: string;
   proxyUrl: string;
   priority: string;
-  accountCost: string;
-  accountStartedAt: string;
-  sourceChannel: string;
+  websockets: boolean;
+  websocketsTouched: boolean;
   note: string;
-  accountCostTouched: boolean;
-  accountStartedAtTouched: boolean;
-  sourceChannelTouched: boolean;
   noteTouched: boolean;
   headersText: string;
   headersTouched: boolean;
@@ -104,18 +109,45 @@ const parseHeadersText = (
 const normalizeTextField = (value: unknown): string =>
   typeof value === 'string' ? value.trim() : '';
 
-const normalizeNumberTextField = (value: unknown): string => {
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-  if (typeof value === 'string') return value.trim();
-  return '';
+const INVALID_CONTENT_PREVIEW_LIMIT = 1000;
+
+const buildInvalidContentPreview = (text: string): string => {
+  const trimmed = text.trim();
+  if (!trimmed) return '';
+  if (trimmed.length <= INVALID_CONTENT_PREVIEW_LIMIT) return trimmed;
+  return `${trimmed.slice(0, INVALID_CONTENT_PREVIEW_LIMIT)}\n...`;
 };
 
-const parseAccountCostValue = (value: string): number | undefined => {
-  const trimmed = value.trim();
-  if (!trimmed) return 0;
-  const parsed = Number(trimmed);
-  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
-  return parsed;
+const buildInvalidAuthFileContentState = (
+  text: string,
+  resolveError: (key: AuthFileContentErrorKey) => string
+): Pick<
+  PrefixProxyEditorState,
+  'loading' | 'error' | 'rawText' | 'originalText' | 'invalidContentPreview'
+> => ({
+  loading: false,
+  error: resolveError(getAuthFileContentErrorKey(text)),
+  rawText: text,
+  originalText: text,
+  invalidContentPreview: buildInvalidContentPreview(text),
+});
+
+const getAuthFileContentErrorKey = (text: string): AuthFileContentErrorKey => {
+  const head = text.trimStart().slice(0, 4096).toLowerCase();
+  const looksLikeHtml =
+    head.startsWith('<!doctype html') ||
+    head.startsWith('<html') ||
+    head.includes('<head') ||
+    head.includes('<body');
+  const looksLikeChallenge =
+    head.includes('cf_chl') ||
+    head.includes('__cf_chl_tk') ||
+    head.includes('challenge-platform') ||
+    head.includes('cloudflare');
+
+  return looksLikeHtml || looksLikeChallenge
+    ? 'auth_files.prefix_proxy_html_challenge'
+    : 'auth_files.prefix_proxy_invalid_json';
 };
 
 const hasKeys = (value: Record<string, unknown> | AuthFileFieldsPatch | null): boolean =>
@@ -217,14 +249,6 @@ const buildAuthFileFieldsPatch = (
     }
   }
 
-  if (editor.sourceChannelTouched) {
-    const originalSourceChannel = normalizeTextField(original.source_channel ?? original.sourceChannel);
-    const nextSourceChannel = editor.sourceChannel.trim();
-    if (nextSourceChannel !== originalSourceChannel) {
-      patch.source_channel = nextSourceChannel;
-    }
-  }
-
   if (editor.noteTouched) {
     const originalNote = normalizeTextField(original.note);
     const nextNote = editor.note.trim();
@@ -233,19 +257,11 @@ const buildAuthFileFieldsPatch = (
     }
   }
 
-  if (editor.accountCostTouched) {
-    const originalAccountCost = parseAccountCostValue(normalizeNumberTextField(original.account_cost));
-    const nextAccountCost = parseAccountCostValue(editor.accountCost);
-    if (nextAccountCost !== undefined && nextAccountCost !== (originalAccountCost ?? 0)) {
-      patch.account_cost = nextAccountCost;
-    }
-  }
-
-  if (editor.accountStartedAtTouched) {
-    const originalAccountStartedAt = normalizeTextField(original.account_started_at);
-    const nextAccountStartedAt = editor.accountStartedAt.trim();
-    if (nextAccountStartedAt !== originalAccountStartedAt) {
-      patch.account_started_at = nextAccountStartedAt;
+  if (supportsAuthFileWebsockets(editor.providerKey) && editor.websocketsTouched) {
+    const originalWebsockets = readAuthFileWebsockets(original);
+    const nextWebsockets = Boolean(editor.websockets);
+    if (nextWebsockets !== originalWebsockets) {
+      patch.websockets = nextWebsockets;
     }
   }
 
@@ -272,7 +288,7 @@ const buildPrefixProxyUpdatedText = (
 ): string => {
   if (!editor?.json) return editor?.rawText ?? '';
   const patch = buildAuthFileFieldsPatch(editor, resolveHeadersError);
-  const next: Record<string, unknown> = { ...editor.json };
+  let next: Record<string, unknown> = { ...editor.json };
   if (patch.prefix !== undefined) {
     if (patch.prefix) {
       next.prefix = patch.prefix;
@@ -304,31 +320,11 @@ const buildPrefixProxyUpdatedText = (
     }
   }
 
-  if (patch.account_cost !== undefined) {
-    if (patch.account_cost > 0) {
-      next.account_cost = patch.account_cost;
-    } else {
-      delete next.account_cost;
-    }
-  }
-
-  if (patch.account_started_at !== undefined) {
-    if (patch.account_started_at) {
-      next.account_started_at = patch.account_started_at;
-    } else {
-      delete next.account_started_at;
-    }
-  }
-
-  if (patch.source_channel !== undefined) {
-    if (patch.source_channel) {
-      next.source_channel = patch.source_channel;
-    } else {
-      delete next.source_channel;
-    }
-  }
-
   applyHeadersPatch(next, patch.headers);
+
+  if (patch.websockets !== undefined) {
+    next = applyAuthFileWebsockets(next, patch.websockets);
+  }
 
   return JSON.stringify(next);
 };
@@ -346,7 +342,7 @@ export function useAuthFilesPrefixProxyEditor(
     prefixProxyEditor?.headersTouched && prefixProxyEditor.headersError
   );
   const prefixProxyUpdatedText =
-    prefixProxyEditor?.json && !hasBlockingValidationError
+    prefixProxyEditor && !hasBlockingValidationError
       ? buildPrefixProxyUpdatedText(prefixProxyEditor, (key) => t(key))
       : '';
 
@@ -363,6 +359,7 @@ export function useAuthFilesPrefixProxyEditor(
 
   const openPrefixProxyEditor = async (file: AuthFileItem) => {
     const name = file.name;
+    const fileProviderKey = normalizeProviderKey(String(file.type ?? file.provider ?? ''));
 
     if (disableControls) return;
     if (prefixProxyEditor?.fileName === name) {
@@ -378,17 +375,15 @@ export function useAuthFilesPrefixProxyEditor(
       error: null,
       originalText: '',
       rawText: '',
+      invalidContentPreview: '',
       json: null,
+      providerKey: fileProviderKey,
       prefix: '',
       proxyUrl: '',
       priority: '',
-      accountCost: '',
-      accountStartedAt: '',
-      sourceChannel: '',
+      websockets: false,
+      websocketsTouched: false,
       note: '',
-      accountCostTouched: false,
-      accountStartedAtTouched: false,
-      sourceChannelTouched: false,
       noteTouched: false,
       headersText: '',
       headersTouched: false,
@@ -407,10 +402,7 @@ export function useAuthFilesPrefixProxyEditor(
           if (!prev || prev.fileName !== name) return prev;
           return {
             ...prev,
-            loading: false,
-            error: t('auth_files.prefix_proxy_invalid_json'),
-            rawText: trimmed,
-            originalText: trimmed,
+            ...buildInvalidAuthFileContentState(rawText, (key) => t(key)),
           };
         });
         return;
@@ -421,10 +413,7 @@ export function useAuthFilesPrefixProxyEditor(
           if (!prev || prev.fileName !== name) return prev;
           return {
             ...prev,
-            loading: false,
-            error: t('auth_files.prefix_proxy_invalid_json'),
-            rawText: trimmed,
-            originalText: trimmed,
+            ...buildInvalidAuthFileContentState(rawText, (key) => t(key)),
           };
         });
         return;
@@ -432,12 +421,15 @@ export function useAuthFilesPrefixProxyEditor(
 
       const json = { ...(parsed as Record<string, unknown>) };
       const originalText = JSON.stringify(json);
+      const providerKey = normalizeProviderKey(
+        String(json.type ?? json.provider ?? file.type ?? file.provider ?? '')
+      );
       const prefix = typeof json.prefix === 'string' ? json.prefix : '';
       const proxyUrl = typeof json.proxy_url === 'string' ? json.proxy_url : '';
       const priority = parsePriorityValue(json.priority);
-      const accountCost = normalizeNumberTextField(json.account_cost);
-      const accountStartedAt = normalizeTextField(json.account_started_at);
-      const sourceChannel = normalizeTextField(json.source_channel);
+      const websockets = supportsAuthFileWebsockets(providerKey)
+        ? readAuthFileWebsockets(json)
+        : false;
       const note = typeof json.note === 'string' ? json.note : '';
       const headers = json.headers;
       let headersText = '';
@@ -455,17 +447,15 @@ export function useAuthFilesPrefixProxyEditor(
           loading: false,
           originalText,
           rawText: originalText,
+          invalidContentPreview: '',
           json,
+          providerKey,
           prefix,
           proxyUrl,
           priority: priority !== undefined ? String(priority) : '',
-          accountCost,
-          accountStartedAt,
-          sourceChannel,
+          websockets,
+          websocketsTouched: false,
           note,
-          accountCostTouched: false,
-          accountStartedAtTouched: false,
-          sourceChannelTouched: false,
           noteTouched: false,
           headersText,
           headersTouched: false,
@@ -492,9 +482,9 @@ export function useAuthFilesPrefixProxyEditor(
       if (field === 'prefix') return { ...prev, prefix: String(value) };
       if (field === 'proxyUrl') return { ...prev, proxyUrl: String(value) };
       if (field === 'priority') return { ...prev, priority: String(value) };
-      if (field === 'accountCost') return { ...prev, accountCost: String(value), accountCostTouched: true };
-      if (field === 'accountStartedAt') return { ...prev, accountStartedAt: String(value), accountStartedAtTouched: true };
-      if (field === 'sourceChannel') return { ...prev, sourceChannel: String(value), sourceChannelTouched: true };
+      if (field === 'websockets') {
+        return { ...prev, websockets: Boolean(value), websocketsTouched: true };
+      }
       if (field === 'note') return { ...prev, note: String(value), noteTouched: true };
       if (field === 'headersText') {
         const headersText = String(value);
@@ -536,12 +526,11 @@ export function useAuthFilesPrefixProxyEditor(
       await loadFiles();
       setPrefixProxyEditor(null);
     } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : t('notification.update_failed');
-      const displayMessage = `${t('notification.update_failed')}: ${errorMessage}`;
-      showNotification(displayMessage, 'error');
+      const errorMessage = err instanceof Error ? err.message : '';
+      showNotification(`${t('notification.update_failed')}: ${errorMessage}`, 'error');
       setPrefixProxyEditor((prev) => {
         if (!prev || prev.fileName !== name) return prev;
-        return { ...prev, saving: false, error: displayMessage };
+        return { ...prev, saving: false };
       });
     }
   };

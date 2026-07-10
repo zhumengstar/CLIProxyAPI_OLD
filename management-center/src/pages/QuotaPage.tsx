@@ -5,20 +5,15 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useHeaderRefresh } from '@/hooks/useHeaderRefresh';
-import { useAuthStore, useQuotaStore } from '@/stores';
+import { useAuthStore } from '@/stores';
+import { authFilesApi } from '@/services/api';
 import {
-  antigravityQuotaStateApi,
-  authFilesApi,
-  configFileApi,
-  normalizeAntigravityQuotaStates,
-} from '@/services/api';
-import {
+  AntigravityQuotaSection,
   QuotaSection,
-  ANTIGRAVITY_CONFIG,
   CLAUDE_CONFIG,
   CODEX_CONFIG,
-  GEMINI_CLI_CONFIG,
   KIMI_CONFIG,
+  XAI_CONFIG,
 } from '@/components/quota';
 import type { AuthFileItem } from '@/types';
 import styles from './QuotaPage.module.scss';
@@ -26,23 +21,15 @@ import styles from './QuotaPage.module.scss';
 export function QuotaPage() {
   const { t } = useTranslation();
   const connectionStatus = useAuthStore((state) => state.connectionStatus);
-  const setAntigravityQuota = useQuotaStore((state) => state.setAntigravityQuota);
 
   const [files, setFiles] = useState<AuthFileItem[]>([]);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
   const disableControls = connectionStatus !== 'connected';
 
-  const loadConfig = useCallback(async () => {
-    try {
-      await configFileApi.fetchConfigYaml();
-    } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : t('notification.refresh_failed');
-      setError((prev) => prev || errorMessage);
-    }
-  }, [t]);
-
   const loadFiles = useCallback(async () => {
+    setLoading(true);
     setError('');
     try {
       const data = await authFilesApi.list();
@@ -50,34 +37,16 @@ export function QuotaPage() {
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : t('notification.refresh_failed');
       setError(errorMessage);
+    } finally {
+      setLoading(false);
     }
   }, [t]);
 
-  const loadAntigravityQuota = useCallback(async () => {
-    try {
-      const snapshot = await antigravityQuotaStateApi.get();
-      setAntigravityQuota(
-        normalizeAntigravityQuotaStates(
-          snapshot.files,
-          snapshot.quota_refreshed_at ?? snapshot.saved_at
-        )
-      );
-    } catch {
-      // Older servers may not have the state endpoint. The page remains fully usable.
-    }
-  }, [setAntigravityQuota]);
-
-  const handleHeaderRefresh = useCallback(async () => {
-    await Promise.all([loadConfig(), loadFiles()]);
-  }, [loadConfig, loadFiles]);
-
-  useHeaderRefresh(handleHeaderRefresh);
+  useHeaderRefresh(loadFiles);
 
   useEffect(() => {
-    queueMicrotask(() => {
-      void Promise.all([loadFiles(), loadConfig(), loadAntigravityQuota()]);
-    });
-  }, [loadAntigravityQuota, loadFiles, loadConfig]);
+    loadFiles();
+  }, [loadFiles]);
 
   return (
     <div className={styles.container}>
@@ -88,11 +57,36 @@ export function QuotaPage() {
 
       {error && <div className={styles.errorBox}>{error}</div>}
 
-      <QuotaSection config={CLAUDE_CONFIG} files={files} disabled={disableControls} />
-      <QuotaSection config={ANTIGRAVITY_CONFIG} files={files} disabled={disableControls} />
-      <QuotaSection config={CODEX_CONFIG} files={files} disabled={disableControls} />
-      <QuotaSection config={GEMINI_CLI_CONFIG} files={files} disabled={disableControls} />
-      <QuotaSection config={KIMI_CONFIG} files={files} disabled={disableControls} />
+      <QuotaSection
+        config={CLAUDE_CONFIG}
+        files={files}
+        loading={loading}
+        disabled={disableControls}
+      />
+      <AntigravityQuotaSection
+        files={files}
+        loading={loading}
+        disabled={disableControls}
+        onFilesChanged={loadFiles}
+      />
+      <QuotaSection
+        config={CODEX_CONFIG}
+        files={files}
+        loading={loading}
+        disabled={disableControls}
+      />
+      <QuotaSection
+        config={XAI_CONFIG}
+        files={files}
+        loading={loading}
+        disabled={disableControls}
+      />
+      <QuotaSection
+        config={KIMI_CONFIG}
+        files={files}
+        loading={loading}
+        disabled={disableControls}
+      />
     </div>
   );
 }

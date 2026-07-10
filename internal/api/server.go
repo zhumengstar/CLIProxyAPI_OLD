@@ -396,7 +396,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" || path == "/quota-batch-reset.js" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" || path == "/quota-batch-reset.js" || path == "/antigravity-quota-tools.js" {
 				c.Next()
 				return
 			}
@@ -426,6 +426,7 @@ func (s *Server) setupRoutes() {
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	s.engine.GET("/quota-batch-reset.js", s.serveManagementQuotaBatchResetScript)
+	s.engine.GET("/antigravity-quota-tools.js", s.serveManagementAntigravityQuotaToolsScript)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
@@ -725,14 +726,20 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/oauth-model-alias", s.mgmt.DeleteOAuthModelAlias)
 
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
+		mgmt.GET("/auth-files/invalid", s.mgmt.ListInvalidAuthFiles)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
+		mgmt.POST("/auth-files/export", s.mgmt.ExportAuthFiles)
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
+		mgmt.PATCH("/auth-files/manual-priority", s.mgmt.PatchAuthFileManualPriority)
 		mgmt.POST("/auth-files/reset-quota", s.mgmt.ResetQuotaBatch)
+		mgmt.GET("/antigravity-quota-state", s.mgmt.GetAntigravityQuotaState)
+		mgmt.PUT("/antigravity-quota-state", s.mgmt.PutAntigravityQuotaState)
+		mgmt.POST("/antigravity-quota-state", s.mgmt.PutAntigravityQuotaState)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
@@ -881,6 +888,14 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 }
 
 func (s *Server) serveManagementQuotaBatchResetScript(c *gin.Context) {
+	s.serveManagementStaticScript(c, "quota-batch-reset.js")
+}
+
+func (s *Server) serveManagementAntigravityQuotaToolsScript(c *gin.Context) {
+	s.serveManagementStaticScript(c, "antigravity-quota-tools.js")
+}
+
+func (s *Server) serveManagementStaticScript(c *gin.Context, fileName string) {
 	cfg := s.cfg
 	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
 		c.AbortWithStatus(http.StatusNotFound)
@@ -893,10 +908,10 @@ func (s *Server) serveManagementQuotaBatchResetScript(c *gin.Context) {
 		return
 	}
 
-	filePath := filepath.Join(staticDir, "quota-batch-reset.js")
+	filePath := filepath.Join(staticDir, fileName)
 	if _, err := os.Stat(filePath); err != nil {
 		if !os.IsNotExist(err) {
-			log.WithError(err).Error("failed to stat management quota batch reset script")
+			log.WithError(err).WithField("file", fileName).Error("failed to stat management static script")
 		}
 		c.AbortWithStatus(http.StatusNotFound)
 		return

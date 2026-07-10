@@ -22,16 +22,6 @@ export type ParsedLogLine = {
   ip?: string;
   method?: HttpMethod;
   path?: string;
-  user?: string;
-  userId?: string;
-  sessionId?: string;
-  channel?: string;
-  model?: string;
-  requestType?: string;
-  matchedEmail?: string;
-  retry?: string;
-  firstByteMs?: string;
-  tokens?: string;
   message: string;
 };
 

@@ -262,7 +262,11 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	available = preferExpiringWeeklyQuota(available, now)
+	var stickyWeekly bool
+	available, stickyWeekly = preferExpiringWeeklyQuotaWithMode(available, now, model)
+	if stickyWeekly {
+		return available[0], nil
+	}
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -300,7 +304,7 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	available = preferExpiringWeeklyQuota(available, now)
+	available = preferExpiringWeeklyQuota(available, now, model)
 	return available[0], nil
 }
 

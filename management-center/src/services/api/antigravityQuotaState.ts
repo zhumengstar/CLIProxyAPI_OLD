@@ -1,124 +1,99 @@
+import {
+  normalizeAntigravityQuotaGroups,
+  isCompleteAntigravityQuotaGroups,
+  type AntigravityEnhancedQuotaState,
+  type AntigravityPool,
+} from '@/components/quota/antigravityQuota';
 import { apiClient } from './client';
-import type { AntigravityQuotaGroup, AntigravityQuotaState } from '@/types';
 
-const endpoint = '/v0/management/antigravity-quota-state';
+export interface AntigravityQuotaStateFilePayload {
+  status?: string;
+  groups?: unknown;
+  refreshed_at?: string;
+  refreshedAt?: string;
+  account_level?: string;
+  accountLevel?: string;
+  account_tier_label?: string;
+  account_tier_name?: string;
+  account_tier_id?: string;
+  error?: string;
+  error_status?: number;
+  errorStatus?: number;
+}
 
-export type AntigravityQuotaSnapshot = {
-  files: Record<string, unknown>;
-  saved_at?: string;
+export interface AntigravityQuotaStatePayload {
+  files?: Record<string, AntigravityQuotaStateFilePayload>;
   quota_refreshed_at?: string;
+}
+
+const normalizeStatus = (value: unknown): AntigravityEnhancedQuotaState['status'] => {
+  if (value === 'loading' || value === 'success' || value === 'error') return value;
+  return 'idle';
 };
 
-type LegacyBucket = {
-  bucketId?: unknown;
-  window?: unknown;
-  displayName?: unknown;
-  remainingFraction?: unknown;
-  remaining_fraction?: unknown;
-  resetTime?: unknown;
-  reset_time?: unknown;
+const normalizeAccountLevel = (entry: AntigravityQuotaStateFilePayload): string | undefined => {
+  const value =
+    entry.account_level ??
+    entry.accountLevel ??
+    entry.account_tier_label ??
+    entry.account_tier_name ??
+    entry.account_tier_id;
+  const text = String(value ?? '').trim();
+  return text || undefined;
 };
 
-type LegacyGroup = {
-  id?: unknown;
-  label?: unknown;
-  displayName?: unknown;
-  description?: unknown;
-  models?: unknown;
-  remainingFraction?: unknown;
-  resetTime?: unknown;
-  buckets?: unknown;
+const normalizeErrorStatus = (entry: AntigravityQuotaStateFilePayload): number | undefined => {
+  const value = entry.error_status ?? entry.errorStatus;
+  const numeric = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
 };
-
-const asRecord = (value: unknown): Record<string, unknown> | null =>
-  value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-
-const asString = (value: unknown): string | undefined =>
-  typeof value === 'string' && value.trim() ? value : undefined;
-
-const asFraction = (value: unknown): number | undefined =>
-  typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : undefined;
-
-const normalizeGroup = (group: LegacyGroup, index: number): AntigravityQuotaGroup[] => {
-  const groupLabel = asString(group.label) ?? asString(group.displayName) ?? `额度组 ${index + 1}`;
-  const models = Array.isArray(group.models)
-    ? group.models.filter((model): model is string => typeof model === 'string')
-    : [asString(group.description) ?? groupLabel];
-  const buckets = Array.isArray(group.buckets) ? group.buckets : [];
-  if (buckets.length === 0) {
-    const remainingFraction = asFraction(group.remainingFraction);
-    return remainingFraction === undefined
-      ? []
-      : [
-          {
-            id: asString(group.id) ?? `group-${index}`,
-            label: groupLabel,
-            models,
-            remainingFraction,
-            resetTime: asString(group.resetTime),
-          },
-        ];
-  }
-  return buckets.flatMap((rawBucket, bucketIndex) => {
-    const bucket = asRecord(rawBucket) as LegacyBucket | null;
-    if (!bucket) return [];
-    const remainingFraction =
-      asFraction(bucket.remainingFraction) ?? asFraction(bucket.remaining_fraction);
-    if (remainingFraction === undefined) return [];
-    const bucketLabel =
-      asString(bucket.displayName) ?? asString(bucket.window) ?? `窗口 ${bucketIndex + 1}`;
-    return [
-      {
-        id: asString(bucket.bucketId) ?? `${asString(group.id) ?? `group-${index}`}-${bucketIndex}`,
-        label: `${groupLabel} · ${bucketLabel}`,
-        models,
-        remainingFraction,
-        resetTime: asString(bucket.resetTime) ?? asString(bucket.reset_time),
-      },
-    ];
-  });
-};
-
-export const normalizeAntigravityQuotaGroups = (groups: unknown): AntigravityQuotaGroup[] =>
-  Array.isArray(groups)
-    ? groups.flatMap((rawGroup, index) =>
-        normalizeGroup((asRecord(rawGroup) ?? {}) as LegacyGroup, index)
-      )
-    : [];
 
 export const normalizeAntigravityQuotaStates = (
-  files: Record<string, unknown> | undefined,
+  files: Record<string, AntigravityQuotaStateFilePayload> | undefined,
   fallbackRefreshedAt?: string
-): Record<string, AntigravityQuotaState> =>
-  Object.fromEntries(
-    Object.entries(files ?? {}).map(([name, rawState]) => {
-      const state = asRecord(rawState);
-      const status = state?.status;
-      const refreshedAt =
-        asString(state?.refreshedAt) ?? asString(state?.refreshed_at) ?? fallbackRefreshedAt;
-      if (status === 'error') {
-        return [name, { status: 'error', groups: [], error: asString(state?.error), refreshedAt }];
-      }
-      const groups = normalizeAntigravityQuotaGroups(state?.groups);
-      return [
-        name,
-        {
-          status: status === 'loading' ? 'loading' : status === 'idle' ? 'idle' : 'success',
-          groups,
-          refreshedAt,
-        },
-      ];
-    })
-  );
+): Record<string, AntigravityEnhancedQuotaState> => {
+  const normalized: Record<string, AntigravityEnhancedQuotaState> = {};
+  Object.entries(files ?? {}).forEach(([name, entry]) => {
+    const groups = normalizeAntigravityQuotaGroups(entry.groups);
+    const status = normalizeStatus(entry.status);
+    const incomplete = status === 'success' && !isCompleteAntigravityQuotaGroups(groups);
+    normalized[name] = {
+      status: incomplete ? 'error' : status,
+      groups,
+      refreshedAt: entry.refreshed_at ?? entry.refreshedAt ?? fallbackRefreshedAt,
+      accountLevel: normalizeAccountLevel(entry),
+      error: incomplete ? entry.error ?? '缓存中的额度数据不完整，请重新刷新' : entry.error,
+      errorStatus: normalizeErrorStatus(entry),
+    };
+  });
+  return normalized;
+};
+
+const serializeQuotaState = (
+  quota: Record<string, AntigravityEnhancedQuotaState>
+): AntigravityQuotaStatePayload => ({
+  files: Object.fromEntries(
+    Object.entries(quota).map(([name, state]) => [
+      name,
+      {
+        status: state.status,
+        groups: state.groups,
+        refreshed_at: state.refreshedAt,
+        account_level: state.accountLevel,
+        error: state.error,
+        error_status: state.errorStatus,
+      },
+    ])
+  ),
+});
 
 export const antigravityQuotaStateApi = {
-  get: () => apiClient.get<AntigravityQuotaSnapshot>(endpoint),
-  save: (files: Record<string, AntigravityQuotaState>) =>
-    apiClient.put<AntigravityQuotaSnapshot>(endpoint, {
-      files,
-      replace: true,
-      quota_refreshed_at: new Date().toISOString(),
-    }),
+  get: async () => {
+    const payload = await apiClient.get<AntigravityQuotaStatePayload>('/antigravity-quota-state');
+    return normalizeAntigravityQuotaStates(payload.files, payload.quota_refreshed_at);
+  },
+  save: (quota: Record<string, AntigravityEnhancedQuotaState>) =>
+    apiClient.put<AntigravityQuotaStatePayload>('/antigravity-quota-state', serializeQuotaState(quota)),
+  setManualPriority: (name: string, pool: AntigravityPool, enabled: boolean) =>
+    apiClient.patch('/auth-files/manual-priority', { name, pool, enabled }),
 };

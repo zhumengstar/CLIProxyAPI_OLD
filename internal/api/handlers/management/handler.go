@@ -41,6 +41,7 @@ type Handler struct {
 	cfg                     *config.Config
 	configFilePath          string
 	mu                      sync.Mutex
+	quotaStateMu            sync.Mutex
 	reloadMu                sync.Mutex
 	reloadGeneration        uint64
 	appliedReloadGeneration uint64
@@ -82,6 +83,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		envSecret:           envSecret,
 	}
 	h.startAttemptCleanup()
+	h.restoreAntigravityWeeklyPreferences()
 	return h
 }
 
@@ -138,6 +140,7 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	h.mu.Lock()
 	h.authManager = manager
 	h.mu.Unlock()
+	h.restoreAntigravityWeeklyPreferences()
 }
 
 // SetPluginHost updates the plugin host used by plugin-backed management endpoints.
@@ -368,7 +371,6 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	}
 
 	if provided == "" {
-		fail()
 		return false, http.StatusUnauthorized, "missing management key"
 	}
 

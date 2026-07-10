@@ -1,6 +1,7 @@
 package management
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -567,6 +568,22 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
+	now := time.Now()
+	geminiSnapshot, hasGeminiSnapshot := coreauth.WeeklyQuotaRoutingSnapshotForAuth(auth, now, "gemini-pro-agent")
+	claudeSnapshot, hasClaudeSnapshot := coreauth.WeeklyQuotaRoutingSnapshotForAuth(auth, now, "claude-sonnet-4-5")
+	if hasGeminiSnapshot {
+		entry["weekly_quota_routing_gemini"] = geminiSnapshot
+		entry["weekly_quota_routing"] = geminiSnapshot
+	}
+	if hasClaudeSnapshot {
+		entry["weekly_quota_routing_claude_gpt"] = claudeSnapshot
+		if !hasGeminiSnapshot {
+			entry["weekly_quota_routing"] = claudeSnapshot
+		}
+	}
+	entry["manual_weekly_priority"] = coreauth.ManualWeeklyPriority(auth.ID)
+	entry["manual_weekly_priority_gemini"] = coreauth.ManualWeeklyPriorityForPool(auth.ID, "gemini")
+	entry["manual_weekly_priority_claude_gpt"] = coreauth.ManualWeeklyPriorityForPool(auth.ID, "claude-gpt")
 	return entry
 }
 
@@ -730,6 +747,286 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 	}
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", name))
 	c.Data(200, "application/json", data)
+}
+
+type exportAuthFileSelection struct {
+	Name      string `json:"name"`
+	Source    string `json:"source"`
+	Directory string `json:"directory"`
+}
+
+type exportAuthFilesRequest struct {
+	Files []exportAuthFileSelection `json:"files"`
+}
+
+type authFileManualPriorityRequest struct {
+	Name    string `json:"name"`
+	Pool    string `json:"pool"`
+	Enabled bool   `json:"enabled"`
+}
+
+func (h *Handler) invalidAuthFileDirs() []string {
+	if h == nil || h.cfg == nil || strings.TrimSpace(h.cfg.AuthDir) == "" {
+		return nil
+	}
+	authDir, err := filepath.Abs(h.cfg.AuthDir)
+	if err != nil {
+		authDir = filepath.Clean(h.cfg.AuthDir)
+	}
+	parent := filepath.Dir(authDir)
+	candidates := []string{
+		filepath.Join(authDir, "authbak"),
+		filepath.Join(parent, "authbak"),
+		filepath.Join(authDir, "invalid"),
+		filepath.Join(parent, "invalid"),
+		filepath.Join(parent, "invalid-auths"),
+		filepath.Join(parent, "auth_invalid"),
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	dirs := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		dir, errAbs := filepath.Abs(candidate)
+		if errAbs != nil {
+			dir = filepath.Clean(candidate)
+		}
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		if info, errStat := os.Stat(dir); errStat == nil && info.IsDir() {
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
+}
+
+// ListInvalidAuthFiles lists auth JSON files that were moved out of the active auth directory.
+func (h *Handler) ListInvalidAuthFiles(c *gin.Context) {
+	dirs := h.invalidAuthFileDirs()
+	files := make([]gin.H, 0)
+	for _, dir := range dirs {
+		entries, errReadDir := os.ReadDir(dir)
+		if errReadDir != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if !strings.HasSuffix(strings.ToLower(name), ".json") {
+				continue
+			}
+			info, errInfo := entry.Info()
+			if errInfo != nil {
+				continue
+			}
+			full := filepath.Join(dir, name)
+			fileData := gin.H{
+				"name":      name,
+				"directory": dir,
+				"bucket":    filepath.Base(dir),
+				"source":    "invalid",
+				"size":      info.Size(),
+				"modtime":   info.ModTime(),
+			}
+			if data, errRead := os.ReadFile(full); errRead == nil {
+				if typeValue := strings.TrimSpace(gjson.GetBytes(data, "type").String()); typeValue != "" {
+					fileData["type"] = typeValue
+				}
+				if providerValue := strings.TrimSpace(gjson.GetBytes(data, "provider").String()); providerValue != "" {
+					fileData["provider"] = providerValue
+				}
+				if emailValue := strings.TrimSpace(gjson.GetBytes(data, "email").String()); emailValue != "" {
+					fileData["email"] = emailValue
+				}
+				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
+					fileData["project_id"] = projectID
+				}
+				if note := strings.TrimSpace(gjson.GetBytes(data, "note").String()); note != "" {
+					fileData["note"] = note
+				}
+				if disabledValue := gjson.GetBytes(data, "disabled"); disabledValue.Exists() {
+					fileData["disabled"] = disabledValue.Bool()
+				}
+			}
+			files = append(files, fileData)
+		}
+	}
+	sort.Slice(files, func(i, j int) bool {
+		nameI, _ := files[i]["name"].(string)
+		nameJ, _ := files[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	c.JSON(http.StatusOK, gin.H{"files": files, "directories": dirs})
+}
+
+func safeInvalidAuthDir(requested string, allowed []string) (string, bool) {
+	if strings.TrimSpace(requested) == "" {
+		return "", false
+	}
+	cleaned, err := filepath.Abs(requested)
+	if err != nil {
+		cleaned = filepath.Clean(requested)
+	}
+	for _, dir := range allowed {
+		if cleaned == dir {
+			return dir, true
+		}
+	}
+	return "", false
+}
+
+// PatchAuthFileManualPriority toggles and persists first-position routing for one auth.
+func (h *Handler) PatchAuthFileManualPriority(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req authFileManualPriorityRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	var targetAuth *coreauth.Auth
+	if auth, ok := h.authManager.GetByID(name); ok {
+		targetAuth = auth
+	} else {
+		for _, auth := range h.authManager.List() {
+			if auth.FileName == name || auth.Index == name {
+				targetAuth = auth
+				break
+			}
+		}
+	}
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	pool := strings.ToLower(strings.TrimSpace(req.Pool))
+	if pool != "gemini" && pool != "claude-gpt" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "pool must be gemini or claude-gpt"})
+		return
+	}
+	if req.Enabled && (targetAuth.Disabled || targetAuth.Status == coreauth.StatusDisabled || targetAuth.Unavailable) {
+		c.JSON(http.StatusConflict, gin.H{"error": "auth is not currently available"})
+		return
+	}
+
+	coreauth.PersistManualWeeklyPriorityForPool(targetAuth, pool, req.Enabled)
+	targetAuth.UpdatedAt = time.Now()
+	if _, err := h.authManager.Update(c.Request.Context(), targetAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to persist manual priority: %v", err)})
+		return
+	}
+	coreauth.SetManualWeeklyPriorityForPool(targetAuth.ID, pool, req.Enabled)
+	c.JSON(http.StatusOK, gin.H{
+		"status":                 "ok",
+		"id":                     targetAuth.ID,
+		"name":                   targetAuth.FileName,
+		"manual_weekly_priority": req.Enabled,
+		"pool":                   pool,
+	})
+}
+
+// ExportAuthFiles exports selected auth JSON files into a zip archive.
+func (h *Handler) ExportAuthFiles(c *gin.Context) {
+	var req exportAuthFilesRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid request body: %v", err)})
+		return
+	}
+	if len(req.Files) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "files is required"})
+		return
+	}
+
+	invalidDirs := h.invalidAuthFileDirs()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	added := make(map[string]struct{}, len(req.Files))
+	failed := make([]gin.H, 0)
+	exported := 0
+
+	for _, selected := range req.Files {
+		name := strings.TrimSpace(selected.Name)
+		if isUnsafeAuthFileName(name) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			failed = append(failed, gin.H{"name": name, "error": "invalid name"})
+			continue
+		}
+		source := strings.ToLower(strings.TrimSpace(selected.Source))
+		if source == "" {
+			source = "active"
+		}
+
+		var fullPath string
+		var zipName string
+		switch source {
+		case "active":
+			fullPath = filepath.Join(h.cfg.AuthDir, name)
+			zipName = filepath.ToSlash(filepath.Join("active", name))
+		case "invalid":
+			dir, ok := safeInvalidAuthDir(selected.Directory, invalidDirs)
+			if !ok {
+				failed = append(failed, gin.H{"name": name, "source": source, "error": "invalid directory"})
+				continue
+			}
+			fullPath = filepath.Join(dir, name)
+			zipName = filepath.ToSlash(filepath.Join("invalid", filepath.Base(dir), name))
+		default:
+			failed = append(failed, gin.H{"name": name, "source": source, "error": "invalid source"})
+			continue
+		}
+
+		if _, ok := added[zipName]; ok {
+			continue
+		}
+		data, errRead := os.ReadFile(fullPath)
+		if errRead != nil {
+			failed = append(failed, gin.H{"name": name, "source": source, "error": errRead.Error()})
+			continue
+		}
+		writer, errCreate := zw.Create(zipName)
+		if errCreate != nil {
+			_ = zw.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create zip entry: %v", errCreate)})
+			return
+		}
+		if _, errWrite := writer.Write(data); errWrite != nil {
+			_ = zw.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to write zip entry: %v", errWrite)})
+			return
+		}
+		added[zipName] = struct{}{}
+		exported++
+	}
+
+	if exported == 0 {
+		_ = zw.Close()
+		c.JSON(http.StatusNotFound, gin.H{"error": "no files exported", "failed": failed})
+		return
+	}
+	if len(failed) > 0 {
+		manifest, _ := json.MarshalIndent(gin.H{"failed": failed}, "", "  ")
+		if writer, errCreate := zw.Create("export-failed.json"); errCreate == nil {
+			_, _ = writer.Write(manifest)
+		}
+	}
+	if errClose := zw.Close(); errClose != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to close zip: %v", errClose)})
+		return
+	}
+
+	fileName := fmt.Sprintf("antigravity-auth-export-%s.zip", time.Now().Format("20060102-150405"))
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
+	c.Data(http.StatusOK, "application/zip", buf.Bytes())
 }
 
 // Upload auth file: multipart or raw JSON with ?name=

@@ -2108,6 +2108,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		clearedCooldown = clearCooldownStateForAuth(auth, now)
 	}
 	auth.EnsureIndex()
+	RestoreManualWeeklyPriority(auth)
 	authClone := auth.Clone()
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone

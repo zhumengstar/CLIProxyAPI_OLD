@@ -16,29 +16,32 @@ export const CACHE_EXPIRY_MS = 30 * 1000; // 与基线保持一致，减少管�
 export const DEFAULT_API_PORT = 8317;
 export const MANAGEMENT_API_PREFIX = '/v0/management';
 export const REQUEST_TIMEOUT_MS = 30 * 1000;
-export const API_CALL_TIMEOUT_MS = 10 * 60 * 1000;
-export const VERSION_HEADER_KEYS = ['x-cpa-version', 'x-server-version'];
-export const BUILD_DATE_HEADER_KEYS = ['x-cpa-build-date', 'x-server-build-date'];
-export const STATUS_UPDATE_INTERVAL_MS = 1000;
-export const LOG_REFRESH_DELAY_MS = 500;
+export const CPA_VERSION_HEADER_KEYS = ['x-cpa-version'];
+export const CPA_BUILD_DATE_HEADER_KEYS = ['x-cpa-build-date'];
+export const CPA_SUPPORT_PLUGIN_HEADER_KEYS = ['x-cpa-support-plugin'];
+export const HOME_VERSION_HEADER_KEYS = ['x-cpa-home-version'];
+export const HOME_BUILD_DATE_HEADER_KEYS = ['x-cpa-home-build-date'];
+export const VERSION_HEADER_KEYS = [
+  ...HOME_VERSION_HEADER_KEYS,
+  ...CPA_VERSION_HEADER_KEYS,
+  'x-server-version',
+];
+export const BUILD_DATE_HEADER_KEYS = [
+  ...HOME_BUILD_DATE_HEADER_KEYS,
+  ...CPA_BUILD_DATE_HEADER_KEYS,
+  'x-server-build-date',
+];
 
 // 日志相关
-export const MAX_LOG_LINES = 2000;
-export const LOG_FETCH_LIMIT = 2500;
 export const LOGS_TIMEOUT_MS = 60 * 1000;
 
 // 认证文件分页
-export const DEFAULT_AUTH_FILES_PAGE_SIZE = 20;
-export const MIN_AUTH_FILES_PAGE_SIZE = 10;
-export const MAX_AUTH_FILES_PAGE_SIZE = 100;
 export const MAX_AUTH_FILE_SIZE = 10 * 1024 * 1024;
 
 // 本地存储键名
 export const STORAGE_KEY_AUTH = 'cli-proxy-auth';
 export const STORAGE_KEY_THEME = 'cli-proxy-theme';
 export const STORAGE_KEY_LANGUAGE = 'cli-proxy-language';
-export const STORAGE_KEY_SIDEBAR = 'cli-proxy-sidebar-collapsed';
-export const STORAGE_KEY_AUTH_FILES_PAGE_SIZE = 'cli-proxy-auth-files-page-size';
 
 // 语言配置
 export const LANGUAGE_ORDER = defineLanguageOrder(['zh-CN', 'zh-TW', 'en', 'ru'] as const);
@@ -46,36 +49,9 @@ export const LANGUAGE_LABEL_KEYS: Record<Language, string> = {
   'zh-CN': 'language.chinese',
   'zh-TW': 'language.chinese_tw',
   en: 'language.english',
-  ru: 'language.russian'
+  ru: 'language.russian',
 };
 export const SUPPORTED_LANGUAGES = LANGUAGE_ORDER;
 
 // 通知持续时间
 export const NOTIFICATION_DURATION_MS = 3000;
-
-// OAuth 卡片 ID 列表
-export const OAUTH_CARD_IDS = [
-  'codex-oauth-card',
-  'anthropic-oauth-card',
-  'antigravity-oauth-card',
-  'gemini-cli-oauth-card',
-  'kimi-oauth-card'
-];
-export const OAUTH_PROVIDERS = {
-  CODEX: 'codex',
-  ANTHROPIC: 'anthropic',
-  ANTIGRAVITY: 'antigravity',
-  GEMINI_CLI: 'gemini-cli',
-  KIMI: 'kimi'
-} as const;
-
-// API 端点
-export const API_ENDPOINTS = {
-  CONFIG: '/config',
-  LOGIN: '/login',
-  API_KEYS: '/api-keys',
-  PROVIDERS: '/providers',
-  AUTH_FILES: '/auth-files',
-  OAUTH: '/oauth',
-  LOGS: '/logs'
-} as const;

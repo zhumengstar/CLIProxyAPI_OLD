@@ -1,25 +1,18 @@
-import { Suspense, lazy, useEffect } from 'react';
+import { useEffect } from 'react';
 import { Outlet, RouterProvider, createHashRouter } from 'react-router-dom';
+import { LoginPage } from '@/pages/LoginPage';
 import { NotificationContainer } from '@/components/common/NotificationContainer';
 import { ConfirmationModal } from '@/components/common/ConfirmationModal';
+import { MainLayout } from '@/components/layout/MainLayout';
 import { ProtectedRoute } from '@/router/ProtectedRoute';
 import { useLanguageStore, useThemeStore } from '@/stores';
-
-const LoginPage = lazy(() =>
-  import('@/pages/LoginPage').then((mod) => ({ default: mod.LoginPage }))
-);
-const MainLayout = lazy(() =>
-  import('@/components/layout/MainLayout').then((mod) => ({ default: mod.MainLayout }))
-);
 
 function RootShell() {
   return (
     <>
       <NotificationContainer />
       <ConfirmationModal />
-      <Suspense fallback={null}>
-        <Outlet />
-      </Suspense>
+      <Outlet />
     </>
   );
 }
