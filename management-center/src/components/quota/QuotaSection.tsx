@@ -36,7 +36,14 @@ const ANTIGRAVITY_RENDER_BATCH_SIZE = 8;
 
 type QuotaSortMode = 'quota_desc' | 'quota_asc' | 'name_asc';
 type AntigravityPool = 'gemini' | 'claude-gpt';
-type AntigravityFilter = 'all' | 'priority48' | 'mid72' | 'reserve' | 'noquota' | 'unfetched' | 'invalid';
+type AntigravityFilter =
+  | 'all'
+  | 'priority48'
+  | 'mid72'
+  | 'reserve'
+  | 'noquota'
+  | 'unfetched'
+  | 'invalid';
 
 const antigravityGroupBelongsToPool = (
   group: AntigravityQuotaState['groups'][number],
@@ -46,10 +53,8 @@ const antigravityGroupBelongsToPool = (
   return pool === 'gemini' ? /gemini/.test(descriptor) : /claude|gpt/.test(descriptor);
 };
 
-const antigravityGroupsForPool = (
-  state: AntigravityQuotaState,
-  pool: AntigravityPool
-) => state.groups.filter((group) => antigravityGroupBelongsToPool(group, pool));
+const antigravityGroupsForPool = (state: AntigravityQuotaState, pool: AntigravityPool) =>
+  state.groups.filter((group) => antigravityGroupBelongsToPool(group, pool));
 
 const antigravityStateBelongsToPool = (
   state: AntigravityQuotaState | undefined,
@@ -105,18 +110,23 @@ const readPendingQuotaRefresh = (type: string): PendingQuotaRefresh | null => {
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<PendingQuotaRefresh>;
     const names = Array.isArray(parsed.names)
-      ? parsed.names.filter((name): name is string => typeof name === 'string' && Boolean(name.trim()))
+      ? parsed.names.filter(
+          (name): name is string => typeof name === 'string' && Boolean(name.trim())
+        )
       : [];
     if (names.length === 0) return null;
     const completed = Array.isArray(parsed.completed)
-      ? parsed.completed.filter((name): name is string => typeof name === 'string' && Boolean(name.trim()))
+      ? parsed.completed.filter(
+          (name): name is string => typeof name === 'string' && Boolean(name.trim())
+        )
       : [];
     return {
       names: Array.from(new Set(names)),
       completed: Array.from(new Set(completed)),
-      concurrency: typeof parsed.concurrency === 'number' && Number.isFinite(parsed.concurrency)
-        ? parsed.concurrency
-        : DEFAULT_QUOTA_REFRESH_CONCURRENCY,
+      concurrency:
+        typeof parsed.concurrency === 'number' && Number.isFinite(parsed.concurrency)
+          ? parsed.concurrency
+          : DEFAULT_QUOTA_REFRESH_CONCURRENCY,
       startedAt: typeof parsed.startedAt === 'number' ? parsed.startedAt : Date.now(),
     };
   } catch {
@@ -209,7 +219,7 @@ interface QuotaSectionProps<TState extends QuotaStatusState, TData> {
 export function QuotaSection<TState extends QuotaStatusState, TData>({
   config,
   files,
-  disabled
+  disabled,
 }: QuotaSectionProps<TState, TData>) {
   const { t } = useTranslation();
   const resolvedTheme: ResolvedTheme = useThemeStore((state) => state.resolvedTheme);
@@ -237,7 +247,9 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
   const [resumedPendingRefresh, setResumedPendingRefresh] = useState(false);
   const [antigravityPool, setAntigravityPool] = useState<AntigravityPool>('gemini');
   const [antigravityFilter, setAntigravityFilter] = useState<AntigravityFilter>('all');
-  const [visibleAntigravityCards, setVisibleAntigravityCards] = useState(ANTIGRAVITY_INITIAL_CARD_COUNT);
+  const [visibleAntigravityCards, setVisibleAntigravityCards] = useState(
+    ANTIGRAVITY_INITIAL_CARD_COUNT
+  );
   const persistTimerRef = useRef<number | null>(null);
 
   const quotaFiles = useMemo(() => files.filter((file) => config.filterFn(file)), [files, config]);
@@ -259,8 +271,12 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
     if (config.type !== 'antigravity') return null;
     const states = quota as unknown as Record<string, AntigravityQuotaState>;
     return {
-      gemini: quotaFiles.filter((file) => antigravityStateBelongsToPool(states[file.name], 'gemini')).length,
-      'claude-gpt': quotaFiles.filter((file) => antigravityStateBelongsToPool(states[file.name], 'claude-gpt')).length,
+      gemini: quotaFiles.filter((file) =>
+        antigravityStateBelongsToPool(states[file.name], 'gemini')
+      ).length,
+      'claude-gpt': quotaFiles.filter((file) =>
+        antigravityStateBelongsToPool(states[file.name], 'claude-gpt')
+      ).length,
     };
   }, [config.type, quota, quotaFiles]);
   const filteredFiles = useMemo(() => {
@@ -269,7 +285,10 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
     return quotaFiles.filter((file) => {
       const state = states[file.name];
       if (!antigravityStateBelongsToPool(state, antigravityPool)) return false;
-      return antigravityFilter === 'all' || antigravityFilterForState(state, antigravityPool) === antigravityFilter;
+      return (
+        antigravityFilter === 'all' ||
+        antigravityFilterForState(state, antigravityPool) === antigravityFilter
+      );
     });
   }, [antigravityFilter, antigravityPool, config.type, quota, quotaFiles]);
 
@@ -287,11 +306,14 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
     }, 350);
   }, [config.type]);
 
-  useEffect(() => () => {
-    if (persistTimerRef.current !== null && typeof window !== 'undefined') {
-      window.clearTimeout(persistTimerRef.current);
-    }
-  }, []);
+  useEffect(
+    () => () => {
+      if (persistTimerRef.current !== null && typeof window !== 'undefined') {
+        window.clearTimeout(persistTimerRef.current);
+      }
+    },
+    []
+  );
   const showAllAllowed = filteredFiles.length <= MAX_SHOW_ALL_THRESHOLD;
   const effectiveViewMode: ViewMode = viewMode === 'all' && !showAllAllowed ? 'paged' : viewMode;
 
@@ -304,8 +326,7 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
   const maxQuotaPageSize = Math.max(MIN_QUOTA_PAGE_SIZE, filteredFiles.length);
 
   const clampQuotaPageSize = useCallback(
-    (value: number) =>
-      Math.min(maxQuotaPageSize, Math.max(MIN_QUOTA_PAGE_SIZE, Math.round(value))),
+    (value: number) => Math.min(maxQuotaPageSize, Math.max(MIN_QUOTA_PAGE_SIZE, Math.round(value))),
     [maxQuotaPageSize]
   );
 
@@ -362,7 +383,9 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
           .map((group) => {
             if (!group || typeof group !== 'object') return null;
             const fraction = group.remainingFraction;
-            return typeof fraction === 'number' && Number.isFinite(fraction) ? fraction * 100 : null;
+            return typeof fraction === 'number' && Number.isFinite(fraction)
+              ? fraction * 100
+              : null;
           })
           .filter((value): value is number => value !== null);
         return values.length > 0 ? Math.min(...values) : null;
@@ -374,7 +397,9 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
           .map((windowItem) => {
             if (!windowItem || typeof windowItem !== 'object') return null;
             const used = (windowItem as Record<string, unknown>).usedPercent;
-            return typeof used === 'number' && Number.isFinite(used) ? Math.max(0, 100 - used) : null;
+            return typeof used === 'number' && Number.isFinite(used)
+              ? Math.max(0, 100 - used)
+              : null;
           })
           .filter((value): value is number => value !== null);
         return values.length > 0 ? Math.min(...values) : null;
@@ -386,7 +411,9 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
           .map((bucket) => {
             if (!bucket || typeof bucket !== 'object') return null;
             const fraction = (bucket as Record<string, unknown>).remainingFraction;
-            return typeof fraction === 'number' && Number.isFinite(fraction) ? fraction * 100 : null;
+            return typeof fraction === 'number' && Number.isFinite(fraction)
+              ? fraction * 100
+              : null;
           })
           .filter((value): value is number => value !== null);
         return values.length > 0 ? Math.min(...values) : null;
@@ -463,18 +490,10 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
     };
   }, [antigravityFilter, antigravityPool, config.type, sortedFiles.length]);
 
-  const {
-    pageSize,
-    totalPages,
-    currentPage,
-    pageItems,
-    setPageSize,
-    goToPrev,
-    goToNext,
-  } = useQuotaPagination(sortedFiles);
-  const displayedItems = config.type === 'antigravity'
-    ? sortedFiles.slice(0, visibleAntigravityCards)
-    : pageItems;
+  const { pageSize, totalPages, currentPage, pageItems, setPageSize, goToPrev, goToNext } =
+    useQuotaPagination(sortedFiles);
+  const displayedItems =
+    config.type === 'antigravity' ? sortedFiles.slice(0, visibleAntigravityCards) : pageItems;
 
   useEffect(() => {
     const nextPageSize =
@@ -569,111 +588,112 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
     [clampQuotaRefreshConcurrency, config.type, setRefreshStoreConcurrency]
   );
 
-  const runRefreshTargets = useCallback(async (
-    targets: AuthFileItem[],
-    options: { resume?: boolean; concurrency?: number } = {}
-  ) => {
-    if (disabled || refreshTask.refreshing) return;
-    if (targets.length === 0) return;
+  const runRefreshTargets = useCallback(
+    async (targets: AuthFileItem[], options: { resume?: boolean; concurrency?: number } = {}) => {
+      if (disabled || refreshTask.refreshing) return;
+      if (targets.length === 0) return;
 
-    const concurrency = Math.max(
-      MIN_QUOTA_REFRESH_CONCURRENCY,
-      Math.round(options.concurrency ?? refreshConcurrency)
-    );
-    const runId = beginRefresh(config.type, targets.length, concurrency);
-    if (!runId) return;
-    const controller = new AbortController();
-    quotaRefreshAbortControllers.set(config.type, controller);
-    if (!options.resume) {
-      writePendingQuotaRefresh(config.type, {
-        names: targets.map((file) => file.name),
-        completed: [],
-        concurrency,
-        startedAt: Date.now(),
-      });
-    }
-
-    setQuota((prev) => {
-      const next = { ...prev };
-      targets.forEach((file) => {
-        next[file.name] = config.buildLoadingState();
-      });
-      return next;
-    });
-
-    let cursor = 0;
-    const workerCount = Math.max(1, Math.min(concurrency, targets.length));
-
-    const worker = async () => {
-      for (;;) {
-        if (controller.signal.aborted) return;
-        const index = cursor;
-        cursor += 1;
-        const file = targets[index];
-        if (!file) return;
-        try {
-          const data = await config.fetchQuota(file, t, controller.signal);
-          if (controller.signal.aborted) return;
-          setQuota((prev) => ({
-            ...prev,
-            [file.name]: config.buildSuccessState(data),
-          }));
-          scheduleAntigravityPersistence();
-          advanceRefresh(config.type, runId, true);
-          markPendingQuotaCompleted(config.type, file.name);
-        } catch (err: unknown) {
-          if (controller.signal.aborted) return;
-          const message = err instanceof Error ? err.message : t('common.unknown_error');
-          const status = getStatusFromError(err);
-          setQuota((prev) => ({
-            ...prev,
-            [file.name]: config.buildErrorState(message, status),
-          }));
-          scheduleAntigravityPersistence();
-          advanceRefresh(config.type, runId, false);
-          markPendingQuotaCompleted(config.type, file.name);
-        }
-      }
-    };
-
-    try {
-      await Promise.all(Array.from({ length: workerCount }, () => worker()));
-      if (controller.signal.aborted) return;
-      const latest = useQuotaRefreshStore.getState().tasks[config.type];
-      const summary = latest.summary;
-      showNotification(
-        t('auth_files.quota_refresh_all_done', {
-          success: summary.success,
-          failed: summary.failed,
-          defaultValue: `额度刷新完成：成功 ${summary.success}，失败 ${summary.failed}`,
-        }),
-        summary.failed > 0 ? 'warning' : 'success'
+      const concurrency = Math.max(
+        MIN_QUOTA_REFRESH_CONCURRENCY,
+        Math.round(options.concurrency ?? refreshConcurrency)
       );
-      clearPendingQuotaRefresh(config.type);
-    } finally {
-      quotaRefreshAbortControllers.delete(config.type);
-      finishRefresh(config.type, runId);
-    }
-  }, [
-    advanceRefresh,
-    beginRefresh,
-    config,
-    disabled,
-    finishRefresh,
-    refreshConcurrency,
-    refreshTask.refreshing,
-    scheduleAntigravityPersistence,
-    setQuota,
-    showNotification,
-    t,
-  ]);
+      const runId = beginRefresh(config.type, targets.length, concurrency);
+      if (!runId) return;
+      const controller = new AbortController();
+      quotaRefreshAbortControllers.set(config.type, controller);
+      if (!options.resume) {
+        writePendingQuotaRefresh(config.type, {
+          names: targets.map((file) => file.name),
+          completed: [],
+          concurrency,
+          startedAt: Date.now(),
+        });
+      }
+
+      setQuota((prev) => {
+        const next = { ...prev };
+        targets.forEach((file) => {
+          next[file.name] = config.buildLoadingState();
+        });
+        return next;
+      });
+
+      let cursor = 0;
+      const workerCount = Math.max(1, Math.min(concurrency, targets.length));
+
+      const worker = async () => {
+        for (;;) {
+          if (controller.signal.aborted) return;
+          const index = cursor;
+          cursor += 1;
+          const file = targets[index];
+          if (!file) return;
+          try {
+            const data = await config.fetchQuota(file, t, controller.signal);
+            if (controller.signal.aborted) return;
+            setQuota((prev) => ({
+              ...prev,
+              [file.name]: config.buildSuccessState(data),
+            }));
+            scheduleAntigravityPersistence();
+            advanceRefresh(config.type, runId, true);
+            markPendingQuotaCompleted(config.type, file.name);
+          } catch (err: unknown) {
+            if (controller.signal.aborted) return;
+            const message = err instanceof Error ? err.message : t('common.unknown_error');
+            const status = getStatusFromError(err);
+            setQuota((prev) => ({
+              ...prev,
+              [file.name]: config.buildErrorState(message, status),
+            }));
+            scheduleAntigravityPersistence();
+            advanceRefresh(config.type, runId, false);
+            markPendingQuotaCompleted(config.type, file.name);
+          }
+        }
+      };
+
+      try {
+        await Promise.all(Array.from({ length: workerCount }, () => worker()));
+        if (controller.signal.aborted) return;
+        const latest = useQuotaRefreshStore.getState().tasks[config.type];
+        const summary = latest.summary;
+        showNotification(
+          t('auth_files.quota_refresh_all_done', {
+            success: summary.success,
+            failed: summary.failed,
+            defaultValue: `额度刷新完成：成功 ${summary.success}，失败 ${summary.failed}`,
+          }),
+          summary.failed > 0 ? 'warning' : 'success'
+        );
+        clearPendingQuotaRefresh(config.type);
+      } finally {
+        quotaRefreshAbortControllers.delete(config.type);
+        finishRefresh(config.type, runId);
+      }
+    },
+    [
+      advanceRefresh,
+      beginRefresh,
+      config,
+      disabled,
+      finishRefresh,
+      refreshConcurrency,
+      refreshTask.refreshing,
+      scheduleAntigravityPersistence,
+      setQuota,
+      showNotification,
+      t,
+    ]
+  );
 
   const handleRefresh = useCallback(async () => {
     await runRefreshTargets(sortedFiles);
   }, [runRefreshTargets, sortedFiles]);
 
   useEffect(() => {
-    if (resumedPendingRefresh || disabled || refreshTask.refreshing || filteredFiles.length === 0) return;
+    if (resumedPendingRefresh || disabled || refreshTask.refreshing || filteredFiles.length === 0)
+      return;
     const pending = readPendingQuotaRefresh(config.type);
     const remainingNames = getRemainingPendingQuotaNames(config.type);
     if (!pending || remainingNames.length === 0) {
@@ -713,14 +733,14 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
 
       setQuota((prev) => ({
         ...prev,
-        [file.name]: config.buildLoadingState()
+        [file.name]: config.buildLoadingState(),
       }));
 
       try {
         const data = await config.fetchQuota(file, t);
         setQuota((prev) => ({
           ...prev,
-          [file.name]: config.buildSuccessState(data)
+          [file.name]: config.buildSuccessState(data),
         }));
         scheduleAntigravityPersistence();
         showNotification(t('auth_files.quota_refresh_success', { name: file.name }), 'success');
@@ -729,7 +749,7 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
         const status = getStatusFromError(err);
         setQuota((prev) => ({
           ...prev,
-          [file.name]: config.buildErrorState(message, status)
+          [file.name]: config.buildErrorState(message, status),
         }));
         scheduleAntigravityPersistence();
         showNotification(
@@ -762,11 +782,7 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
   const titleNode = (
     <div className={styles.titleWrapper}>
       <span>{t(`${config.i18nPrefix}.title`)}</span>
-      {quotaFiles.length > 0 && (
-        <span className={styles.countBadge}>
-          {quotaFiles.length}
-        </span>
-      )}
+      {quotaFiles.length > 0 && <span className={styles.countBadge}>{quotaFiles.length}</span>}
     </div>
   );
 
@@ -796,62 +812,73 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
       }),
       'warning'
     );
-  }, [config.type, finishRefresh, refreshTask.activeRunId, refreshTask.summary, showNotification, t]);
+  }, [
+    config.type,
+    finishRefresh,
+    refreshTask.activeRunId,
+    refreshTask.summary,
+    showNotification,
+    t,
+  ]);
 
   return (
     <Card
       title={titleNode}
       extra={
         <div className={styles.headerActions}>
-          {config.type !== 'antigravity' && <div className={styles.viewModeToggle}>
-            <Button
-              variant="secondary"
-              size="sm"
-              className={`${styles.viewModeButton} ${
-                effectiveViewMode === 'paged' ? styles.viewModeButtonActive : ''
-              }`}
-              onClick={() => setViewMode('paged')}
-            >
-              {t('auth_files.view_mode_paged')}
-            </Button>
-            <Button
-              variant="secondary"
-              size="sm"
-              className={`${styles.viewModeButton} ${
-                effectiveViewMode === 'all' ? styles.viewModeButtonActive : ''
-              }`}
-              onClick={() => {
-                if (filteredFiles.length > MAX_SHOW_ALL_THRESHOLD) {
-                  setShowTooManyWarning(true);
-                } else {
-                  setViewMode('all');
-                }
-              }}
-            >
-              {t('auth_files.view_mode_all')}
-            </Button>
-          </div>}
-          {config.type !== 'antigravity' && effectiveViewMode === 'paged' && filteredFiles.length > 0 && (
-            <label className={styles.quotaPageSizeControl}>
-              <span>{t('quota_management.page_size_label')}</span>
-              <input
-                className={styles.pageSizeSelect}
-                type="number"
-                min={MIN_QUOTA_PAGE_SIZE}
-                max={maxQuotaPageSize}
-                step={1}
-                value={pageSizeInput}
-                onChange={handlePageSizeChange}
-                onBlur={(event) => commitPageSizeInput(event.currentTarget.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
-                    event.currentTarget.blur();
+          {config.type !== 'antigravity' && (
+            <div className={styles.viewModeToggle}>
+              <Button
+                variant="secondary"
+                size="sm"
+                className={`${styles.viewModeButton} ${
+                  effectiveViewMode === 'paged' ? styles.viewModeButtonActive : ''
+                }`}
+                onClick={() => setViewMode('paged')}
+              >
+                {t('auth_files.view_mode_paged')}
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                className={`${styles.viewModeButton} ${
+                  effectiveViewMode === 'all' ? styles.viewModeButtonActive : ''
+                }`}
+                onClick={() => {
+                  if (filteredFiles.length > MAX_SHOW_ALL_THRESHOLD) {
+                    setShowTooManyWarning(true);
+                  } else {
+                    setViewMode('all');
                   }
                 }}
-                aria-label={t('quota_management.page_size_label')}
-              />
-            </label>
+              >
+                {t('auth_files.view_mode_all')}
+              </Button>
+            </div>
           )}
+          {config.type !== 'antigravity' &&
+            effectiveViewMode === 'paged' &&
+            filteredFiles.length > 0 && (
+              <label className={styles.quotaPageSizeControl}>
+                <span>{t('quota_management.page_size_label')}</span>
+                <input
+                  className={styles.pageSizeSelect}
+                  type="number"
+                  min={MIN_QUOTA_PAGE_SIZE}
+                  max={maxQuotaPageSize}
+                  step={1}
+                  value={pageSizeInput}
+                  onChange={handlePageSizeChange}
+                  onBlur={(event) => commitPageSizeInput(event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.currentTarget.blur();
+                    }
+                  }}
+                  aria-label={t('quota_management.page_size_label')}
+                />
+              </label>
+            )}
           <label className={styles.quotaPageSizeControl}>
             <span>{t('quota_management.sort_label', { defaultValue: '排序' })}</span>
             <Select
@@ -908,6 +935,50 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
         </div>
       }
     >
+      {config.type === 'antigravity' && (
+        <div className={styles.antigravityNativeControls}>
+          <div className={styles.antigravityPoolTabs} role="tablist" aria-label="额度池">
+            <Button
+              variant="secondary"
+              size="sm"
+              className={`${styles.antigravityPoolTab} ${antigravityPool === 'gemini' ? styles.antigravityPoolTabActive : ''}`}
+              onClick={() => setAntigravityPool('gemini')}
+              role="tab"
+              aria-selected={antigravityPool === 'gemini'}
+            >
+              {`Gemini 池 ${antigravityPoolCounts?.gemini ?? 0}`}
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              className={`${styles.antigravityPoolTab} ${antigravityPool === 'claude-gpt' ? styles.antigravityPoolTabActive : ''}`}
+              onClick={() => setAntigravityPool('claude-gpt')}
+              role="tab"
+              aria-selected={antigravityPool === 'claude-gpt'}
+            >
+              {`Claude / GPT 池 ${antigravityPoolCounts?.['claude-gpt'] ?? 0}`}
+            </Button>
+          </div>
+          <div className={styles.antigravityFilterTabs} role="tablist" aria-label="额度状态">
+            {antigravityFilterOptions.map((option) => (
+              <Button
+                key={option.value}
+                variant="secondary"
+                size="sm"
+                className={`${styles.antigravityFilterTab} ${antigravityFilter === option.value ? styles.antigravityFilterTabActive : ''}`}
+                onClick={() => setAntigravityFilter(option.value)}
+                role="tab"
+                aria-selected={antigravityFilter === option.value}
+              >
+                {option.label}
+              </Button>
+            ))}
+          </div>
+          <div className={styles.antigravityRenderStatus}>
+            {`${antigravityPool === 'gemini' ? 'Gemini' : 'Claude / GPT'} 池：${displayedItems.length} / ${sortedFiles.length} 个`}
+          </div>
+        </div>
+      )}
       {filteredFiles.length === 0 ? (
         <EmptyState
           title={t(`${config.i18nPrefix}.empty_title`)}
@@ -915,50 +986,6 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
         />
       ) : (
         <>
-          {config.type === 'antigravity' && (
-            <div className={styles.antigravityNativeControls}>
-              <div className={styles.antigravityPoolTabs} role="tablist" aria-label="额度池">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className={`${styles.antigravityPoolTab} ${antigravityPool === 'gemini' ? styles.antigravityPoolTabActive : ''}`}
-                  onClick={() => setAntigravityPool('gemini')}
-                  role="tab"
-                  aria-selected={antigravityPool === 'gemini'}
-                >
-                  {`Gemini 池 ${antigravityPoolCounts?.gemini ?? 0}`}
-                </Button>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className={`${styles.antigravityPoolTab} ${antigravityPool === 'claude-gpt' ? styles.antigravityPoolTabActive : ''}`}
-                  onClick={() => setAntigravityPool('claude-gpt')}
-                  role="tab"
-                  aria-selected={antigravityPool === 'claude-gpt'}
-                >
-                  {`Claude / GPT 池 ${antigravityPoolCounts?.['claude-gpt'] ?? 0}`}
-                </Button>
-              </div>
-              <div className={styles.antigravityFilterTabs} role="tablist" aria-label="额度状态">
-                {antigravityFilterOptions.map((option) => (
-                  <Button
-                    key={option.value}
-                    variant="secondary"
-                    size="sm"
-                    className={`${styles.antigravityFilterTab} ${antigravityFilter === option.value ? styles.antigravityFilterTabActive : ''}`}
-                    onClick={() => setAntigravityFilter(option.value)}
-                    role="tab"
-                    aria-selected={antigravityFilter === option.value}
-                  >
-                    {option.label}
-                  </Button>
-                ))}
-              </div>
-              <div className={styles.antigravityRenderStatus}>
-                {`${antigravityPool === 'gemini' ? 'Gemini' : 'Claude / GPT'} 池：${displayedItems.length} / ${sortedFiles.length} 个`}
-              </div>
-            </div>
-          )}
           {refreshTask.refreshing && (
             <div className={styles.statsInfo}>
               {t('quota_management.refresh_progress', {
@@ -987,33 +1014,35 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
               />
             ))}
           </div>
-          {config.type !== 'antigravity' && filteredFiles.length > pageSize && effectiveViewMode === 'paged' && (
-            <div className={styles.pagination}>
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={goToPrev}
-                disabled={currentPage <= 1}
-              >
-                {t('auth_files.pagination_prev')}
-              </Button>
-              <div className={styles.pageInfo}>
-                {t('auth_files.pagination_info', {
-                  current: currentPage,
-                  total: totalPages,
-                  count: filteredFiles.length
-                })}
+          {config.type !== 'antigravity' &&
+            filteredFiles.length > pageSize &&
+            effectiveViewMode === 'paged' && (
+              <div className={styles.pagination}>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={goToPrev}
+                  disabled={currentPage <= 1}
+                >
+                  {t('auth_files.pagination_prev')}
+                </Button>
+                <div className={styles.pageInfo}>
+                  {t('auth_files.pagination_info', {
+                    current: currentPage,
+                    total: totalPages,
+                    count: filteredFiles.length,
+                  })}
+                </div>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={goToNext}
+                  disabled={currentPage >= totalPages}
+                >
+                  {t('auth_files.pagination_next')}
+                </Button>
               </div>
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={goToNext}
-                disabled={currentPage >= totalPages}
-              >
-                {t('auth_files.pagination_next')}
-              </Button>
-            </div>
-          )}
+            )}
         </>
       )}
       {showTooManyWarning && (

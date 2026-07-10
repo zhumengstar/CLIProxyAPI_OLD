@@ -205,6 +205,7 @@ export interface AntigravityQuotaGroup {
 export interface AntigravityQuotaState {
   status: 'idle' | 'loading' | 'success' | 'error';
   groups: AntigravityQuotaGroup[];
+  refreshedAt?: string;
   error?: string;
   errorStatus?: number;
 }
