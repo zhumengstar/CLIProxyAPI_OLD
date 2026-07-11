@@ -94,3 +94,49 @@ func TestModelFamilyFailureIsolation(t *testing.T) {
 		})
 	}
 }
+
+func TestDisableCoolingBypassesModelFamilyIsolation(t *testing.T) {
+	tests := []struct {
+		name   string
+		model  string
+		status int
+	}{
+		{name: "gemini rate limit", model: "gemini-3-pro-preview", status: 429},
+		{name: "gemini forbidden", model: "gemini-3-pro-preview", status: 403},
+		{name: "claude rate limit", model: "claude-sonnet-4-5", status: 429},
+		{name: "claude forbidden", model: "claude-sonnet-4-5", status: 403},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			registered, err := manager.Register(context.Background(), &Auth{
+				ID:       "disable-cooling-auth",
+				Provider: "antigravity",
+				Status:   StatusActive,
+				Metadata: map[string]any{"disable_cooling": true},
+			})
+			if err != nil {
+				t.Fatalf("Register() error = %v", err)
+			}
+
+			manager.MarkResult(context.Background(), Result{
+				AuthID: registered.ID,
+				Model:  tt.model,
+				Error:  &Error{HTTPStatus: tt.status, Message: "upstream failure"},
+			})
+
+			auth, ok := manager.GetByID(registered.ID)
+			if !ok {
+				t.Fatal("GetByID() did not return registered auth")
+			}
+			if familyKey := modelFamilyStateKey(tt.model); familyKey != "" && auth.ModelStates[familyKey] != nil {
+				t.Fatalf("family state %q remains with disable_cooling=true: %#v", familyKey, auth.ModelStates[familyKey])
+			}
+			selector := &RoundRobinSelector{}
+			if picked, errPick := selector.Pick(context.Background(), auth.Provider, tt.model, cliproxyexecutor.Options{}, []*Auth{auth}); errPick != nil || picked.ID != auth.ID {
+				t.Fatalf("Pick(%q) = (%v, %v), want auth %q", tt.model, picked, errPick, auth.ID)
+			}
+		})
+	}
+}

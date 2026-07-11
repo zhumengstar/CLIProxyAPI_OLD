@@ -3558,6 +3558,22 @@ func markModelFamilyInvalid(auth *Auth, model string, resultErr *Error, now time
 	}
 }
 
+func clearModelFamilyIsolation(auth *Auth, model string, now time.Time) {
+	if auth == nil {
+		return
+	}
+	if familyKey := modelFamilyStateKey(model); familyKey != "" {
+		delete(auth.ModelStates, familyKey)
+	}
+	if state := auth.ModelStates[model]; state != nil {
+		state.Unavailable = false
+		state.Status = StatusError
+		state.NextRetryAfter = time.Time{}
+		state.Quota = QuotaState{}
+		state.UpdatedAt = now
+	}
+}
+
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
@@ -3665,7 +3681,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							}
 						case 403:
 							if disableCooling {
-								state.NextRetryAfter = time.Time{}
+								clearModelFamilyIsolation(auth, result.Model, now)
+								state = ensureModelState(auth, result.Model)
 							} else if modelFamilyStateKey(result.Model) == "" {
 								// Preserve the legacy cooldown for unknown model families. A
 								// permanent family isolation is only safe when the request can
@@ -3690,7 +3707,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							}
 						case 429:
 							if disableCooling {
-								state.NextRetryAfter = time.Time{}
+								clearModelFamilyIsolation(auth, result.Model, now)
+								state = ensureModelState(auth, result.Model)
 							} else {
 								next, backoffLevel := rateLimitRetryAfter(now, result.RetryAfter, state.Quota.BackoffLevel)
 								markModelFamilyRateLimited(auth, result.Model, result.Error, next, backoffLevel, now)
@@ -4146,6 +4164,16 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 	if isRequestScopedNotFoundResultError(resultErr) {
 		return
+	}
+	if disableCooling {
+		defer func() {
+			auth.Unavailable = false
+			if auth.Status == StatusInvalid {
+				auth.Status = StatusError
+			}
+			auth.NextRetryAfter = time.Time{}
+			auth.Quota = QuotaState{}
+		}()
 	}
 	auth.Unavailable = true
 	auth.Status = StatusError
