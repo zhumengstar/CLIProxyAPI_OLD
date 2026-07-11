@@ -2451,6 +2451,8 @@ func antigravityConfiguredUserAgent(auth *cliproxyauth.Auth) string {
 	return raw
 }
 
+const antigravityMaxSameAuthAttempts = 2
+
 func antigravityRetryAttempts(auth *cliproxyauth.Auth, cfg *config.Config) int {
 	retry := 0
 	if cfg != nil {
@@ -2467,6 +2469,11 @@ func antigravityRetryAttempts(auth *cliproxyauth.Auth, cfg *config.Config) int {
 	attempts := retry + 1
 	if attempts < 1 {
 		return 1
+	}
+	// The auth manager already retries with another available credential. Keep
+	// only one same-auth retry here so stacked retry budgets do not inflate TTFT.
+	if attempts > antigravityMaxSameAuthAttempts {
+		return antigravityMaxSameAuthAttempts
 	}
 	return attempts
 }

@@ -231,6 +231,40 @@ func TestAntigravityShouldRetryNoCapacity_Standard503(t *testing.T) {
 	}
 }
 
+func TestAntigravityRetryAttempts_CapsSameAuthRetries(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *config.Config
+		auth *cliproxyauth.Auth
+		want int
+	}{
+		{name: "nil config", want: 1},
+		{name: "retry disabled", cfg: &config.Config{RequestRetry: 0}, want: 1},
+		{name: "one retry", cfg: &config.Config{RequestRetry: 1}, want: 2},
+		{name: "global retry capped", cfg: &config.Config{RequestRetry: 3}, want: 2},
+		{
+			name: "auth disables retry",
+			cfg:  &config.Config{RequestRetry: 3},
+			auth: &cliproxyauth.Auth{Metadata: map[string]any{"request_retry": 0}},
+			want: 1,
+		},
+		{
+			name: "auth retry capped",
+			cfg:  &config.Config{RequestRetry: 0},
+			auth: &cliproxyauth.Auth{Metadata: map[string]any{"request_retry": 5}},
+			want: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := antigravityRetryAttempts(tt.auth, tt.cfg); got != tt.want {
+				t.Fatalf("antigravityRetryAttempts() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestInjectEnabledCreditTypes(t *testing.T) {
 	body := []byte(`{"model":"claude-sonnet-4-6","request":{}}`)
 	got := injectEnabledCreditTypes(body)
