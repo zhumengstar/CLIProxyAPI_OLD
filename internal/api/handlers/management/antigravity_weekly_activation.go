@@ -17,6 +17,7 @@ import (
 const (
 	antigravityWeeklyActivationProbeCooldown = 30 * time.Minute
 	antigravityWeeklyActivationProbeTimeout  = 20 * time.Second
+	antigravityWeeklyActivationFreshWindow   = 6*24*time.Hour + 23*time.Hour
 )
 
 var antigravityWeeklyActivationProbeState = struct {
@@ -87,16 +88,18 @@ func missingAntigravityWeeklyActivationProbes(payload map[string]any, now time.T
 	models := antigravityAvailableModels(rawModels)
 
 	hasWeeklyReset := make(map[string]bool, 2)
+	observedFamilies := make(map[string]bool, 2)
 	for _, group := range groups {
 		groupName := antigravityQuotaDisplayName(group.ID, group.Label, group.DisplayName, group.DisplayNameSnake)
 		family := antigravityQuotaFamily(groupName)
 		if family == "" {
 			continue
 		}
+		observedFamilies[family] = true
 		for _, bucket := range group.Buckets {
 			resetAt, ok := parseAntigravityResetTime(bucketResetTime(bucket))
 			bucketName := antigravityQuotaDisplayName(groupName, bucket.ID, bucket.BucketID, bucket.BucketIDSnake, bucket.Label, bucket.DisplayName, bucket.DisplayNameSnake, bucket.Window)
-			if ok && resetAt.After(now) && isAntigravityWeeklyQuota(bucketName, resetAt, now) {
+			if ok && resetAt.After(now) && isAntigravityWeeklyQuota(bucketName, resetAt, now) && resetAt.Sub(now) < antigravityWeeklyActivationFreshWindow {
 				hasWeeklyReset[family] = true
 			}
 		}
@@ -108,7 +111,7 @@ func missingAntigravityWeeklyActivationProbes(payload map[string]any, now time.T
 		modelName := antigravityModelName(model)
 		family := antigravityQuotaFamily(modelName)
 		resetAt, ok := parseAntigravityResetTime(model.QuotaInfo.ResetTime)
-		if family != "" && ok && resetAt.After(now) && isAntigravityWeeklyQuota(modelName, resetAt, now) {
+		if family != "" && ok && resetAt.After(now) && isAntigravityWeeklyQuota(modelName, resetAt, now) && resetAt.Sub(now) < antigravityWeeklyActivationFreshWindow {
 			hasWeeklyReset[family] = true
 		}
 	}
@@ -121,6 +124,15 @@ func missingAntigravityWeeklyActivationProbes(payload map[string]any, now time.T
 			continue
 		}
 		candidates[family] = append(candidates[family], modelID)
+	}
+	// The quota summary endpoint can return grouped limits without a models map.
+	// Keep activation deterministic in that response shape by using lightweight,
+	// generally available Antigravity models for the missing family only.
+	if observedFamilies["gemini"] && len(candidates["gemini"]) == 0 {
+		candidates["gemini"] = []string{"gemini-2.5-flash-lite"}
+	}
+	if observedFamilies["claude-gpt"] && len(candidates["claude-gpt"]) == 0 {
+		candidates["claude-gpt"] = []string{"claude-haiku-4-5"}
 	}
 
 	probes := make([]antigravityWeeklyActivationProbe, 0, 2)

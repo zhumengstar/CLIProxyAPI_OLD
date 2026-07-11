@@ -278,6 +278,60 @@ func TestMissingAntigravityWeeklyActivationProbesIncludesGeminiAndClaude(t *test
 	}
 }
 
+func TestMissingAntigravityWeeklyActivationProbesTreatsFreshSevenDayWindowAsInactive(t *testing.T) {
+	now := time.Now().UTC()
+	remaining := 1.0
+	payload := map[string]any{
+		"groups": []antigravityAvailableModelsGroup{{
+			ID: "gemini-weekly",
+			Buckets: []antigravityAvailableModelsBucket{{
+				ID: "gemini-weekly", Window: "weekly", RemainingFraction: &remaining,
+				ResetTime: now.Add(7 * 24 * time.Hour).Format(time.RFC3339),
+			}},
+		}},
+		"models": json.RawMessage(`{"gemini-2.5-flash-lite":{"quotaInfo":{"remainingFraction":1}}}`),
+	}
+
+	probes := missingAntigravityWeeklyActivationProbes(payload, now)
+	if len(probes) != 1 || probes[0].Family != "gemini" {
+		t.Fatalf("probes = %#v, want fresh seven-day Gemini window activated", probes)
+	}
+}
+
+func TestMissingAntigravityWeeklyActivationProbesFallsBackWhenModelsAreMissing(t *testing.T) {
+	now := time.Now().UTC()
+	remaining := 1.0
+	payload := map[string]any{
+		"groups": []antigravityAvailableModelsGroup{
+			{
+				DisplayName: "Gemini Models",
+				Buckets: []antigravityAvailableModelsBucket{{
+					Window: "weekly", RemainingFraction: &remaining,
+					ResetTime: now.Add(7 * 24 * time.Hour).Format(time.RFC3339),
+				}},
+			},
+			{
+				DisplayName: "Claude and GPT models",
+				Buckets: []antigravityAvailableModelsBucket{{
+					Window: "weekly", RemainingFraction: &remaining,
+					ResetTime: now.Add(7 * 24 * time.Hour).Format(time.RFC3339),
+				}},
+			},
+		},
+	}
+
+	probes := missingAntigravityWeeklyActivationProbes(payload, now)
+	if len(probes) != 2 {
+		t.Fatalf("probes = %#v, want both fallback families", probes)
+	}
+	if probes[0].Family != "gemini" || probes[0].Model != "gemini-2.5-flash-lite" {
+		t.Fatalf("Gemini probe = %#v", probes[0])
+	}
+	if probes[1].Family != "claude-gpt" || probes[1].Model != "claude-haiku-4-5" {
+		t.Fatalf("Claude/GPT probe = %#v", probes[1])
+	}
+}
+
 func TestReserveAntigravityWeeklyActivationProbeCooldown(t *testing.T) {
 	resetAntigravityWeeklyActivationProbeState()
 	t.Cleanup(resetAntigravityWeeklyActivationProbeState)
