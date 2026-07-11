@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strconv"
 	"testing"
@@ -263,6 +264,48 @@ func TestSchedulerWeightsUrgentPoolByResetTime(t *testing.T) {
 	}
 	if counts[farther.ID] == 0 {
 		t.Fatal("farther urgent auth must remain reachable")
+	}
+}
+
+func TestSchedulerNormalizesUrgentWeightsAcrossUnevenBuckets(t *testing.T) {
+	resetWeeklyQuotaPreferences(t)
+	now := time.Now()
+	closer := &Auth{ID: "closer", Provider: "antigravity"}
+	ObserveQuotaHeaders(closer.ID, weeklyHeaders(now.Add(2*time.Hour), 50))
+
+	entries := []*scheduledAuth{{auth: closer}}
+	for i := range 20 {
+		farther := &Auth{ID: fmt.Sprintf("farther-%02d", i), Provider: "antigravity"}
+		ObserveQuotaHeaders(farther.ID, weeklyHeaders(now.Add(20*time.Hour), 50))
+		entries = append(entries, &scheduledAuth{auth: farther})
+	}
+
+	view := readyView{flat: entries}
+	predicate, pool := weeklyPreferredPredicate(view.flat, nil, now, "gemini-pro-agent")
+	if pool != weeklyPreferencePoolUrgent {
+		t.Fatalf("pool = %v, want urgent", pool)
+	}
+	weight := normalizedUrgentWeeklyResetWeight(view.flat, predicate, now, "gemini-pro-agent")
+	counts := map[string]int{}
+	for range 1400 {
+		picked := view.pickSmoothWeightedRoundRobin(predicate, weight)
+		if picked == nil {
+			t.Fatal("expected a weighted pick")
+		}
+		counts[picked.auth.ID]++
+	}
+
+	fartherTotal := 0
+	for id, count := range counts {
+		if id != closer.ID {
+			fartherTotal += count
+		}
+	}
+	if counts[closer.ID] <= fartherTotal {
+		t.Fatalf("closer picks = %d, combined farther picks = %d", counts[closer.ID], fartherTotal)
+	}
+	if fartherTotal == 0 {
+		t.Fatal("farther bucket must remain reachable")
 	}
 }
 

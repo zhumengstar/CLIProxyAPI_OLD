@@ -791,9 +791,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 		if strategy == schedulerStrategyFillFirst {
 			picked = view.pickFirst(predicate)
 		} else {
-			picked = view.pickSmoothWeightedRoundRobin(predicate, func(entry *scheduledAuth) int {
-				return urgentWeeklyResetWeight(entry, now, m.modelKey)
-			})
+			picked = view.pickSmoothWeightedRoundRobin(predicate, normalizedUrgentWeeklyResetWeight(view.flat, predicate, now, m.modelKey))
 		}
 		if picked != nil {
 			return picked.auth
@@ -857,9 +855,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if strategy == schedulerStrategyFillFirst {
 		picked = view.pickFirst(predicate)
 	} else if weeklyPool == weeklyPreferencePoolUrgent {
-		picked = view.pickSmoothWeightedRoundRobin(predicate, func(entry *scheduledAuth) int {
-			return urgentWeeklyResetWeight(entry, now, m.modelKey)
-		})
+		picked = view.pickSmoothWeightedRoundRobin(predicate, normalizedUrgentWeeklyResetWeight(view.flat, predicate, now, m.modelKey))
 	} else {
 		picked = view.pickRoundRobin(predicate)
 	}

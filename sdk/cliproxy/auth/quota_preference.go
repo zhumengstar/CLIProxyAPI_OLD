@@ -502,6 +502,32 @@ func urgentWeeklyResetWeight(entry *scheduledAuth, now time.Time, model string) 
 	return weight
 }
 
+// normalizedUrgentWeeklyResetWeight keeps the aggregate weight of each
+// two-hour reset bucket proportional to its urgency, regardless of how many
+// credentials happen to be in that bucket.
+func normalizedUrgentWeeklyResetWeight(entries []*scheduledAuth, predicate func(*scheduledAuth) bool, now time.Time, model string) func(*scheduledAuth) int {
+	const weightScale = 4096
+	bucketCounts := make(map[int]int, 12)
+	for _, entry := range entries {
+		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
+			continue
+		}
+		bucketCounts[urgentWeeklyResetWeight(entry, now, model)]++
+	}
+	return func(entry *scheduledAuth) int {
+		bucketWeight := urgentWeeklyResetWeight(entry, now, model)
+		count := bucketCounts[bucketWeight]
+		if count < 1 {
+			return 1
+		}
+		weight := weightScale * bucketWeight / count
+		if weight < 1 {
+			return 1
+		}
+		return weight
+	}
+}
+
 func fiveHourQuotaEligiblePredicate(predicate func(*scheduledAuth) bool, now time.Time, model string) func(*scheduledAuth) bool {
 	return func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
