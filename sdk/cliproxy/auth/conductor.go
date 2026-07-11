@@ -612,7 +612,8 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 
 func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now time.Time) bool {
 	authID := strings.TrimSpace(record.AuthID)
-	if authID == "" || record.NextRetryAfter.IsZero() || !record.NextRetryAfter.After(now) {
+	isInvalid := strings.EqualFold(strings.TrimSpace(record.Status), string(StatusInvalid))
+	if authID == "" || (!isInvalid && (record.NextRetryAfter.IsZero() || !record.NextRetryAfter.After(now))) {
 		return false
 	}
 	auth := m.auths[authID]
@@ -633,6 +634,9 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 	if model == "" {
 		auth.Unavailable = true
 		auth.Status = StatusError
+		if isInvalid {
+			auth.Status = StatusInvalid
+		}
 		auth.NextRetryAfter = record.NextRetryAfter
 		auth.Quota = quota
 		auth.UpdatedAt = updatedAt
@@ -646,6 +650,9 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 	state := ensureModelState(auth, model)
 	state.Unavailable = true
 	state.Status = StatusError
+	if isInvalid {
+		state.Status = StatusInvalid
+	}
 	state.NextRetryAfter = record.NextRetryAfter
 	state.Quota = quota
 	state.UpdatedAt = updatedAt
@@ -907,14 +914,20 @@ func cooldownErrorEqual(a, b *Error) bool {
 }
 
 func authCooldownStateRecord(auth *Auth, now time.Time) (CooldownStateRecord, bool) {
-	if auth == nil || !auth.Unavailable || auth.NextRetryAfter.IsZero() || !auth.NextRetryAfter.After(now) {
+	if auth == nil || !auth.Unavailable {
+		return CooldownStateRecord{}, false
+	}
+	status := "cooling"
+	if auth.Status == StatusInvalid {
+		status = string(StatusInvalid)
+	} else if auth.NextRetryAfter.IsZero() || !auth.NextRetryAfter.After(now) {
 		return CooldownStateRecord{}, false
 	}
 	return CooldownStateRecord{
 		Provider:       strings.TrimSpace(auth.Provider),
 		AuthID:         auth.ID,
 		AuthFile:       cooldownAuthFile(auth),
-		Status:         "cooling",
+		Status:         status,
 		NextRetryAfter: auth.NextRetryAfter,
 		Reason:         cooldownReason(auth.StatusMessage, auth.Quota, auth.LastError),
 		Quota:          auth.Quota,
@@ -925,7 +938,13 @@ func authCooldownStateRecord(auth *Auth, now time.Time) (CooldownStateRecord, bo
 
 func modelCooldownStateRecord(auth *Auth, model string, state *ModelState, now time.Time) (CooldownStateRecord, bool) {
 	model = strings.TrimSpace(model)
-	if auth == nil || state == nil || model == "" || !state.Unavailable || state.NextRetryAfter.IsZero() || !state.NextRetryAfter.After(now) {
+	if auth == nil || state == nil || model == "" || !state.Unavailable {
+		return CooldownStateRecord{}, false
+	}
+	status := "cooling"
+	if state.Status == StatusInvalid {
+		status = string(StatusInvalid)
+	} else if state.NextRetryAfter.IsZero() || !state.NextRetryAfter.After(now) {
 		return CooldownStateRecord{}, false
 	}
 	return CooldownStateRecord{
@@ -933,7 +952,7 @@ func modelCooldownStateRecord(auth *Auth, model string, state *ModelState, now t
 		AuthID:         auth.ID,
 		AuthFile:       cooldownAuthFile(auth),
 		Model:          model,
-		Status:         "cooling",
+		Status:         status,
 		NextRetryAfter: state.NextRetryAfter,
 		Reason:         cooldownReason(state.StatusMessage, state.Quota, state.LastError),
 		Quota:          state.Quota,
@@ -3494,6 +3513,51 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 	}
 }
 
+const rateLimitMinimumCooldown = 5 * time.Hour
+
+func rateLimitRetryAfter(now time.Time, retryAfter *time.Duration, backoffLevel int) (time.Time, int) {
+	cooldown, nextLevel := nextQuotaCooldown(backoffLevel, false)
+	if retryAfter != nil && *retryAfter > cooldown {
+		cooldown = *retryAfter
+	}
+	if cooldown < rateLimitMinimumCooldown {
+		cooldown = rateLimitMinimumCooldown
+	}
+	return now.Add(cooldown), nextLevel
+}
+
+func markModelFamilyRateLimited(auth *Auth, model string, resultErr *Error, next time.Time, backoffLevel int, now time.Time) {
+	for _, key := range []string{model, modelFamilyStateKey(model)} {
+		if key == "" {
+			continue
+		}
+		state := ensureModelState(auth, key)
+		state.Unavailable = true
+		state.Status = StatusError
+		state.StatusMessage = "quota exhausted"
+		state.NextRetryAfter = next
+		state.Quota = QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next, BackoffLevel: backoffLevel}
+		state.LastError = cloneError(resultErr)
+		state.UpdatedAt = now
+	}
+}
+
+func markModelFamilyInvalid(auth *Auth, model string, resultErr *Error, now time.Time) {
+	for _, key := range []string{model, modelFamilyStateKey(model)} {
+		if key == "" {
+			continue
+		}
+		state := ensureModelState(auth, key)
+		state.Unavailable = true
+		state.Status = StatusInvalid
+		state.StatusMessage = "forbidden"
+		state.NextRetryAfter = time.Time{}
+		state.Quota = QuotaState{}
+		state.LastError = cloneError(resultErr)
+		state.UpdatedAt = now
+	}
+}
+
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
@@ -3527,6 +3591,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
 				resetModelState(state, now)
+				if familyKey := modelFamilyStateKey(result.Model); familyKey != "" {
+					familyState := ensureModelState(auth, familyKey)
+					if familyState.Status != StatusInvalid {
+						resetModelState(familyState, now)
+					}
+				}
 				updateAggregatedAvailability(auth, now)
 				if !hasModelError(auth, now) {
 					auth.LastError = nil
@@ -3584,13 +3654,29 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								suspendReason = "unauthorized"
 								shouldSuspendModel = true
 							}
-						case 402, 403:
+						case 402:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								next := now.Add(30 * time.Minute)
 								state.NextRetryAfter = next
 								suspendReason = "payment_required"
+								shouldSuspendModel = true
+							}
+						case 403:
+							if disableCooling {
+								state.NextRetryAfter = time.Time{}
+							} else if modelFamilyStateKey(result.Model) == "" {
+								// Preserve the legacy cooldown for unknown model families. A
+								// permanent family isolation is only safe when the request can
+								// be attributed to Gemini or Claude/GPT.
+								state.NextRetryAfter = now.Add(30 * time.Minute)
+								suspendReason = "forbidden"
+								shouldSuspendModel = true
+							} else {
+								markModelFamilyInvalid(auth, result.Model, result.Error, now)
+								state = ensureModelState(auth, result.Model)
+								suspendReason = "forbidden"
 								shouldSuspendModel = true
 							}
 						case 404:
@@ -3603,27 +3689,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								shouldSuspendModel = true
 							}
 						case 429:
-							var next time.Time
-							backoffLevel := state.Quota.BackoffLevel
-							if !disableCooling {
-								if result.RetryAfter != nil {
-									next = now.Add(*result.RetryAfter)
-								} else {
-									cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
-									if cooldown > 0 {
-										next = now.Add(cooldown)
-									}
-									backoffLevel = nextLevel
-								}
-							}
-							state.NextRetryAfter = next
-							state.Quota = QuotaState{
-								Exceeded:      true,
-								Reason:        "quota",
-								NextRecoverAt: next,
-								BackoffLevel:  backoffLevel,
-							}
-							if !disableCooling {
+							if disableCooling {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next, backoffLevel := rateLimitRetryAfter(now, result.RetryAfter, state.Quota.BackoffLevel)
+								markModelFamilyRateLimited(auth, result.Model, result.Error, next, backoffLevel, now)
+								state = ensureModelState(auth, result.Model)
 								suspendReason = "quota"
 								shouldSuspendModel = true
 								setModelQuota = true
@@ -3744,7 +3815,7 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		}
 		hasState = true
 		stateUnavailable := false
-		if state.Status == StatusDisabled {
+		if state.Status == StatusDisabled || state.Status == StatusInvalid {
 			stateUnavailable = true
 		} else if state.Unavailable {
 			if state.NextRetryAfter.IsZero() {
@@ -4106,12 +4177,21 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		} else {
 			auth.NextRetryAfter = now.Add(30 * time.Minute)
 		}
-	case 402, 403:
+	case 402:
 		auth.StatusMessage = "payment_required"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
 			auth.NextRetryAfter = now.Add(30 * time.Minute)
+		}
+	case 403:
+		auth.StatusMessage = "forbidden"
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+		} else {
+			auth.Status = StatusInvalid
+			auth.NextRetryAfter = time.Time{}
+			auth.Quota = QuotaState{}
 		}
 	case 404:
 		auth.StatusMessage = "not_found"
@@ -4122,22 +4202,13 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	case 429:
 		auth.StatusMessage = "quota exhausted"
-		auth.Quota.Exceeded = true
-		auth.Quota.Reason = "quota"
-		var next time.Time
-		if !disableCooling {
-			if retryAfter != nil {
-				next = now.Add(*retryAfter)
-			} else {
-				cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
-				if cooldown > 0 {
-					next = now.Add(cooldown)
-				}
-				auth.Quota.BackoffLevel = nextLevel
-			}
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+		} else {
+			next, backoffLevel := rateLimitRetryAfter(now, retryAfter, auth.Quota.BackoffLevel)
+			auth.Quota = QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next, BackoffLevel: backoffLevel}
+			auth.NextRetryAfter = next
 		}
-		auth.Quota.NextRecoverAt = next
-		auth.NextRetryAfter = next
 	case 408, 500, 502, 503, 504:
 		auth.StatusMessage = "transient upstream error"
 		if disableCooling {

@@ -447,6 +447,17 @@ func preferExpiringWeeklyQuotaWithMode(auths []*Auth, now time.Time, model strin
 	}
 	for _, pool := range weeklyPreferencePoolsInOrder() {
 		if len(pools[pool]) > 0 {
+			sort.SliceStable(pools[pool], func(i, j int) bool {
+				left, leftOK := loadWeeklyQuotaPreference(pools[pool][i].ID, model, now)
+				right, rightOK := loadWeeklyQuotaPreference(pools[pool][j].ID, model, now)
+				if leftOK != rightOK {
+					return leftOK
+				}
+				if leftOK && !left.resetAt.Equal(right.resetAt) {
+					return left.resetAt.Before(right.resetAt)
+				}
+				return pools[pool][i].ID < pools[pool][j].ID
+			})
 			return pools[pool], false
 		}
 	}
@@ -730,4 +741,14 @@ func weeklyQuotaFamilyKey(model string) string {
 	default:
 		return "default"
 	}
+}
+
+const modelFamilyStatePrefix = "__family__:"
+
+func modelFamilyStateKey(model string) string {
+	family := weeklyQuotaFamilyKey(model)
+	if family == "" || family == "default" {
+		return ""
+	}
+	return modelFamilyStatePrefix + family
 }

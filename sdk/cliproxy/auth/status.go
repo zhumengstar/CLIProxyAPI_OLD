@@ -16,4 +16,6 @@ const (
 	StatusError Status = "error"
 	// StatusDisabled marks the auth as intentionally disabled.
 	StatusDisabled Status = "disabled"
+	// StatusInvalid marks the auth as unusable until it is explicitly refreshed or reset.
+	StatusInvalid Status = "invalid"
 )

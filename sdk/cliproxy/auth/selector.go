@@ -312,11 +312,16 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
-	if auth.Disabled || auth.Status == StatusDisabled {
+	if auth.Disabled || auth.Status == StatusDisabled || auth.Status == StatusInvalid {
 		return true, blockReasonDisabled, time.Time{}
 	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
+			if familyState := auth.ModelStates[modelFamilyStateKey(model)]; familyState != nil {
+				if blocked, reason, next := isModelStateBlocked(familyState, now); blocked {
+					return blocked, reason, next
+				}
+			}
 			state, ok := auth.ModelStates[model]
 			if (!ok || state == nil) && model != "" {
 				baseModel := canonicalModelKey(model)
@@ -325,26 +330,8 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 				}
 			}
 			if ok && state != nil {
-				if state.Status == StatusDisabled {
-					return true, blockReasonDisabled, time.Time{}
-				}
-				if state.Unavailable {
-					if state.NextRetryAfter.IsZero() {
-						return false, blockReasonNone, time.Time{}
-					}
-					if state.NextRetryAfter.After(now) {
-						next := state.NextRetryAfter
-						if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
-							next = state.Quota.NextRecoverAt
-						}
-						if next.Before(now) {
-							next = now
-						}
-						if state.Quota.Exceeded {
-							return true, blockReasonCooldown, next
-						}
-						return true, blockReasonOther, next
-					}
+				if blocked, reason, next := isModelStateBlocked(state, now); blocked {
+					return blocked, reason, next
 				}
 				return false, blockReasonNone, time.Time{}
 			}
@@ -365,6 +352,26 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return true, blockReasonOther, next
 	}
 	return false, blockReasonNone, time.Time{}
+}
+
+func isModelStateBlocked(state *ModelState, now time.Time) (bool, blockReason, time.Time) {
+	if state == nil {
+		return false, blockReasonNone, time.Time{}
+	}
+	if state.Status == StatusDisabled || state.Status == StatusInvalid {
+		return true, blockReasonDisabled, time.Time{}
+	}
+	if !state.Unavailable || state.NextRetryAfter.IsZero() || !state.NextRetryAfter.After(now) {
+		return false, blockReasonNone, time.Time{}
+	}
+	next := state.NextRetryAfter
+	if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
+		next = state.Quota.NextRecoverAt
+	}
+	if state.Quota.Exceeded {
+		return true, blockReasonCooldown, next
+	}
+	return true, blockReasonOther, next
 }
 
 // sessionPattern matches Claude Code user_id format:
