@@ -225,16 +225,44 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 	if webSearchModel.ContextLength != staticWebSearchModel.ContextLength || webSearchModel.MaxCompletionTokens != staticWebSearchModel.MaxCompletionTokens {
 		t.Fatalf("static token limits should be preserved, got=%#v static=%#v", webSearchModel, staticWebSearchModel)
 	}
-	if agentModel == nil {
-		t.Fatal("expected gemini-3-flash-agent to be registered")
+	if agentModel != nil {
+		t.Fatal("static-only gemini-3-flash-agent should not be registered")
 	}
-	if agentModel.SupportsWebSearch {
-		t.Fatal("gemini-3-flash-agent should not support web search")
+	if staticOnlyModel != nil {
+		t.Fatal("static-only gpt-oss-120b-medium should not be registered")
 	}
-	if staticOnlyModel == nil {
-		t.Fatal("expected static-only Antigravity model to remain registered")
+	if fetchedOnlyModel == nil {
+		t.Fatal("expected fetched-only model to be registered")
 	}
-	if fetchedOnlyModel != nil {
-		t.Fatalf("fetched-only model should not be registered: %#v", fetchedOnlyModel)
+	if !fetchedOnlyModel.SupportsWebSearch {
+		t.Fatal("expected fetched-only model to support web search")
+	}
+}
+
+func TestRegisterModelsForAuth_AntigravityFallsBackToStaticModels(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "temporary upstream failure", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	service := &Service{cfg: &config.Config{}}
+	auth := &coreauth.Auth{
+		ID:       "auth-antigravity-static-fallback",
+		Provider: "antigravity",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{"access_token": "token"},
+	}
+
+	registry := internalregistry.GetGlobalRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() { registry.UnregisterClient(auth.ID) })
+
+	service.registerModelsForAuth(context.Background(), auth)
+	models := registry.GetModelsForClient(auth.ID)
+	if len(models) != len(internalregistry.GetAntigravityModels()) {
+		t.Fatalf("fallback model count = %d, want %d", len(models), len(internalregistry.GetAntigravityModels()))
 	}
 }
