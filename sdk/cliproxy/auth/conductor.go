@@ -216,14 +216,18 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store         Store
-	cooldownStore CooldownStateStore
-	executors     map[string]ProviderExecutor
-	selector      Selector
-	hook          Hook
-	mu            sync.RWMutex
-	auths         map[string]*Auth
-	scheduler     *authScheduler
+	store             Store
+	cooldownStore     CooldownStateStore
+	requestCountStore RequestCountStateStore
+	requestCounts     map[string]RequestCountRecord
+	requestCountDirty chan struct{}
+	requestCountOnce  sync.Once
+	executors         map[string]ProviderExecutor
+	selector          Selector
+	hook              Hook
+	mu                sync.RWMutex
+	auths             map[string]*Auth
+	scheduler         *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
@@ -270,20 +274,100 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		hook:             hook,
-		auths:            make(map[string]*Auth),
-		homeRuntimeAuths: make(map[string]map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
+		store:             store,
+		executors:         make(map[string]ProviderExecutor),
+		selector:          selector,
+		hook:              hook,
+		auths:             make(map[string]*Auth),
+		homeRuntimeAuths:  make(map[string]map[string]*Auth),
+		providerOffsets:   make(map[string]int),
+		modelPoolOffsets:  make(map[string]int),
+		requestCounts:     make(map[string]RequestCountRecord),
+		requestCountDirty: make(chan struct{}, 1),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
 	return manager
+}
+
+// SetRequestCountStateStore configures and loads email-bound cumulative counters.
+func (m *Manager) SetRequestCountStateStore(store RequestCountStateStore) error {
+	if m == nil {
+		return nil
+	}
+	var records []RequestCountRecord
+	var err error
+	if store != nil {
+		records, err = store.Load(context.Background())
+		if err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	m.requestCountStore = store
+	m.requestCounts = make(map[string]RequestCountRecord, len(records))
+	for _, record := range records {
+		email := strings.ToLower(strings.TrimSpace(record.Email))
+		if email == "" {
+			continue
+		}
+		record.Email = email
+		m.requestCounts[email] = record
+	}
+	for _, auth := range m.auths {
+		m.restoreRequestCountLocked(auth)
+	}
+	m.mu.Unlock()
+	if store != nil {
+		m.requestCountOnce.Do(func() {
+			go m.runRequestCountPersistence()
+		})
+	}
+	return nil
+}
+
+func (m *Manager) restoreRequestCountLocked(auth *Auth) {
+	email := requestCountEmail(auth)
+	if email == "" {
+		return
+	}
+	if record, ok := m.requestCounts[email]; ok {
+		auth.Success = record.Success
+		auth.Failed = record.Failed
+	}
+}
+
+func (m *Manager) markRequestCountDirty() {
+	select {
+	case m.requestCountDirty <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Manager) runRequestCountPersistence() {
+	for range m.requestCountDirty {
+		time.Sleep(time.Second)
+		if err := m.persistRequestCounts(context.Background()); err != nil {
+			log.Warnf("failed to persist request counters: %v", err)
+		}
+	}
+}
+
+func (m *Manager) persistRequestCounts(ctx context.Context) error {
+	m.mu.RLock()
+	store := m.requestCountStore
+	records := make([]RequestCountRecord, 0, len(m.requestCounts))
+	for _, record := range m.requestCounts {
+		records = append(records, record)
+	}
+	m.mu.RUnlock()
+	if store == nil {
+		return nil
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Email < records[j].Email })
+	return store.Save(ctx, records)
 }
 
 func (m *Manager) SetPluginScheduler(scheduler PluginScheduler) {
@@ -2130,6 +2214,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	RestoreManualWeeklyPriority(auth)
 	authClone := auth.Clone()
 	m.mu.Lock()
+	m.restoreRequestCountLocked(authClone)
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
@@ -2164,6 +2249,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	auth.Success = existing.Success
 	auth.Failed = existing.Failed
+	m.restoreRequestCountLocked(auth)
 	auth.recentRequests = existing.recentRequests
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
@@ -3597,7 +3683,20 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
 		auth.recordRecentRequest(now, result.Success)
-		if result.Success {
+		if email := requestCountEmail(auth); email != "" {
+			record := m.requestCounts[email]
+			record.Email = email
+			if result.Success {
+				record.Success++
+			} else {
+				record.Failed++
+			}
+			record.UpdatedAt = now.UTC()
+			m.requestCounts[email] = record
+			auth.Success = record.Success
+			auth.Failed = record.Failed
+			m.markRequestCountDirty()
+		} else if result.Success {
 			auth.Success++
 		} else {
 			auth.Failed++
@@ -4275,7 +4374,9 @@ func (m *Manager) List() []*Auth {
 	defer m.mu.RUnlock()
 	list := make([]*Auth, 0, len(m.auths))
 	for _, auth := range m.auths {
-		list = append(list, auth.Clone())
+		clone := auth.Clone()
+		m.restoreRequestCountLocked(clone)
+		list = append(list, clone)
 	}
 	return list
 }
@@ -4292,7 +4393,9 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 	if !ok {
 		return nil, false
 	}
-	return auth.Clone(), true
+	clone := auth.Clone()
+	m.restoreRequestCountLocked(clone)
+	return clone, true
 }
 
 // GetExecutionSessionAuthByID retrieves a Home runtime auth scoped to an execution session.
@@ -5386,6 +5489,9 @@ func (m *Manager) StopAutoRefresh() {
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if err := m.persistRequestCounts(context.Background()); err != nil {
+		log.Warnf("failed to flush request counters: %v", err)
 	}
 	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
 	if stoppable, ok := m.selector.(StoppableSelector); ok {

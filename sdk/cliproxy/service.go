@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -785,6 +786,21 @@ func (s *Service) configureCooldownStateStore(cfg *config.Config) {
 		return
 	}
 	s.coreManager.SetCooldownStateStore(coreauth.NewFileCooldownStateStoreWithAuthDir(authDir, authDir))
+}
+
+func (s *Service) configureRequestCountStateStore(cfg *config.Config) {
+	if s == nil || s.coreManager == nil || cfg == nil || cfg.Home.Enabled {
+		return
+	}
+	authDir, err := util.ResolveAuthDir(cfg.AuthDir)
+	if err != nil || strings.TrimSpace(authDir) == "" {
+		log.Warnf("failed to resolve request count state directory: %v", err)
+		return
+	}
+	path := filepath.Join(authDir, ".runtime", "request-counts.json")
+	if err = s.coreManager.SetRequestCountStateStore(coreauth.NewFileRequestCountStateStore(path)); err != nil {
+		log.Warnf("failed to restore request counters: %v", err)
+	}
 }
 
 func resolveCooldownStateAuthDir(cfg *config.Config) (string, error) {
@@ -1633,6 +1649,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.applyRetryConfig(s.cfg)
 	s.configureCooldownStateStore(s.cfg)
+	s.configureRequestCountStateStore(s.cfg)
 
 	s.registerPluginAuthParser()
 	if s.coreManager != nil && !homeEnabled {
