@@ -920,19 +920,37 @@ func (h *Handler) PatchAuthFileManualPriority(c *gin.Context) {
 		return
 	}
 
-	coreauth.PersistManualWeeklyPriorityForPool(targetAuth, pool, req.Enabled)
-	targetAuth.UpdatedAt = time.Now()
-	if _, err := h.authManager.Update(c.Request.Context(), targetAuth); err != nil {
+	originalAuth := targetAuth.Clone()
+	candidateAuth := targetAuth.Clone()
+	coreauth.PersistManualWeeklyPriorityForPool(candidateAuth, pool, req.Enabled)
+	candidateAuth.UpdatedAt = time.Now()
+	ctx := c.Request.Context()
+	if err := h.authManager.PersistAuth(ctx, candidateAuth); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to persist manual priority: %v", err)})
 		return
 	}
-	coreauth.SetManualWeeklyPriorityForPool(targetAuth.ID, pool, req.Enabled)
+	if updated, err := h.authManager.Update(coreauth.WithSkipPersist(ctx), candidateAuth); err != nil || updated == nil {
+		rollbackErr := h.authManager.PersistAuth(ctx, originalAuth)
+		if rollbackErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update manual priority in memory: %v; rollback failed: %v", err, rollbackErr)})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update manual priority in memory: %v", err)})
+		return
+	}
+	coreauth.SetManualWeeklyPriorityForPool(candidateAuth.ID, pool, req.Enabled)
+	memoryApplied := coreauth.ManualWeeklyPriorityForPool(candidateAuth.ID, pool) == req.Enabled
 	c.JSON(http.StatusOK, gin.H{
-		"status":                 "ok",
-		"id":                     targetAuth.ID,
-		"name":                   targetAuth.FileName,
-		"manual_weekly_priority": req.Enabled,
-		"pool":                   pool,
+		"status":                            "ok",
+		"id":                                candidateAuth.ID,
+		"name":                              candidateAuth.FileName,
+		"manual_weekly_priority":            req.Enabled,
+		"manual_weekly_priority_gemini":     coreauth.ManualWeeklyPriorityForPool(candidateAuth.ID, "gemini"),
+		"manual_weekly_priority_claude_gpt": coreauth.ManualWeeklyPriorityForPool(candidateAuth.ID, "claude-gpt"),
+		"pool":                              pool,
+		"persisted":                         true,
+		"memory_applied":                    memoryApplied,
+		"updated_at":                        candidateAuth.UpdatedAt,
 	})
 }
 

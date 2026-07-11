@@ -235,6 +235,37 @@ func TestSchedulerFiltersToSoonWeeklyQuotaPool(t *testing.T) {
 	}
 }
 
+func TestSchedulerWeightsUrgentPoolByResetTime(t *testing.T) {
+	resetWeeklyQuotaPreferences(t)
+	now := time.Now()
+	closer := &Auth{ID: "closer", Provider: "antigravity"}
+	farther := &Auth{ID: "farther", Provider: "antigravity"}
+	ObserveQuotaHeaders(closer.ID, weeklyHeaders(now.Add(2*time.Hour), 50))
+	ObserveQuotaHeaders(farther.ID, weeklyHeaders(now.Add(20*time.Hour), 50))
+
+	view := readyView{flat: []*scheduledAuth{{auth: closer}, {auth: farther}}}
+	predicate, pool := weeklyPreferredPredicate(view.flat, nil, now, "gemini-pro-agent")
+	if pool != weeklyPreferencePoolUrgent {
+		t.Fatalf("pool = %v, want urgent", pool)
+	}
+	counts := map[string]int{}
+	for range 90 {
+		picked := view.pickSmoothWeightedRoundRobin(predicate, func(entry *scheduledAuth) int {
+			return urgentWeeklyResetWeight(entry, now, "gemini-pro-agent")
+		})
+		if picked == nil {
+			t.Fatal("expected a weighted pick")
+		}
+		counts[picked.auth.ID]++
+	}
+	if counts[closer.ID] <= counts[farther.ID] {
+		t.Fatalf("closer picks = %d, farther picks = %d", counts[closer.ID], counts[farther.ID])
+	}
+	if counts[farther.ID] == 0 {
+		t.Fatal("farther urgent auth must remain reachable")
+	}
+}
+
 func TestSchedulerManualWeeklyPriorityOverridesStickySoon(t *testing.T) {
 	resetWeeklyQuotaPreferences(t)
 	now := time.Now()

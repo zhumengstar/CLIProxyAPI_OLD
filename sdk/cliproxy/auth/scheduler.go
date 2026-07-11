@@ -85,8 +85,9 @@ type readyBucket struct {
 
 // readyView holds the selection order for flat round-robin traversal.
 type readyView struct {
-	flat   []*scheduledAuth
-	cursor int
+	flat            []*scheduledAuth
+	cursor          int
+	weightedCurrent map[string]int
 }
 
 // cooldownQueue is the blocked auth collection ordered by next retry time during rebuilds.
@@ -809,10 +810,14 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		view = &bucket.ws
 	}
 	now := time.Now()
-	predicate = weightedWeeklyPreferredPredicate(view.flat, predicate, now, m.modelKey)
+	predicate, weeklyPool := weeklyPreferredPredicate(view.flat, predicate, now, m.modelKey)
 	var picked *scheduledAuth
 	if strategy == schedulerStrategyFillFirst {
 		picked = view.pickFirst(predicate)
+	} else if weeklyPool == weeklyPreferencePoolUrgent {
+		picked = view.pickSmoothWeightedRoundRobin(predicate, func(entry *scheduledAuth) int {
+			return urgentWeeklyResetWeight(entry, now, m.modelKey)
+		})
 	} else {
 		picked = view.pickRoundRobin(predicate)
 	}
@@ -995,4 +1000,46 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 		return entry
 	}
 	return nil
+}
+
+// pickSmoothWeightedRoundRobin distributes requests according to stable integer
+// weights while still guaranteeing that every eligible entry is selected.
+func (v *readyView) pickSmoothWeightedRoundRobin(predicate func(*scheduledAuth) bool, weight func(*scheduledAuth) int) *scheduledAuth {
+	if len(v.flat) == 0 {
+		return nil
+	}
+	if v.weightedCurrent == nil {
+		v.weightedCurrent = make(map[string]int, len(v.flat))
+	}
+	var picked *scheduledAuth
+	pickedScore := 0
+	totalWeight := 0
+	eligible := make(map[string]struct{}, len(v.flat))
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
+			continue
+		}
+		entryWeight := weight(entry)
+		if entryWeight < 1 {
+			entryWeight = 1
+		}
+		id := entry.auth.ID
+		eligible[id] = struct{}{}
+		v.weightedCurrent[id] += entryWeight
+		totalWeight += entryWeight
+		if picked == nil || v.weightedCurrent[id] > pickedScore {
+			picked = entry
+			pickedScore = v.weightedCurrent[id]
+		}
+	}
+	if picked == nil {
+		return nil
+	}
+	v.weightedCurrent[picked.auth.ID] -= totalWeight
+	for id := range v.weightedCurrent {
+		if _, ok := eligible[id]; !ok {
+			delete(v.weightedCurrent, id)
+		}
+	}
+	return picked
 }

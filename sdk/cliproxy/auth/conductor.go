@@ -5234,6 +5234,15 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	return err
 }
 
+// PersistAuth writes an auth record to the configured store and reports any
+// persistence error without changing the manager's runtime state.
+func (m *Manager) PersistAuth(ctx context.Context, auth *Auth) error {
+	if m == nil {
+		return nil
+	}
+	return m.persist(ctx, auth)
+}
+
 // StartAutoRefresh launches a background loop that evaluates auth freshness
 // every few seconds and triggers refresh operations when required.
 // Only one loop is kept alive; starting a new one cancels the previous run.

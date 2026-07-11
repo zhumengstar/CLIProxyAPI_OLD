@@ -454,6 +454,11 @@ func preferExpiringWeeklyQuotaWithMode(auths []*Auth, now time.Time, model strin
 }
 
 func weightedWeeklyPreferredPredicate(entries []*scheduledAuth, predicate func(*scheduledAuth) bool, now time.Time, model string) func(*scheduledAuth) bool {
+	selected, _ := weeklyPreferredPredicate(entries, predicate, now, model)
+	return selected
+}
+
+func weeklyPreferredPredicate(entries []*scheduledAuth, predicate func(*scheduledAuth) bool, now time.Time, model string) (func(*scheduledAuth) bool, weeklyPreferencePool) {
 	predicate = fiveHourQuotaEligiblePredicate(predicate, now, model)
 	counts := make(map[weeklyPreferencePool]int, 4)
 	for _, entry := range entries {
@@ -467,10 +472,34 @@ func weightedWeeklyPreferredPredicate(entries []*scheduledAuth, predicate func(*
 	}
 	for _, pool := range weeklyPreferencePoolsInOrder() {
 		if counts[pool] > 0 {
-			return weeklyPoolPredicate(predicate, now, model, pool)
+			return weeklyPoolPredicate(predicate, now, model, pool), pool
 		}
 	}
-	return predicate
+	return predicate, weeklyPreferencePoolNone
+}
+
+// urgentWeeklyResetWeight maps the remaining time in the 24-hour pool to a
+// weight from 1 through 12. Each two hours closer to reset adds one share.
+func urgentWeeklyResetWeight(entry *scheduledAuth, now time.Time, model string) int {
+	if entry == nil || entry.auth == nil {
+		return 1
+	}
+	preference, pool := weeklyPreferencePoolForAuth(entry.auth, now, model)
+	if pool != weeklyPreferencePoolUrgent {
+		return 1
+	}
+	remaining := preference.resetAt.Sub(now)
+	if remaining <= 0 {
+		return 12
+	}
+	weight := 12 - int((remaining-time.Nanosecond)/(2*time.Hour))
+	if weight < 1 {
+		return 1
+	}
+	if weight > 12 {
+		return 12
+	}
+	return weight
 }
 
 func fiveHourQuotaEligiblePredicate(predicate func(*scheduledAuth) bool, now time.Time, model string) func(*scheduledAuth) bool {
