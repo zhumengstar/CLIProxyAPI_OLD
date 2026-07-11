@@ -5,6 +5,34 @@ import (
 	"testing"
 )
 
+func TestManager_Update_RestoresManualPriorityFromMetadata(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "manual-priority-update", Provider: "antigravity"}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	t.Cleanup(func() {
+		SetManualWeeklyPriorityForPool(auth.ID, "gemini", false)
+		SetManualWeeklyPriorityForPool(auth.ID, "claude-gpt", false)
+	})
+
+	updated := auth.Clone()
+	updated.Metadata = map[string]any{
+		manualGeminiPriorityMetadataKey: true,
+		manualClaudePriorityMetadataKey: true,
+	}
+	if _, err := manager.Update(context.Background(), updated); err != nil {
+		t.Fatalf("update auth: %v", err)
+	}
+
+	if !ManualWeeklyPriorityForPool(auth.ID, "gemini") {
+		t.Fatal("expected Gemini priority to be restored during update")
+	}
+	if !ManualWeeklyPriorityForPool(auth.ID, "claude-gpt") {
+		t.Fatal("expected Claude/GPT priority to be restored during update")
+	}
+}
+
 func TestManager_Update_PreservesModelStates(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 
