@@ -64,6 +64,7 @@ type modelScheduler struct {
 	entries         map[string]*scheduledAuth
 	priorityOrder   []int
 	readyByPriority map[int]*readyBucket
+	allReady        readyBucket
 	blocked         cooldownQueue
 	providerKey     string
 	manualRouting   *manualWeeklyRoutingState
@@ -94,7 +95,8 @@ type readyView struct {
 type cooldownQueue []*scheduledAuth
 
 type readyViewCursorState struct {
-	cursor int
+	cursor          int
+	weightedCurrent map[string]int
 }
 
 type readyBucketCursorState struct {
@@ -103,7 +105,11 @@ type readyBucketCursorState struct {
 }
 
 func snapshotReadyViewCursors(view readyView) readyViewCursorState {
-	return readyViewCursorState{cursor: view.cursor}
+	weightedCurrent := make(map[string]int, len(view.weightedCurrent))
+	for id, current := range view.weightedCurrent {
+		weightedCurrent[id] = current
+	}
+	return readyViewCursorState{cursor: view.cursor, weightedCurrent: weightedCurrent}
 }
 
 func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
@@ -112,6 +118,9 @@ func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
 	}
 	if len(view.flat) > 0 {
 		view.cursor = normalizeCursor(state.cursor, len(view.flat))
+	}
+	if len(state.weightedCurrent) > 0 {
+		view.weightedCurrent = state.weightedCurrent
 	}
 }
 
@@ -755,8 +764,41 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 		if picked := m.manualRouting.pick(manualEntries, predicate, now, m.modelKey, m.providerKey); picked != nil {
 			return picked.auth
 		}
+		basePredicate := predicate
+		predicate = func(entry *scheduledAuth) bool {
+			return entry != nil && entry.auth != nil &&
+				(basePredicate == nil || basePredicate(entry)) &&
+				!m.manualRouting.inCadence(entry.auth.ID, m.modelKey, now)
+		}
 	}
 	predicate = fiveHourQuotaEligiblePredicate(predicate, now, m.modelKey)
+	// Weekly reset pools are a routing policy above configured auth priority.
+	// Resolve the active pool across every ready priority bucket first, otherwise
+	// a high configured priority in a later pool can hide urgent credentials.
+	readyEntries := make([]*scheduledAuth, 0, len(m.entries))
+	for _, entry := range m.entries {
+		if entry != nil && entry.state == scheduledStateReady {
+			readyEntries = append(readyEntries, entry)
+		}
+	}
+	predicate, weeklyPool := weeklyPreferredPredicate(readyEntries, predicate, now, m.modelKey)
+	if weeklyPool == weeklyPreferencePoolUrgent {
+		view := &m.allReady.all
+		if preferWebsocket && m.allReady.ws.pickFirst(predicate) != nil {
+			view = &m.allReady.ws
+		}
+		var picked *scheduledAuth
+		if strategy == schedulerStrategyFillFirst {
+			picked = view.pickFirst(predicate)
+		} else {
+			picked = view.pickSmoothWeightedRoundRobin(predicate, func(entry *scheduledAuth) int {
+				return urgentWeeklyResetWeight(entry, now, m.modelKey)
+			})
+		}
+		if picked != nil {
+			return picked.auth
+		}
+	}
 	priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocket, predicate)
 	if !okPriority {
 		return nil
@@ -891,6 +933,10 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 
 // rebuildIndexesLocked reconstructs ready and blocked views from the current entry map.
 func (m *modelScheduler) rebuildIndexesLocked() {
+	allReadyState := readyBucketCursorState{
+		all: snapshotReadyViewCursors(m.allReady.all),
+		ws:  snapshotReadyViewCursors(m.allReady.ws),
+	}
 	cursorStates := make(map[int]readyBucketCursorState, len(m.readyByPriority))
 	for priority, bucket := range m.readyByPriority {
 		if bucket == nil {
@@ -906,6 +952,7 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 	m.priorityOrder = m.priorityOrder[:0]
 	m.blocked = m.blocked[:0]
 	priorityBuckets := make(map[int][]*scheduledAuth)
+	allReadyEntries := make([]*scheduledAuth, 0, len(m.entries))
 	for _, entry := range m.entries {
 		if entry == nil || entry.auth == nil {
 			continue
@@ -914,9 +961,19 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 		case scheduledStateReady:
 			priority := entry.meta.priority
 			priorityBuckets[priority] = append(priorityBuckets[priority], entry)
+			allReadyEntries = append(allReadyEntries, entry)
 		case scheduledStateCooldown, scheduledStateBlocked:
 			m.blocked = append(m.blocked, entry)
 		}
+	}
+	sort.Slice(allReadyEntries, func(i, j int) bool {
+		return allReadyEntries[i].auth.ID < allReadyEntries[j].auth.ID
+	})
+	allReady := buildReadyBucket(allReadyEntries)
+	if allReady != nil {
+		restoreReadyViewCursors(&allReady.all, allReadyState.all)
+		restoreReadyViewCursors(&allReady.ws, allReadyState.ws)
+		m.allReady = *allReady
 	}
 	for priority, entries := range priorityBuckets {
 		sort.Slice(entries, func(i, j int) bool {

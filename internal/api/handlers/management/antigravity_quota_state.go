@@ -792,7 +792,11 @@ func antigravityWeeklyQuotaByFamily(raw json.RawMessage, now time.Time) map[stri
 		}
 		consider := func(bucket antigravityQuotaBucket) {
 			resetAt, ok := parsePersistedAntigravityResetTime(bucket)
-			if !ok || !resetAt.After(now) || resetAt.Sub(now) < 24*time.Hour || resetAt.Sub(now) > 8*24*time.Hour {
+			if !ok || !resetAt.After(now) || resetAt.Sub(now) > 8*24*time.Hour {
+				return
+			}
+			window := antigravityQuotaBucketWindow(bucket)
+			if window == "short" || (window == "" && resetAt.Sub(now) < 24*time.Hour) {
 				return
 			}
 			remaining, ok := parsePersistedAntigravityRemaining(bucket)
@@ -805,6 +809,7 @@ func antigravityWeeklyQuotaByFamily(raw json.RawMessage, now time.Time) map[stri
 			}
 		}
 		consider(antigravityQuotaBucket{
+			BucketID: group.ID, DisplayName: firstNonEmpty(group.DisplayName, group.Label, group.Name),
 			ResetTime: group.ResetTime, ResetTimeSnake: group.ResetTimeSnake,
 			RemainingFraction: group.RemainingFraction, RemainingFractionSnake: group.RemainingFractionSnake,
 		})
@@ -828,7 +833,11 @@ func antigravityFiveHourQuotaByFamily(raw json.RawMessage, now time.Time) map[st
 		}
 		consider := func(bucket antigravityQuotaBucket) {
 			resetAt, ok := parsePersistedAntigravityResetTime(bucket)
-			if !ok || !resetAt.After(now) || resetAt.Sub(now) >= 24*time.Hour {
+			if !ok || !resetAt.After(now) {
+				return
+			}
+			window := antigravityQuotaBucketWindow(bucket)
+			if window == "weekly" || (window == "" && resetAt.Sub(now) >= 24*time.Hour) {
 				return
 			}
 			remaining, ok := parsePersistedAntigravityRemaining(bucket)
@@ -841,6 +850,7 @@ func antigravityFiveHourQuotaByFamily(raw json.RawMessage, now time.Time) map[st
 			}
 		}
 		consider(antigravityQuotaBucket{
+			BucketID: group.ID, DisplayName: firstNonEmpty(group.DisplayName, group.Label, group.Name),
 			ResetTime: group.ResetTime, ResetTimeSnake: group.ResetTimeSnake,
 			RemainingFraction: group.RemainingFraction, RemainingFractionSnake: group.RemainingFractionSnake,
 		})
@@ -849,6 +859,19 @@ func antigravityFiveHourQuotaByFamily(raw json.RawMessage, now time.Time) map[st
 		}
 	}
 	return result
+}
+
+func antigravityQuotaBucketWindow(bucket antigravityQuotaBucket) string {
+	descriptor := strings.ToLower(strings.Join([]string{bucket.Window, bucket.BucketID, bucket.DisplayName}, " "))
+	switch {
+	case strings.Contains(descriptor, "weekly"), strings.Contains(descriptor, "week"), strings.Contains(descriptor, "周"):
+		return "weekly"
+	case strings.Contains(descriptor, "five-hour"), strings.Contains(descriptor, "5-hour"),
+		strings.Contains(descriptor, "5 hour"), strings.Contains(descriptor, "short"), strings.Contains(descriptor, "5小时"):
+		return "short"
+	default:
+		return ""
+	}
 }
 
 func antigravityQuotaGroupFamily(group antigravityQuotaGroup) string {

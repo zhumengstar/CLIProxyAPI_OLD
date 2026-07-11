@@ -124,6 +124,26 @@ func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_UrgentWeeklyPoolOverridesConfiguredPriority(t *testing.T) {
+	resetWeeklyQuotaPreferences(t)
+	const model = "gemini-pro-agent"
+	now := time.Now()
+	urgent := &Auth{ID: "urgent-low-priority", Provider: "antigravity", Attributes: map[string]string{"priority": "0"}}
+	reserve := &Auth{ID: "reserve-high-priority", Provider: "antigravity", Attributes: map[string]string{"priority": "10"}}
+	registerSchedulerModels(t, "antigravity", model, urgent.ID, reserve.ID)
+	ObserveQuotaHeaders(urgent.ID, weeklyHeaders(now.Add(4*time.Hour), 50))
+	ObserveQuotaHeaders(reserve.ID, weeklyHeaders(now.Add(5*24*time.Hour), 90))
+
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, urgent, reserve)
+	got, errPick := scheduler.pickSingle(context.Background(), "antigravity", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != urgent.ID {
+		t.Fatalf("pickSingle() auth = %#v, want %q", got, urgent.ID)
+	}
+}
+
 func TestSchedulerPick_ManualPriorityOverridesConfiguredPriorityAndFallsBackDuringCadence(t *testing.T) {
 	resetWeeklyQuotaPreferences(t)
 	const model = "gemini-3-pro"

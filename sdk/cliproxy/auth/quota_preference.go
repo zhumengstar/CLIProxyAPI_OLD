@@ -517,6 +517,14 @@ type manualWeeklyRoutingState struct {
 	lastPicked map[string]time.Time
 }
 
+func (s *manualWeeklyRoutingState) inCadence(authID, model string, now time.Time) bool {
+	if s == nil || s.lastPicked == nil {
+		return false
+	}
+	last := s.lastPicked[strings.TrimSpace(authID)+"\x00"+weeklyQuotaFamilyKey(model)]
+	return !last.IsZero() && now.Sub(last) < manualPriorityInterval
+}
+
 func (s *manualWeeklyRoutingState) pick(entries []*scheduledAuth, predicate func(*scheduledAuth) bool, now time.Time, model, scope string) *scheduledAuth {
 	type candidate struct {
 		entry *scheduledAuth
