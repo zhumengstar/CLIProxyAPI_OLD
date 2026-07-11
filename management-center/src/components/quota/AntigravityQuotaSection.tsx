@@ -62,8 +62,10 @@ interface AntigravityQuotaSectionProps {
   files: AuthFileItem[];
   loading: boolean;
   disabled: boolean;
-  onFilesChanged?: () => void;
+  onFilesChanged?: () => void | Promise<void>;
 }
+
+type ManualPriorityOverrides = Record<string, Partial<Record<AntigravityPool, boolean>>>;
 
 const nowLabel = () => new Date().toISOString();
 
@@ -211,6 +213,8 @@ export function AntigravityQuotaSection({
   const [visibleCount, setVisibleCount] = useState(INITIAL_RENDER_COUNT);
   const [refreshingNames, setRefreshingNames] = useState<Set<string>>(() => new Set());
   const [priorityUpdatingNames, setPriorityUpdatingNames] = useState<Set<string>>(() => new Set());
+  const [manualPriorityOverrides, setManualPriorityOverrides] =
+    useState<ManualPriorityOverrides>({});
   const saveTimerRef = useRef<number | null>(null);
   const quotaRef = useRef(quota);
 
@@ -219,6 +223,19 @@ export function AntigravityQuotaSection({
   }, [quota]);
 
   const quotaFiles = useMemo(() => files.filter(isAntigravityFileLike), [files]);
+
+  // A file-list reload is the authoritative reconciliation point. Optimistic
+  // pin state only exists between a successful PATCH and that reload, so an
+  // automatic server-side unpin (for example, depleted quota) still wins.
+  useEffect(() => {
+    setManualPriorityOverrides({});
+  }, [files]);
+
+  const isManualPriorityEnabled = useCallback(
+    (file: AuthFileItem, targetPool: AntigravityPool): boolean =>
+      manualPriorityOverrides[file.name]?.[targetPool] ?? manualPriorityForPool(file, targetPool),
+    [manualPriorityOverrides]
+  );
 
   useEffect(() => {
     if (loading) return;
@@ -387,12 +404,16 @@ export function AntigravityQuotaSection({
   const toggleManualPriority = useCallback(
     async (file: AuthFileItem) => {
       if (disabled || !isEnabledFile(file)) return;
-      const current = manualPriorityForPool(file, pool);
+      const current = isManualPriorityEnabled(file, pool);
       setPriorityUpdatingNames((prev) => new Set(prev).add(file.name));
       try {
         await antigravityQuotaStateApi.setManualPriority(file.name, pool, !current);
+        setManualPriorityOverrides((prev) => ({
+          ...prev,
+          [file.name]: { ...prev[file.name], [pool]: !current },
+        }));
         showNotification(!current ? `已置顶 ${file.name}` : `已取消置顶 ${file.name}`, 'success');
-        onFilesChanged?.();
+        await onFilesChanged?.();
       } catch (err: unknown) {
         showNotification(`置顶更新失败：${errorMessageFromUnknown(err)}`, 'error');
       } finally {
@@ -403,7 +424,7 @@ export function AntigravityQuotaSection({
         });
       }
     },
-    [disabled, onFilesChanged, pool, showNotification]
+    [disabled, isManualPriorityEnabled, onFilesChanged, pool, showNotification]
   );
 
   const titleNode = (
@@ -511,6 +532,7 @@ export function AntigravityQuotaSection({
                     file={file}
                     state={state}
                     pool={pool}
+                    pinned={isManualPriorityEnabled(file, pool)}
                     refreshing={refreshingNames.has(file.name)}
                     priorityUpdating={priorityUpdatingNames.has(file.name)}
                     disabled={disabled}
@@ -532,6 +554,7 @@ interface AntigravityQuotaCardProps {
   file: AuthFileItem;
   state: AntigravityEnhancedQuotaState;
   pool: AntigravityPool;
+  pinned: boolean;
   refreshing: boolean;
   priorityUpdating: boolean;
   disabled: boolean;
@@ -544,6 +567,7 @@ function AntigravityQuotaCard({
   file,
   state,
   pool,
+  pinned,
   refreshing,
   priorityUpdating,
   disabled,
@@ -551,7 +575,6 @@ function AntigravityQuotaCard({
   onRefresh,
   onTogglePriority,
 }: AntigravityQuotaCardProps) {
-  const pinned = manualPriorityForPool(file, pool);
   const enabled = isEnabledFile(file);
   const rows = [
     aggregateWindow(state, 'gemini', 'five-hour', 'Gemini · 5 小时'),
