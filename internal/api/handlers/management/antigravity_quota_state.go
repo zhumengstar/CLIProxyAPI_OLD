@@ -92,6 +92,7 @@ func (h *Handler) PutAntigravityQuotaState(c *gin.Context) {
 	if state.Files == nil {
 		state.Files = map[string]json.RawMessage{}
 	}
+	state.Files = h.filterAntigravityQuotaFilesToActiveAuths(state.Files)
 	now := time.Now().UTC()
 	state.SavedAt = now.Format(time.RFC3339)
 	if strings.TrimSpace(state.QuotaRefreshedAt) == "" {
@@ -162,6 +163,7 @@ func (h *Handler) readAntigravityQuotaState() (antigravityQuotaState, error) {
 	if state.Files == nil {
 		state.Files = map[string]json.RawMessage{}
 	}
+	state.Files = h.filterAntigravityQuotaFilesToActiveAuths(state.Files)
 	for fileName, raw := range state.Files {
 		state.Files[fileName] = normalizePersistedAntigravityTransient(raw)
 	}
@@ -662,6 +664,9 @@ func (h *Handler) persistAntigravityQuotaStateFile(fileName string, raw json.Raw
 	if h == nil {
 		return errors.New("management handler is unavailable")
 	}
+	if !h.isActiveAntigravityAuthFileName(fileName) {
+		return nil
+	}
 	h.quotaStateMu.Lock()
 	defer h.quotaStateMu.Unlock()
 
@@ -672,6 +677,7 @@ func (h *Handler) persistAntigravityQuotaStateFile(fileName string, raw json.Raw
 	if state.Files == nil {
 		state.Files = map[string]json.RawMessage{}
 	}
+	state.Files = h.filterAntigravityQuotaFilesToActiveAuths(state.Files)
 	state.Files[fileName] = mergeAntigravityQuotaAttempt(state.Files[fileName], raw)
 	now := time.Now().UTC().Format(time.RFC3339)
 	state.SavedAt = now
@@ -777,6 +783,63 @@ func (h *Handler) antigravityAuthIDByFileName() map[string]string {
 		}
 	}
 	return result
+}
+
+func (h *Handler) filterAntigravityQuotaFilesToActiveAuths(files map[string]json.RawMessage) map[string]json.RawMessage {
+	if len(files) == 0 || h == nil || h.authManager == nil {
+		return files
+	}
+	active := h.activeAntigravityAuthFileNames()
+	if active == nil {
+		return files
+	}
+	filtered := make(map[string]json.RawMessage, len(files))
+	for fileName, raw := range files {
+		base := filepath.Base(strings.TrimSpace(fileName))
+		if _, ok := active[base]; ok {
+			filtered[base] = raw
+		}
+	}
+	return filtered
+}
+
+func (h *Handler) activeAntigravityAuthFileNames() map[string]struct{} {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	result := map[string]struct{}{}
+	for _, auth := range h.authManager.List() {
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+			continue
+		}
+		for _, candidate := range []string{
+			auth.FileName,
+			authAttribute(auth, "path"),
+			authAttribute(auth, coreauth.AttributeVirtualSource),
+		} {
+			base := filepath.Base(strings.TrimSpace(candidate))
+			if base != "" && base != "." {
+				result[base] = struct{}{}
+			}
+		}
+	}
+	return result
+}
+
+func (h *Handler) isActiveAntigravityAuthFileName(fileName string) bool {
+	if h == nil || h.authManager == nil {
+		return true
+	}
+	base := filepath.Base(strings.TrimSpace(fileName))
+	if base == "" || base == "." {
+		return false
+	}
+	active := h.activeAntigravityAuthFileNames()
+	if active == nil {
+		return true
+	}
+	_, ok := active[base]
+	return ok
 }
 
 func antigravityWeeklyQuotaByFamily(raw json.RawMessage, now time.Time) map[string]coreauth.WeeklyQuotaSnapshotUpdate {
