@@ -154,6 +154,10 @@ const readDateField = (entry: AuthFileEntry): number => {
 
 const isRuntimeOnlyEntry = (entry: AuthFileEntry): boolean => entry['runtime_only'] === true;
 
+const isFileBackedEntry = (entry: AuthFileEntry): boolean =>
+  readTextField(entry, 'source').toLowerCase() === 'file' ||
+  Boolean(readTextField(entry, 'path'));
+
 const hasMeaningfulValue = (value: unknown): boolean => {
   if (value == null) return false;
   if (typeof value === 'string') return value.trim().length > 0;
@@ -172,7 +176,6 @@ const authFilePriorityScore = (entry: AuthFileEntry): number => {
   if (readTextField(entry, 'source').toLowerCase() === 'file') score += 32;
   if (readTextField(entry, 'path')) score += 16;
   if (!isRuntimeOnlyEntry(entry)) score += 8;
-  if (entry.disabled !== true) score += 4;
   if (readDateField(entry) > 0) score += 2;
   return score;
 };
@@ -190,6 +193,41 @@ const compareAuthFileEntries = (left: AuthFileEntry, right: AuthFileEntry): numb
   return 0;
 };
 
+const pickStatusAuthorityEntry = (entries: AuthFileEntry[]): AuthFileEntry | undefined =>
+  [...entries]
+    .filter(isFileBackedEntry)
+    .sort((left, right) => {
+      const fileSourceDiff =
+        Number(readTextField(right, 'source').toLowerCase() === 'file') -
+        Number(readTextField(left, 'source').toLowerCase() === 'file');
+      if (fileSourceDiff !== 0) return fileSourceDiff;
+
+      const pathDiff =
+        Number(Boolean(readTextField(right, 'path'))) -
+        Number(Boolean(readTextField(left, 'path')));
+      if (pathDiff !== 0) return pathDiff;
+
+      return readDateField(right) - readDateField(left);
+    })[0];
+
+const copyAuthRuntimeState = (target: AuthFileEntry, source: AuthFileEntry | undefined): void => {
+  if (!source) return;
+  [
+    'disabled',
+    'unavailable',
+    'status',
+    'status_message',
+    'statusMessage',
+    'manual_weekly_priority',
+    'manual_weekly_priority_gemini',
+    'manual_weekly_priority_claude_gpt',
+  ].forEach((key) => {
+    if (key in source) {
+      target[key] = source[key];
+    }
+  });
+};
+
 const mergeAuthFileEntries = (entries: AuthFileEntry[]): AuthFileEntry => {
   const [primary, ...rest] = [...entries].sort(compareAuthFileEntries);
   const merged: AuthFileEntry = { ...primary };
@@ -201,6 +239,10 @@ const mergeAuthFileEntries = (entries: AuthFileEntry[]): AuthFileEntry => {
       }
     });
   });
+
+  // Quota/cache records can outlive the auth file. Keep display/runtime state
+  // tied to the current file-backed auth entry instead of stale cached quota.
+  copyAuthRuntimeState(merged, pickStatusAuthorityEntry(entries) ?? primary);
 
   return merged;
 };
