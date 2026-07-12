@@ -21,6 +21,7 @@ import (
 const resetQuotaBatchPageSizeMax = 100
 
 const antigravityQuotaTokenRefreshAttempts = 3
+const antigravityQuotaResetTimeout = 2 * time.Minute
 
 var antigravityRetrieveUserQuotaSummaryURLs = []string{
 	"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
@@ -256,7 +257,10 @@ func (h *Handler) resetQuotaForAuth(ctx context.Context, auth *coreauth.Auth) (*
 		return nil, nil, nil, nil
 	}
 
-	updated, models, errReset := h.authManager.ResetQuota(ctx, auth.ID)
+	operationCtx, cancel := context.WithTimeout(context.Background(), antigravityQuotaResetTimeout)
+	defer cancel()
+
+	updated, models, errReset := h.authManager.ResetQuota(operationCtx, auth.ID)
 	if errReset != nil {
 		_ = h.persistAntigravityQuotaFailure(auth, errReset)
 		return nil, nil, nil, errReset
@@ -267,14 +271,14 @@ func (h *Handler) resetQuotaForAuth(ctx context.Context, auth *coreauth.Auth) (*
 
 	quotaPayload := gin.H{}
 	if h.canFetchAntigravityOfficialQuota(updated) {
-		payload, errFetch := h.fetchAntigravityOfficialQuota(ctx, updated)
+		payload, errFetch := h.fetchAntigravityOfficialQuota(operationCtx, updated)
 		if errFetch != nil {
 			_ = h.persistAntigravityQuotaFailure(auth, errFetch)
 			return nil, nil, nil, errFetch
 		}
-		probeResults := h.activateMissingAntigravityWeeklyWindows(ctx, updated, payload)
+		probeResults := h.activateMissingAntigravityWeeklyWindows(operationCtx, updated, payload)
 		if len(probeResults) > 0 {
-			if refreshedPayload, errRefetch := h.fetchAntigravityOfficialQuota(ctx, updated); errRefetch == nil {
+			if refreshedPayload, errRefetch := h.fetchAntigravityOfficialQuota(operationCtx, updated); errRefetch == nil {
 				payload = refreshedPayload
 			} else {
 				probeResults["refetch"] = "failed: " + compactQuotaErrorBody([]byte(errRefetch.Error()))
